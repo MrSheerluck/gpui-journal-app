@@ -2,6 +2,10 @@ Dainiki is a free, open-source, local-first journaling application built with Ru
 
 Capture your everyday life through text, images, videos, and audio in a continuous, vertically scrolling daily timeline.
 
+<img width="1649" height="969" alt="Screenshot 2026-10-15 at 09 45 55" src="https://github.com/user-attachments/assets/36ce4bdb-c9b0-473e-a88e-c66d6b25deb8" />
+
+
+
 
 ## Features
 

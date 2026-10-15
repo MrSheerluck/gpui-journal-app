@@ -1,0 +1,24 @@
+{
+  "name": "smbl-dainiki",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/"]
+  },
+  "d1_databases": [
+    {
+      "binding": "WAITLIST",
+      "database_name": "smbl-wishlist",
+      "database_id": "1a89707b-7e1b-4253-bfc9-25abb05b8540"
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "dainiki.smbl.dev",
+      "custom_domain": true
+    }
+  ],
+  "workers_dev": true
+}

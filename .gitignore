@@ -1,0 +1,29 @@
+# macOS / OS
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# Rust
+/target
+**/*.rs.bk
+
+# Node
+node_modules/
+.npm/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Cloudflare
+.wrangler/
+
+# Logs
+*.log
+
+# Editors
+.idea/
+.vscode/
+*.swp

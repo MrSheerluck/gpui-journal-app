@@ -1,0 +1,161 @@
+@import "tailwindcss";
+
+
+@theme {
+  
+  --color-surface: #fef8f6;
+  --color-surface-container: #f2edeb;
+  --color-surface-container-low: #f8f2f0;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-high: #ede7e5;
+  --color-surface-container-highest: #e7e1df;
+  --color-surface-variant: #e7e1df;
+  --color-surface-dim: #ded9d7;
+  --color-surface-bright: #fef8f6;
+  --color-background: #fef8f6;
+  --color-on-surface: #1d1b1a;
+  --color-on-surface-variant: #424843;
+  --color-on-background: #1d1b1a;
+  --color-primary: #32533f;
+  --color-on-primary: #ffffff;
+  --color-primary-container: #4a6b56;
+  --color-on-primary-container: #c5ead0;
+  --color-primary-fixed: #c6ebd1;
+  --color-primary-fixed-dim: #abcfb6;
+  --color-on-primary-fixed: #002111;
+  --color-on-primary-fixed-variant: #2d4d3a;
+  --color-secondary: #944924;
+  --color-on-secondary: #ffffff;
+  --color-secondary-container: #fe9e72;
+  --color-on-secondary-container: #77330f;
+  --color-secondary-fixed: #ffdbcd;
+  --color-secondary-fixed-dim: #ffb595;
+  --color-on-secondary-fixed: #360f00;
+  --color-on-secondary-fixed-variant: #76330f;
+  --color-tertiary: #554a35;
+  --color-on-tertiary: #ffffff;
+  --color-tertiary-container: #6e624c;
+  --color-on-tertiary-container: #efdfc2;
+  --color-tertiary-fixed: #f1e1c4;
+  --color-tertiary-fixed-dim: #d4c5a9;
+  --color-on-tertiary-fixed: #221a09;
+  --color-on-tertiary-fixed-variant: #504531;
+  --color-error: #ba1a1a;
+  --color-on-error: #ffffff;
+  --color-error-container: #ffdad6;
+  --color-on-error-container: #93000a;
+  --color-outline: #727973;
+  --color-outline-variant: #c2c8c1;
+  --color-inverse-surface: #32302f;
+  --color-inverse-on-surface: #f5efed;
+  --color-inverse-primary: #abcfb6;
+  --color-surface-tint: #456651;
+
+  
+  --font-headline-md: "Newsreader", serif;
+  --font-headline-lg: "Newsreader", serif;
+  --font-headline-lg-mobile: "Newsreader", serif;
+  --font-headline-sm: "Newsreader", serif;
+  --font-journal-body: "Newsreader", serif;
+  --font-journal-body-lg: "Newsreader", serif;
+  --font-journal-quote: "Newsreader", serif;
+  --font-display-date: "Newsreader", serif;
+  --font-display-date-mobile: "Newsreader", serif;
+  --font-ui-body: "Inter", sans-serif;
+  --font-ui-caption: "Inter", sans-serif;
+  --font-ui-header: "Inter", sans-serif;
+  --font-ui-label: "Inter", sans-serif;
+
+  --text-headline-md: 1.5rem;
+  --text-headline-md--line-height: 2rem;
+  --text-headline-md--letter-spacing: -0.01em;
+
+  --text-headline-lg: 2.25rem;
+  --text-headline-lg--line-height: 2.75rem;
+  --text-headline-lg--letter-spacing: -0.015em;
+
+  --text-headline-lg-mobile: 1.75rem;
+  --text-headline-lg-mobile--line-height: 2.25rem;
+  --text-headline-lg-mobile--letter-spacing: -0.01em;
+
+  --text-headline-sm: 1.25rem;
+  --text-headline-sm--line-height: 1.75rem;
+
+  --text-display-date: 3rem;
+  --text-display-date--line-height: 3.5rem;
+  --text-display-date--letter-spacing: -0.02em;
+
+  --text-display-date-mobile: 2rem;
+  --text-display-date-mobile--line-height: 2.5rem;
+  --text-display-date-mobile--letter-spacing: -0.01em;
+
+  --text-journal-body: 1.0625rem;
+  --text-journal-body--line-height: 1.75rem;
+
+  --text-journal-body-lg: 1.1875rem;
+  --text-journal-body-lg--line-height: 1.9375rem;
+
+  --text-journal-quote: 1.25rem;
+  --text-journal-quote--line-height: 2rem;
+
+  --text-ui-body: 0.8125rem;
+  --text-ui-body--line-height: 1.25rem;
+
+  --text-ui-caption: 0.6875rem;
+  --text-ui-caption--line-height: 0.875rem;
+  --text-ui-caption--letter-spacing: 0.04em;
+
+  --text-ui-header: 0.875rem;
+  --text-ui-header--line-height: 1.25rem;
+  --text-ui-header--letter-spacing: 0.01em;
+
+  --text-ui-label: 0.75rem;
+  --text-ui-label--line-height: 1rem;
+  --text-ui-label--letter-spacing: 0.02em;
+
+  
+  
+  --radius-xs: 0.125rem;
+  --radius-sm: 0.125rem;
+  --radius-lg: 0.25rem;
+  --radius-xl: 0.5rem;
+  --radius-full: 0.75rem;
+
+  
+  --spacing-space-xs: 0.25rem;
+  --spacing-space-sm: 0.5rem;
+  --spacing-space-md: 1rem;
+  --spacing-space-lg: 1.5rem;
+  --spacing-space-xl: 2.5rem;
+  --spacing-margin: 2.5rem;
+  --spacing-margin-mobile: 1.25rem;
+  --spacing-gutter: 1.5rem;
+  --spacing-gutter-compact: 0.75rem;
+}
+
+
+@layer base {
+  html,
+  body {
+    margin: 0;
+    padding: 0;
+  }
+  body {
+    overscroll-behavior: none;
+  }
+  main > :first-child {
+    margin-top: 0 !important;
+  }
+  main > :last-child {
+    margin-bottom: 0 !important;
+  }
+}
+
+::-webkit-scrollbar {
+  display: none;
+}
+
+
+.rounded {
+  border-radius: 0.125rem;
+}

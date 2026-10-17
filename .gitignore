@@ -27,3 +27,8 @@ node_modules/
 .idea/
 .vscode/
 *.swp
+
+
+
+# smbl
+smbl-guidelines.md

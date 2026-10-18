@@ -545,6 +545,19 @@ impl MarkdownEditor {
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         tracing::debug!(key = %keystroke.key, "editor key down");
+        // Return and Tab carry control characters: macOS routes them through
+        // key-command selectors that land here, not through text input, so we
+        // insert them ourselves.
+        if keystroke.key == "enter" {
+            self.insert_text_at_selection("\n", cx);
+            cx.stop_propagation();
+            return;
+        }
+        if keystroke.key == "tab" {
+            self.insert_text_at_selection("\t", cx);
+            cx.stop_propagation();
+            return;
+        }
         if keystroke.modifiers.platform {
             match keystroke.key.as_str() {
                 "c" => {
@@ -765,6 +778,13 @@ impl MarkdownEditor {
                     && self.selection.end() < construct.range.end
             })
             .cloned()
+    }
+
+    /// Inserts literal text at the selection as one edit. Used for keys the
+    /// platform routes through key-command selectors (Return, Tab).
+    fn insert_text_at_selection(&mut self, text: &str, cx: &mut Context<Self>) {
+        let range = self.selection.start()..self.selection.end();
+        self.apply_input_edit(range, text, None, false, MergeKind::None, cx);
     }
 
     /// Backspace/delete: removes the selection, or one grapheme/word/line
@@ -1407,6 +1427,24 @@ mod interaction_tests {
         cx.update(|_, app| {
             assert_eq!(editor.read(app).content(app), "- **title**");
             assert!(editor.read(app).inline_format_active(InlineFormat::Bold));
+        });
+    }
+
+    #[gpui::test]
+    async fn enter_and_tab_insert_text_as_their_own_undo_steps(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "a");
+        cx.simulate_keystrokes("right enter b");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "a\nb");
+            assert_eq!(editor.read(app).selection().head(), 3);
+        });
+        cx.simulate_keystrokes("tab");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "a\nb\t");
+        });
+        cx.simulate_keystrokes("cmd-z cmd-z cmd-z cmd-z");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "a", "undo steps are wrong");
         });
     }
 

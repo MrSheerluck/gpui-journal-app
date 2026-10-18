@@ -610,6 +610,11 @@ impl MarkdownEditor {
                     cx.stop_propagation();
                     return;
                 }
+                "k" if !keystroke.modifiers.shift => {
+                    self.insert_link("", cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 "1" if !keystroke.modifiers.shift => {
                     self.toggle_block_format(BlockFormat::Heading(1), cx);
                     cx.stop_propagation();
@@ -1506,6 +1511,16 @@ mod interaction_tests {
                     .read(app)
                     .block_format_active(BlockFormat::Bullet, app)
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn link_shortcut_inserts_placeholder(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "hello");
+        cx.simulate_keystrokes("cmd-a cmd-k");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "[hello]()");
+            assert_eq!(editor.read(app).selection().head(), 8);
         });
     }
 

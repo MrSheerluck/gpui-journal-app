@@ -328,7 +328,8 @@ fn strip_block_prefix(line: &str) -> String {
 }
 
 /// Inserts a Markdown link. A selection becomes the label; a collapsed caret
-/// uses the URL as the label so the result is immediately useful.
+/// uses the URL as the label. An empty URL inserts `[]()` with the caret
+/// inside the parentheses, ready for typing a target.
 pub fn insert_link(text: &str, selection: Selection, url: &str) -> Edit {
     let url = url.trim();
     let (start, end) = (selection.start(), selection.end());
@@ -338,7 +339,12 @@ pub fn insert_link(text: &str, selection: Selection, url: &str) -> Edit {
         &text[start..end]
     };
     let new_text = format!("[{label}]({url})");
-    let caret = start + new_text.len();
+    let caret = if url.is_empty() {
+        // Just inside the closing parenthesis.
+        start + new_text.len() - 1
+    } else {
+        start + new_text.len()
+    };
     Edit {
         range: start..end,
         new_text,
@@ -529,6 +535,11 @@ mod tests {
 
         let edit = super::insert_link("", Selection::caret(0), "  https://x.dev  ");
         assert_eq!(apply("", &edit), "[https://x.dev](https://x.dev)");
+
+        // Empty URL: caret lands inside the parentheses.
+        let edit = super::insert_link("hello", Selection::new(0, 5), "");
+        assert_eq!(apply("hello", &edit), "[hello]()");
+        assert_eq!(edit.new_selection, Selection::caret(8));
 
         let edit = super::insert_image(Selection::caret(0), "shot", "assets/shot.png");
         assert_eq!(apply("", &edit), "![shot](assets/shot.png)");

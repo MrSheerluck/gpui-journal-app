@@ -119,12 +119,14 @@ impl DainikiApp {
         id: &'static str,
         label: &'static str,
         format: InlineFormat,
+        tooltip: &'static str,
         cx: &Context<Self>,
     ) -> Toggle {
         let active = self.editor.read(cx).inline_format_active(format);
         let editor = self.editor.clone();
         Toggle::new(id)
             .label(label)
+            .tooltip(tooltip)
             .checked(active)
             .on_click(move |_checked, _window, cx| {
                 editor.update(cx, |editor, cx| editor.toggle_inline_format(format, cx));
@@ -136,12 +138,14 @@ impl DainikiApp {
         id: &'static str,
         label: &'static str,
         format: BlockFormat,
+        tooltip: &'static str,
         cx: &Context<Self>,
     ) -> Toggle {
         let active = self.editor.read(cx).block_format_active(format, cx);
         let editor = self.editor.clone();
         Toggle::new(id)
             .label(label)
+            .tooltip(tooltip)
             .checked(active)
             .on_click(move |_checked, _window, cx| {
                 editor.update(cx, |editor, cx| editor.toggle_block_format(format, cx));
@@ -150,24 +154,72 @@ impl DainikiApp {
 
     fn block_toolbar(&self, cx: &mut Context<Self>) -> ToggleGroup {
         ToggleGroup::new("block-formats").segmented().children([
-            self.block_toggle("h1", "H1", BlockFormat::Heading(1), cx),
-            self.block_toggle("h2", "H2", BlockFormat::Heading(2), cx),
-            self.block_toggle("h3", "H3", BlockFormat::Heading(3), cx),
-            self.block_toggle("bullet", "•", BlockFormat::Bullet, cx),
-            self.block_toggle("ordered", "1.", BlockFormat::Ordered, cx),
-            self.block_toggle("task", "☐", BlockFormat::Task, cx),
-            self.block_toggle("quote", ">", BlockFormat::Quote, cx),
+            self.block_toggle("h1", "H1", BlockFormat::Heading(1), "Heading 1 — ⌘1", cx),
+            self.block_toggle("h2", "H2", BlockFormat::Heading(2), "Heading 2 — ⌘2", cx),
+            self.block_toggle("h3", "H3", BlockFormat::Heading(3), "Heading 3 — ⌘3", cx),
+            self.block_toggle("bullet", "•", BlockFormat::Bullet, "Bullet list — ⌘⇧8", cx),
+            self.block_toggle(
+                "ordered",
+                "1.",
+                BlockFormat::Ordered,
+                "Numbered list — ⌘⇧7",
+                cx,
+            ),
+            self.block_toggle("task", "☐", BlockFormat::Task, "Task list — ⌘⇧9", cx),
+            self.block_toggle("quote", ">", BlockFormat::Quote, "Quote", cx),
         ])
     }
 
     fn inline_toolbar(&self, cx: &mut Context<Self>) -> ToggleGroup {
         ToggleGroup::new("inline-formats").segmented().children([
-            self.inline_toggle("bold", "B", InlineFormat::Bold, cx),
-            self.inline_toggle("italic", "I", InlineFormat::Italic, cx),
-            self.inline_toggle("strike", "S", InlineFormat::Strike, cx),
-            self.inline_toggle("highlight", "H", InlineFormat::Highlight, cx),
-            self.inline_toggle("code", "`", InlineFormat::Code, cx),
+            self.inline_toggle("bold", "B", InlineFormat::Bold, "Bold — ⌘B", cx),
+            self.inline_toggle("italic", "I", InlineFormat::Italic, "Italic — ⌘I", cx),
+            self.inline_toggle(
+                "strike",
+                "S",
+                InlineFormat::Strike,
+                "Strikethrough — ⌘⇧X",
+                cx,
+            ),
+            self.inline_toggle(
+                "highlight",
+                "H",
+                InlineFormat::Highlight,
+                "Highlight — ⌘⇧H",
+                cx,
+            ),
+            self.inline_toggle("code", "`", InlineFormat::Code, "Inline code — ⌘`", cx),
         ])
+    }
+
+    fn help_menu(&self) -> Popover {
+        const SHORTCUTS: [(&str, &str); 14] = [
+            ("Bold / Italic", "⌘B / ⌘I"),
+            ("Strikethrough / Highlight", "⌘⇧X / ⌘⇧H"),
+            ("Inline code", "⌘`"),
+            ("Link", "⌘K"),
+            ("Headings 1–3", "⌘1 … ⌘3"),
+            ("Numbered / Bullet / Task list", "⌘⇧7 / ⌘⇧8 / ⌘⇧9"),
+            ("Undo / Redo", "⌘Z / ⌘⇧Z"),
+            ("Select all", "⌘A"),
+            ("Copy / Cut / Paste", "⌘C / ⌘X / ⌘V"),
+            ("Word step", "⌥← / ⌥→"),
+            ("Line / Document jumps", "⌘← / ⌘↑"),
+            ("Save", "⌘S"),
+            ("New line / Tab", "⏎ / ⇥"),
+            ("Reveal markup", "click into a construct"),
+        ];
+        Popover::new("shortcut-help")
+            .trigger(Button::new("help-trigger").label("?").compact())
+            .content(move |_state, _window, _cx| {
+                v_flex()
+                    .w(px(360.))
+                    .gap_1()
+                    .text_sm()
+                    .children(SHORTCUTS.map(|(action, keys)| {
+                        h_flex().justify_between().gap_4().child(action).child(keys)
+                    }))
+            })
     }
 
     fn insert_menu(&self) -> Popover {
@@ -325,7 +377,8 @@ impl Render for DainikiApp {
                                 .child(self.inline_toolbar(cx))
                                 .child(self.block_toolbar(cx)),
                         )
-                        .child(self.insert_menu()),
+                        .child(self.insert_menu())
+                        .child(self.help_menu()),
                 ),
             )
             .child(

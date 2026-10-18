@@ -16,6 +16,10 @@ pub fn surface_container_low() -> Hsla {
     rgb(0xF8F2F0).into()
 }
 
+pub fn surface_container_lowest() -> Hsla {
+    rgb(0xFFFFFF).into()
+}
+
 pub fn surface_container() -> Hsla {
     rgb(0xF2EDEB).into()
 }

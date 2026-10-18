@@ -86,6 +86,8 @@ struct JournalSession {
     /// The search bar: input and open state.
     search_input: Entity<InputState>,
     search_open: bool,
+    /// The month the sidebar calendar shows, `(year, month)`.
+    calendar_month: (i32, u32),
     /// Set by the jump input's Enter event; processed in render, which has a
     /// window to activate a day with.
     pending_submit: Cell<bool>,
@@ -218,6 +220,7 @@ impl DainikiApp {
             jump_error: None,
             search_input,
             search_open: false,
+            calendar_month: (today.year(), today.month()),
             pending_submit: Cell::new(false),
             pending_reveal: Cell::new(None),
             _jump_events: jump_events,
@@ -465,10 +468,21 @@ impl DainikiApp {
         if let Some(session) = self.session_mut() {
             session.jump_open = false;
             session.jump_error = None;
+            session.calendar_month = (date.year(), date.month());
             session.pending_reveal.set(Some(date));
             session
                 .jump_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Moves the sidebar calendar by whole months.
+    fn shift_calendar_month(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut() {
+            let (year, month) = session.calendar_month;
+            let total = year * 12 + month as i32 - 1 + delta;
+            session.calendar_month = (total.div_euclid(12), (total.rem_euclid(12) + 1) as u32);
         }
         cx.notify();
     }
@@ -1272,12 +1286,13 @@ impl JournalSession {
                     ),
             )
             .child(
-                // The bottom block; the calendar and settings land here.
+                // The bottom block: the calendar, settings, and the footnote.
                 v_flex()
                     .gap_2()
                     .p_2()
                     .border_t_1()
                     .border_color(brand::outline_variant().opacity(0.4))
+                    .child(self.calendar_card(active_date, this))
                     .child(
                         h_flex()
                             .gap_2()
@@ -1298,6 +1313,145 @@ impl JournalSession {
                             ),
                     ),
             )
+            .into_any_element()
+    }
+
+    /// The sidebar calendar: a month at a glance, entry days dotted, today in
+    /// primary; clicking a day opens it.
+    fn calendar_card(
+        &self,
+        active_date: Option<NaiveDate>,
+        this: &WeakEntity<DainikiApp>,
+    ) -> AnyElement {
+        let (year, month) = self.calendar_month;
+        let label = NaiveDate::from_ymd_opt(year, month, 1)
+            .map(|first| first.format("%B %Y").to_string())
+            .unwrap_or_default();
+        let grid = month_grid(year, month);
+        let today = Local::now().date_naive();
+        let mut with_entries: BTreeSet<NaiveDate> = self.days.keys().copied().collect();
+        if let Some(date) = active_date {
+            with_entries.insert(date);
+        }
+
+        let chevron = |label: &'static str, delta: i32, this: WeakEntity<DainikiApp>| {
+            div()
+                .id(ElementId::Name(format!("cal-chevron-{delta}").into()))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                    this.update(cx, |app, cx| app.shift_calendar_month(delta, cx))
+                        .ok();
+                })
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(brand::on_surface_variant())
+                        .child(label),
+                )
+                .into_any_element()
+        };
+
+        v_flex()
+            .gap_1()
+            .p_2()
+            .rounded_lg()
+            .bg(brand::surface_container_lowest().opacity(0.8))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .px_1()
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(brand::on_surface())
+                            .child(label),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(chevron("‹", -1, this.clone()))
+                            .child(chevron("›", 1, this.clone())),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .children(["M", "T", "W", "T", "F", "S", "S"].map(|day| {
+                        div()
+                            .w(px(24.))
+                            .text_center()
+                            .text_size(px(9.))
+                            .text_color(brand::outline())
+                            .child(day)
+                    })),
+            )
+            .child(v_flex().gap_1().children(grid.chunks(7).map(|row| {
+                h_flex()
+                    .gap_1()
+                    .children(row.iter().map(|(date, in_month)| {
+                        self.calendar_cell(*date, *in_month, today, &with_entries, this)
+                    }))
+            })))
+            .into_any_element()
+    }
+
+    /// One calendar cell: the number, primary when it has an entry or is
+    /// today, dotted when it has an entry. The future is not clickable.
+    fn calendar_cell(
+        &self,
+        date: NaiveDate,
+        in_month: bool,
+        today: NaiveDate,
+        with_entries: &BTreeSet<NaiveDate>,
+        this: &WeakEntity<DainikiApp>,
+    ) -> AnyElement {
+        let has_entry = with_entries.contains(&date);
+        let is_today = date == today;
+        let clickable = date <= today;
+        let cell_this = this.clone();
+        v_flex()
+            .id(ElementId::Name(format!("cal-{date}").into()))
+            .w(px(24.))
+            .h(px(26.))
+            .items_center()
+            .justify_center()
+            .gap(px(1.))
+            .rounded_sm()
+            .when(clickable, |el| {
+                el.cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        cell_this
+                            .update(cx, |app, cx| app.jump_to(date, window, cx))
+                            .ok();
+                    })
+            })
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .when(has_entry || is_today, |el| {
+                        el.font_weight(FontWeight::SEMIBOLD)
+                            .text_color(brand::primary())
+                    })
+                    .when(!has_entry && !is_today, |el| {
+                        el.text_color(brand::on_surface_variant().opacity(if in_month {
+                            0.8
+                        } else {
+                            0.3
+                        }))
+                    })
+                    .child(day_number(date)),
+            )
+            .when(has_entry, |el| {
+                el.child(
+                    div()
+                        .w(px(3.))
+                        .h(px(3.))
+                        .rounded_full()
+                        .bg(brand::primary()),
+                )
+            })
             .into_any_element()
     }
 
@@ -1670,6 +1824,35 @@ impl ActiveDay {
     }
 }
 
+/// The cells of a month's calendar grid, Monday first, padded with the
+/// neighbouring months' dates: `(date, in_this_month)`.
+fn month_grid(year: i32, month: u32) -> Vec<(NaiveDate, bool)> {
+    let Some(first) = NaiveDate::from_ymd_opt(year, month, 1) else {
+        return Vec::new();
+    };
+    let offset = first.weekday().num_days_from_monday() as u64;
+    let days = days_in_month(year, month) as u64;
+    let rows = (offset + days).div_ceil(7);
+    let start = first - chrono::Days::new(offset);
+    (0..rows * 7)
+        .map(|index| {
+            let date = start + chrono::Days::new(index);
+            (date, date.month() == month)
+        })
+        .collect()
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid month");
+    let next = NaiveDate::from_ymd_opt(next_year, next_month, 1).expect("valid month");
+    (next - first).num_days() as u32
+}
+
 /// The ghosted day number beside a day's heading, as in the landing's
 /// showcase: `19`.
 fn day_number(date: NaiveDate) -> String {
@@ -1873,8 +2056,8 @@ mod tests {
     // which re-exports gpui's `test` proc macro; globbing it in would shadow
     // the builtin `#[test]` inside the generated harness and recurse forever.
     use super::{
-        DainikiApp, Screen, brand, config, day_heading, day_number, journal, parse_jump_date,
-        resolve_cli_root,
+        DainikiApp, Screen, brand, config, day_heading, day_number, journal, month_grid,
+        parse_jump_date, resolve_cli_root,
     };
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -1933,6 +2116,28 @@ mod tests {
         fs::write(&file, "x").expect("seed");
         assert_eq!(resolve_cli_root(Some(file)), None);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn month_grids_start_on_monday_and_pad_neighbours() {
+        let grid = month_grid(2026, 10);
+        assert_eq!(grid.len(), 35, "five rows for October 2026");
+        assert_eq!(
+            grid[0],
+            (NaiveDate::from_ymd_opt(2026, 9, 28).unwrap(), false)
+        );
+        assert_eq!(
+            grid[3],
+            (NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(), true)
+        );
+        assert_eq!(
+            grid[34],
+            (NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(), false)
+        );
+        assert_eq!(grid.iter().filter(|(_, inside)| *inside).count(), 31);
+
+        let february = month_grid(2024, 2);
+        assert_eq!(february.iter().filter(|(_, inside)| *inside).count(), 29);
     }
 
     #[test]
@@ -2019,6 +2224,26 @@ mod tests {
                 top.item_ix > 0,
                 "the stream should have scrolled to the jumped day: {top:?}"
             );
+            assert_eq!(
+                session.calendar_month,
+                (oldest.year(), oldest.month()),
+                "the sidebar calendar follows a jump"
+            );
+        });
+
+        // Month stepping wraps correctly across years.
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| app.shift_calendar_month(-1, cx));
+        });
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| app.shift_calendar_month(1, cx));
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert_eq!(session.calendar_month, (oldest.year(), oldest.month()));
         });
         fs::remove_dir_all(&dir).ok();
     }

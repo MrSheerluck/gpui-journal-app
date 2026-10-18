@@ -1,4 +1,5 @@
 pub mod buffer;
+pub mod display;
 pub mod input;
 pub mod markdown;
 pub mod theme;

@@ -364,6 +364,140 @@ pub fn insert_image(selection: Selection, alt: &str, path: &str) -> Edit {
     }
 }
 
+/// Items offered by the slash menu. Every item applies without the user
+/// typing any Markdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlashItem {
+    Heading1,
+    Heading2,
+    Heading3,
+    Bullet,
+    Ordered,
+    Task,
+    Quote,
+    CodeBlock,
+    Divider,
+    Link,
+    Image,
+}
+
+impl SlashItem {
+    pub const ALL: [SlashItem; 11] = [
+        SlashItem::Heading1,
+        SlashItem::Heading2,
+        SlashItem::Heading3,
+        SlashItem::Bullet,
+        SlashItem::Ordered,
+        SlashItem::Task,
+        SlashItem::Quote,
+        SlashItem::CodeBlock,
+        SlashItem::Divider,
+        SlashItem::Link,
+        SlashItem::Image,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SlashItem::Heading1 => "Heading 1",
+            SlashItem::Heading2 => "Heading 2",
+            SlashItem::Heading3 => "Heading 3",
+            SlashItem::Bullet => "Bullet list",
+            SlashItem::Ordered => "Numbered list",
+            SlashItem::Task => "Task",
+            SlashItem::Quote => "Quote",
+            SlashItem::CodeBlock => "Code block",
+            SlashItem::Divider => "Divider",
+            SlashItem::Link => "Link",
+            SlashItem::Image => "Image",
+        }
+    }
+
+    /// Whether `label` matches the typed query (case-insensitive substring).
+    pub fn matches(self, query: &str) -> bool {
+        let query = query.trim().to_lowercase();
+        query.is_empty() || self.label().to_lowercase().contains(&query)
+    }
+}
+
+/// Applies a slash item over the line holding `query_start`: any typed
+/// `/query` is removed and the block/insert it names is applied in one edit.
+pub fn apply_slash(text: &str, caret: usize, query_start: usize, item: SlashItem) -> Edit {
+    let caret = caret.min(text.len());
+    let query_start = query_start.min(caret);
+    let line_start = text[..query_start]
+        .rfind('\n')
+        .map(|ix| ix + 1)
+        .unwrap_or(0);
+    let line = &text[line_start..query_start];
+    let content = strip_block_prefix(line);
+    let content = content.trim();
+
+    let (new_text, caret_offset) = match item {
+        SlashItem::Heading1
+        | SlashItem::Heading2
+        | SlashItem::Heading3
+        | SlashItem::Bullet
+        | SlashItem::Ordered
+        | SlashItem::Task
+        | SlashItem::Quote => {
+            let format = match item {
+                SlashItem::Heading1 => BlockFormat::Heading(1),
+                SlashItem::Heading2 => BlockFormat::Heading(2),
+                SlashItem::Heading3 => BlockFormat::Heading(3),
+                SlashItem::Bullet => BlockFormat::Bullet,
+                SlashItem::Ordered => BlockFormat::Ordered,
+                SlashItem::Task => BlockFormat::Task,
+                SlashItem::Quote => BlockFormat::Quote,
+                _ => unreachable!(),
+            };
+            let prefix = match format {
+                BlockFormat::Heading(level) => format!("{} ", "#".repeat(level as usize)),
+                BlockFormat::Bullet => "- ".to_string(),
+                BlockFormat::Ordered => "1. ".to_string(),
+                BlockFormat::Task => "- [ ] ".to_string(),
+                BlockFormat::Quote => "> ".to_string(),
+            };
+            let line = format!("{prefix}{content}");
+            let caret = line.len();
+            (line, caret)
+        }
+        SlashItem::CodeBlock => {
+            let text = if content.is_empty() {
+                "```\n\n```\n".to_string()
+            } else {
+                format!("{content}\n```\n\n```\n")
+            };
+            let fence_start = text.len() - "```\n\n```\n".len();
+            (text, fence_start + 4)
+        }
+        SlashItem::Divider => {
+            let text = if content.is_empty() {
+                "---\n".to_string()
+            } else {
+                format!("{content}\n\n---\n")
+            };
+            let caret = text.len();
+            (text, caret)
+        }
+        SlashItem::Link => ("[]()".to_string(), 3),
+        SlashItem::Image => ("![]()".to_string(), 5),
+    };
+
+    Edit {
+        range: line_start..caret,
+        new_text,
+        new_selection: Selection::caret(line_start + caret_offset),
+    }
+}
+
+/// Items matching a slash query, favorites first.
+pub fn slash_items(query: &str) -> Vec<SlashItem> {
+    SlashItem::ALL
+        .into_iter()
+        .filter(|item| item.matches(query))
+        .collect()
+}
+
 /// Removes an enclosing delimiter pair around a selection: `open` and `close`
 /// are the marker ranges (e.g. of a parsed strong construct).
 pub fn unwrap_delimiters(
@@ -543,6 +677,76 @@ mod tests {
 
         let edit = super::insert_image(Selection::caret(0), "shot", "assets/shot.png");
         assert_eq!(apply("", &edit), "![shot](assets/shot.png)");
+    }
+
+    #[test]
+    fn slash_blocks_apply_without_markdown_syntax() {
+        // "/bul" typed on an empty line → a bullet item with the query gone.
+        let text = "/bul";
+        let edit = super::apply_slash(text, 4, 0, super::SlashItem::Bullet);
+        assert_eq!(apply(text, &edit), "- ");
+        assert_eq!(edit.new_selection, Selection::caret(2));
+
+        // Swaps an existing block prefix: "## /quo" → "> ".
+        let text = "## /quo";
+        let edit = super::apply_slash(text, 7, 3, super::SlashItem::Quote);
+        assert_eq!(apply(text, &edit), "> ");
+
+        // Typed content is kept.
+        let text = "my title /h1";
+        let edit = super::apply_slash(text, 12, 9, super::SlashItem::Heading1);
+        assert_eq!(apply(text, &edit), "# my title");
+    }
+
+    #[test]
+    fn slash_inserts_code_block_divider_link_and_image() {
+        let edit = super::apply_slash("/code", 5, 0, super::SlashItem::CodeBlock);
+        assert_eq!(apply("/code", &edit), "```\n\n```\n");
+        assert_eq!(
+            edit.new_selection,
+            Selection::caret(4),
+            "caret inside the fence"
+        );
+
+        let text = "intro\n```\n\n```\n";
+        let edit = super::apply_slash("intro /c", 8, 6, super::SlashItem::CodeBlock);
+        assert_eq!(apply("intro /c", &edit), text);
+        assert_eq!(
+            edit.new_selection,
+            Selection::caret(10),
+            "inside the empty fence line"
+        );
+
+        let edit = super::apply_slash("/div", 4, 0, super::SlashItem::Divider);
+        assert_eq!(apply("/div", &edit), "---\n");
+
+        let edit = super::apply_slash("/link", 5, 0, super::SlashItem::Link);
+        assert_eq!(apply("/link", &edit), "[]()");
+        assert_eq!(
+            edit.new_selection,
+            Selection::caret(3),
+            "inside the parentheses"
+        );
+
+        let edit = super::apply_slash("/img", 4, 0, super::SlashItem::Image);
+        assert_eq!(apply("/img", &edit), "![]()");
+        assert_eq!(edit.new_selection, Selection::caret(5));
+    }
+
+    #[test]
+    fn slash_items_filter_by_label() {
+        let items = super::slash_items("");
+        assert_eq!(items.len(), super::SlashItem::ALL.len());
+        let items = super::slash_items("hea");
+        assert_eq!(
+            items,
+            vec![
+                super::SlashItem::Heading1,
+                super::SlashItem::Heading2,
+                super::SlashItem::Heading3
+            ]
+        );
+        assert!(super::slash_items("zzz").is_empty());
     }
 
     #[test]

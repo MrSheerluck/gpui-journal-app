@@ -252,48 +252,6 @@ impl DainikiApp {
         }
     }
 
-    /// Persists a preferences change (the in-memory value stays authoritative
-    /// for this session even when the write fails).
-    fn set_show_empty_days(&mut self, show: bool, cx: &mut Context<Self>) {
-        if self.config.show_empty_days == show {
-            return;
-        }
-        self.config.show_empty_days = show;
-        if let Err(error) = config::save(&self.config) {
-            tracing::warn!(error = %error, "could not save preferences");
-        }
-        cx.notify();
-    }
-
-    /// Journal preferences, available from the toolbar.
-    fn settings_menu(&self, cx: &Context<Self>) -> Popover {
-        let this = cx.weak_entity();
-        let show_empty_days = self.config.show_empty_days;
-        Popover::new("settings")
-            .trigger(Button::new("settings-trigger").label("Settings").compact())
-            .content(move |_state, _window, _cx| {
-                let this = this.clone();
-                v_flex()
-                    .w(px(320.))
-                    .gap_2()
-                    .text_sm()
-                    .child(
-                        Toggle::new("show-empty-days")
-                            .label("Show days without entries")
-                            .checked(show_empty_days)
-                            .on_click(move |checked, _window, cx| {
-                                this.update(cx, |app, cx| app.set_show_empty_days(*checked, cx))
-                                    .ok();
-                            }),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .child("Empty days appear in the timeline, ready to fill in later."),
-                    )
-            })
-    }
-
     // -- journal actions ----------------------------------------------------
 
     /// Restarts the debounce window; the previous pending save is dropped.
@@ -473,7 +431,6 @@ impl JournalSession {
     fn view(
         &self,
         theme: &EditorTheme,
-        settings: Popover,
         show_empty_days: bool,
         window: &Window,
         cx: &App,
@@ -482,10 +439,10 @@ impl JournalSession {
         let existing: BTreeSet<NaiveDate> = self.days.keys().copied().collect();
         let dates = journal::stream_dates(&existing, today, show_empty_days);
 
-        // The live day gets a viewport-sized editing surface inside the
-        // stream. (The nested-scroll handoff to a focused day is the G3
-        // concern.)
-        let editor_height = px((window.viewport_size().height.as_f32() * 0.55).max(320.0));
+        // The live day gets a capped editing surface inside the stream, so
+        // history is always visible below it; the nested-scroll handoff to a
+        // focused day is the G3 concern.
+        let editor_height = px((window.viewport_size().height.as_f32() * 0.55).clamp(320., 440.));
 
         let mut stream = v_flex().gap_8();
         for date in dates {
@@ -545,6 +502,23 @@ impl JournalSession {
             stream = stream.child(v_flex().gap_4().child(header).child(body));
         }
 
+        // The stream always ends with a designed edge, even on a fresh
+        // journal that has nothing below today.
+        stream = stream.child(
+            v_flex()
+                .items_center()
+                .gap_2()
+                .pt_4()
+                .child(div().text_xs().text_color(brand::outline()).child("· · ·"))
+                .child(
+                    div()
+                        .font_family(brand::SERIF_FAMILY)
+                        .italic()
+                        .text_color(brand::outline())
+                        .child("This is the edge of your journal — everything you write adds to the stream."),
+                ),
+        );
+
         div()
             .size_full()
             .flex()
@@ -568,7 +542,6 @@ impl JournalSession {
                                     .child(self.block_toolbar(cx)),
                             )
                             .child(self.insert_menu())
-                            .child(settings)
                             .child(self.preview_toggle())
                             .child(self.help_menu()),
                     ),
@@ -862,18 +835,9 @@ impl Render for DainikiApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let screen = match &self.screen {
             Screen::Welcome { notice } => self.welcome_view(notice, cx).into_any_element(),
-            Screen::Journal(session) => {
-                let settings = self.settings_menu(cx);
-                session
-                    .view(
-                        &self.theme,
-                        settings,
-                        self.config.show_empty_days,
-                        window,
-                        cx,
-                    )
-                    .into_any_element()
-            }
+            Screen::Journal(session) => session
+                .view(&self.theme, self.config.show_empty_days, window, cx)
+                .into_any_element(),
         };
         div()
             .size_full()

@@ -1,6 +1,6 @@
 use std::fs;
 
-use dainiki_editor::{Buffer, EditorElement, EditorTheme};
+use dainiki_editor::{Buffer, EditorTheme, MarkdownEditor};
 use gpui::{
     App, Bounds, Context, Entity, Render, TitlebarOptions, Window, WindowBounds, WindowOptions,
     div, prelude::*, px, size,
@@ -12,23 +12,36 @@ const SAMPLE: &str = "\
 # Dainiki workbench
 
 The editor renders the raw Markdown source as plain text for now; live preview
-arrives one construct family at a time (D2 first). A long paragraph like this
-one exists in the sample to show that soft wrapping follows the column width —
-resize the window and the line breaks should move accordingly.
+arrives one construct family at a time (D2 first). Long paragraphs like this one
+show that soft wrapping follows the column width - resize the window and the
+line breaks move accordingly.
 
-- Unicode shaping works too: héllo — 日本語 — emoji 🎉
+Keep scrolling: the offset is owned by the editor view, not by a GPUI scroll
+container, and the element skips lines outside the viewport when painting. The
+thin indicator on the right tracks your position through the document.
+
+Scrolling past the fold is the point of A3: wheel ticks move by whole lines,
+trackpad gestures move by exact pixels and continue with OS momentum after your
+fingers lift.
+
+- Unicode shaping works too: héllo - 日本語 - emoji 🎉
 - This second item exists mainly to make the list rhythm visible.
 
 > A quote line, rendered as plain text for now.
 
-Run me against a real file:
+Scroll to the end to confirm the indicator reaches the bottom and the last line
+stays fully visible above it:
 
     cargo run -p dainiki-editor --example workbench -- ~/journal/2026-10-17.md
+
+One more paragraph so the sample reliably overflows a 640 pt window. In later
+steps this file grows a caret, selection, and inline constructs; for now the
+only way to move through it is the scroll offset you are exercising.
 ";
 
 struct Workbench {
     theme: EditorTheme,
-    buffer: Entity<Buffer>,
+    editor: Entity<MarkdownEditor>,
 }
 
 impl Render for Workbench {
@@ -36,16 +49,16 @@ impl Render for Workbench {
         div()
             .size_full()
             .bg(self.theme.background)
-            .text_color(self.theme.text)
             .flex()
             .justify_center()
             .child(
                 div()
                     .w_full()
                     .max_w(px(720.0))
+                    .h_full()
                     .px_6()
                     .py_6()
-                    .child(EditorElement::new(self.buffer.clone())),
+                    .child(self.editor.clone()),
             )
     }
 }
@@ -83,10 +96,9 @@ fn main() {
                 ..Default::default()
             },
             move |_window, cx| {
-                cx.new(|_cx| Workbench {
-                    theme: EditorTheme::default(),
-                    buffer: buffer.clone(),
-                })
+                let theme = EditorTheme::default();
+                let editor = cx.new(|_cx| MarkdownEditor::new(buffer.clone(), theme.clone()));
+                cx.new(|_cx| Workbench { theme, editor })
             },
         )
         .expect("failed to open workbench window");

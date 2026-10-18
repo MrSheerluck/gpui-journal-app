@@ -1,14 +1,18 @@
 //! Dainiki desktop shell: window chrome, journal onboarding and the editor.
+//!
+//! App chrome and standard UI use gpui-kit components wherever one fits
+//! (ADR-0006); the editor crate stays GPUI-primitives-only.
 
 mod config;
 mod journal;
 mod persistence;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 use dainiki_editor::{
     Buffer, EditorEvent, EditorTheme, MarkdownEditor,
     commands::{BlockFormat, InlineFormat},
@@ -17,7 +21,10 @@ use gpui_kit::component::Disableable;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::button::{Button, ButtonVariants, Toggle, ToggleGroup};
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::label::Label;
 use gpui_kit::component::popover::Popover;
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::separator::Separator;
 use gpui_kit::component::text::markdown;
 use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::{h_flex, v_flex};
@@ -44,9 +51,13 @@ enum Screen {
     Journal(Box<JournalSession>),
 }
 
-/// An open journal: today's entry in the editor, autosave and chrome state.
+/// An open journal: today's entry in the editor, past days for the stream,
+/// autosave and chrome state.
 struct JournalSession {
     path: PathBuf,
+    /// Past days with real content — an empty day is no entry. Today is not
+    /// here; the live editor owns it.
+    days: BTreeMap<NaiveDate, String>,
     editor: Entity<MarkdownEditor>,
     dirty: bool,
     last_seen: Option<String>,
@@ -107,6 +118,26 @@ impl DainikiApp {
         let content = loaded.clone().unwrap_or_default();
         let base_dir = path.parent().map(Path::to_path_buf);
 
+        // Read the past days for the stream. Days with an empty file are no
+        // entry and stay out. (Reading happens once at open; a background
+        // scan is the G4 concern.)
+        let mut days = BTreeMap::new();
+        for date in journal.entry_dates() {
+            if date >= today {
+                continue;
+            }
+            let day_path = journal.entry_path(date);
+            match std::fs::read_to_string(&day_path) {
+                Ok(text) if !text.trim().is_empty() => {
+                    days.insert(date, text);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(path = %day_path.display(), error = %error, "could not read an entry");
+                }
+            }
+        }
+
         let theme = self.theme.clone();
         let buffer = cx.new(|_| Buffer::from_text(&content));
         let editor = cx.new(|cx| {
@@ -132,6 +163,7 @@ impl DainikiApp {
         tracing::info!(root = %root.display(), path = %path.display(), "journal opened");
         self.screen = Screen::Journal(Box::new(JournalSession {
             path,
+            days,
             editor,
             dirty: false,
             last_seen: loaded,
@@ -377,19 +409,46 @@ impl DainikiApp {
 }
 
 impl JournalSession {
-    fn view(&self, theme: &EditorTheme, settings: Popover, cx: &App) -> impl IntoElement {
-        let content = if self.preview {
-            let text = self.editor.read(cx).content(cx);
-            div()
-                .id("reading-view")
-                .w_full()
-                .max_w(px(720.))
-                .overflow_y_scroll()
-                .child(markdown(text))
-                .into_any_element()
-        } else {
-            self.editor.clone().into_any_element()
-        };
+    fn view(
+        &self,
+        theme: &EditorTheme,
+        settings: Popover,
+        show_empty_days: bool,
+        window: &Window,
+        cx: &App,
+    ) -> impl IntoElement {
+        let today = Local::now().date_naive();
+        let existing: BTreeSet<NaiveDate> = self.days.keys().copied().collect();
+        let dates = journal::stream_dates(&existing, today, show_empty_days);
+
+        // The live day gets a viewport-sized editing surface inside the
+        // stream. (The nested-scroll handoff to a focused day is the G3
+        // concern.)
+        let editor_height = px((window.viewport_size().height.as_f32() * 0.55).max(320.0));
+
+        let mut stream = v_flex().gap_8();
+        for date in dates {
+            let header = Separator::horizontal().label(day_label(date, today));
+            let body: AnyElement = if date == today {
+                if self.preview {
+                    let text = self.editor.read(cx).content(cx);
+                    div().child(markdown(text)).into_any_element()
+                } else {
+                    div()
+                        .h(editor_height)
+                        .child(self.editor.clone())
+                        .into_any_element()
+                }
+            } else if let Some(text) = self.days.get(&date) {
+                div().child(markdown(text.clone())).into_any_element()
+            } else {
+                div()
+                    .child(Label::new("No entry yet").secondary("— write it later"))
+                    .into_any_element()
+            };
+            stream = stream.child(v_flex().gap_3().child(header).child(body));
+        }
+
         div()
             .size_full()
             .flex()
@@ -412,13 +471,21 @@ impl JournalSession {
                 ),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .bg(theme.background)
-                    .px_10()
-                    .py_6()
-                    .child(content),
+                div().flex_1().min_h_0().bg(theme.background).child(
+                    div()
+                        .size_full()
+                        .overflow_y_scrollbar()
+                        .id("timeline")
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .max_w(px(760.))
+                                .mx_auto()
+                                .px_10()
+                                .py_6()
+                                .child(stream),
+                        ),
+                ),
             )
     }
 
@@ -647,6 +714,16 @@ impl JournalSession {
     }
 }
 
+/// "Today · Monday, 19 October 2026" for today; the plain date otherwise.
+fn day_label(date: NaiveDate, today: NaiveDate) -> String {
+    let formatted = date.format("%A, %-d %B %Y").to_string();
+    if date == today {
+        format!("Today · {formatted}")
+    } else {
+        formatted
+    }
+}
+
 /// Copies an image into the journal's `assets/` folder under a fresh name,
 /// returning `(alt text, relative markdown path)`.
 fn copy_image(source: &Path, assets: &Path) -> Result<(String, String), String> {
@@ -681,12 +758,20 @@ fn copy_image(source: &Path, assets: &Path) -> Result<(String, String), String> 
 }
 
 impl Render for DainikiApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let screen = match &self.screen {
             Screen::Welcome { notice } => self.welcome_view(notice, cx).into_any_element(),
             Screen::Journal(session) => {
                 let settings = self.settings_menu(cx);
-                session.view(&self.theme, settings, cx).into_any_element()
+                session
+                    .view(
+                        &self.theme,
+                        settings,
+                        self.config.show_empty_days,
+                        window,
+                        cx,
+                    )
+                    .into_any_element()
             }
         };
         div()
@@ -781,13 +866,13 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use chrono::Local;
+    use chrono::{Local, NaiveDate};
     use gpui::TestAppContext;
 
     // NOTE: no `use super::*` here. The crate root glob-imports `gpui_kit::*`,
     // which re-exports gpui's `test` proc macro; globbing it in would shadow
     // the builtin `#[test]` inside the generated harness and recurse forever.
-    use super::{DainikiApp, EditorTheme, Screen, config, journal, resolve_cli_root};
+    use super::{DainikiApp, EditorTheme, Screen, config, day_label, journal, resolve_cli_root};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -851,6 +936,14 @@ mod tests {
         });
     }
 
+    #[test]
+    fn day_labels_name_the_day_and_mark_today() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 19).expect("date");
+        let earlier = NaiveDate::from_ymd_opt(2026, 10, 5).expect("date");
+        assert_eq!(day_label(earlier, today), "Monday, 5 October 2026");
+        assert_eq!(day_label(today, today), "Today · Monday, 19 October 2026");
+    }
+
     #[gpui::test]
     async fn entering_a_journal_creates_and_loads_todays_entry(cx: &mut TestAppContext) {
         init(cx);
@@ -859,6 +952,16 @@ mod tests {
         let today = Local::now().date_naive();
         let path = journal.ensure_entry(today).expect("ensure");
         fs::write(&path, "# written earlier today\n").expect("seed");
+
+        // A past day with content joins the stream; an empty past day is not
+        // an entry.
+        let yesterday = today.pred_opt().expect("yesterday");
+        let blank_day = yesterday.pred_opt().expect("earlier");
+        for (date, text) in [(yesterday, "# yesterday's words\n"), (blank_day, "   \n")] {
+            let day_path = journal.entry_path(date);
+            fs::create_dir_all(day_path.parent().unwrap()).expect("dirs");
+            fs::write(&day_path, text).expect("seed");
+        }
 
         let (app, cx) = cx.add_window_view({
             let dir = dir.clone();
@@ -878,6 +981,11 @@ mod tests {
             assert_eq!(
                 session.editor.read(cx).content(cx),
                 "# written earlier today\n"
+            );
+            assert_eq!(session.days.len(), 1, "only the day with content streams");
+            assert_eq!(
+                session.days.get(&yesterday).map(String::as_str),
+                Some("# yesterday's words\n")
             );
         });
         fs::remove_dir_all(&dir).ok();

@@ -639,6 +639,20 @@ impl DainikiApp {
         }
     }
 
+    /// Persists a preferences change (the in-memory value stays authoritative
+    /// for this session even when the write fails). Note: never call this from
+    /// tests — it writes the real user config.
+    fn set_show_empty_days(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.config.show_empty_days == show {
+            return;
+        }
+        self.config.show_empty_days = show;
+        if let Err(error) = config::save(&self.config) {
+            tracing::warn!(error = %error, "could not save preferences");
+        }
+        cx.notify();
+    }
+
     fn welcome_view(&self, notice: &Option<String>, cx: &Context<Self>) -> impl IntoElement {
         let create = cx.weak_entity();
         let open = cx.weak_entity();
@@ -1104,7 +1118,7 @@ impl JournalSession {
                     .min_h_0()
                     .flex()
                     .flex_row()
-                    .child(self.sidebar(&this, cx))
+                    .child(self.sidebar(show_empty_days, &this, cx))
                     .child(main),
             )
     }
@@ -1188,7 +1202,12 @@ impl JournalSession {
     }
 
     /// The left rail: Timeline, Tags, and the bottom block.
-    fn sidebar(&self, this: &WeakEntity<DainikiApp>, cx: &App) -> AnyElement {
+    fn sidebar(
+        &self,
+        show_empty_days: bool,
+        this: &WeakEntity<DainikiApp>,
+        cx: &App,
+    ) -> AnyElement {
         // Tag counts: the index over stored days, plus the open day's tags
         // when they are not already counted for it.
         let active_date = self.active.as_ref().map(|active| active.date);
@@ -1293,6 +1312,7 @@ impl JournalSession {
                     .border_t_1()
                     .border_color(brand::outline_variant().opacity(0.4))
                     .child(self.calendar_card(active_date, this))
+                    .child(self.settings_menu(show_empty_days, this))
                     .child(
                         h_flex()
                             .gap_2()
@@ -1314,6 +1334,47 @@ impl JournalSession {
                     ),
             )
             .into_any_element()
+    }
+
+    /// Journal preferences, opened from the sidebar's bottom block.
+    fn settings_menu(&self, show_empty_days: bool, this: &WeakEntity<DainikiApp>) -> Popover {
+        let root = self.root.clone();
+        let toggle_this = this.clone();
+        let reveal_root = root.clone();
+        Popover::new("settings")
+            .trigger(Button::new("settings-trigger").label("Settings").compact())
+            .content(move |_state, _window, _cx| {
+                let toggle_this = toggle_this.clone();
+                let reveal_root = reveal_root.clone();
+                v_flex()
+                    .w(px(320.))
+                    .gap_3()
+                    .text_sm()
+                    .child(
+                        Toggle::new("show-empty-days")
+                            .label("Show days without entries")
+                            .checked(show_empty_days)
+                            .on_click(move |checked, _window, cx| {
+                                toggle_this
+                                    .update(cx, |app, cx| app.set_show_empty_days(*checked, cx))
+                                    .ok();
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(brand::outline())
+                            .child(root.display().to_string()),
+                    )
+                    .child(
+                        Button::new("reveal-journal")
+                            .label("Reveal in Finder")
+                            .compact()
+                            .on_click(move |_, _window, cx| {
+                                cx.open_url(&format!("file://{}", reveal_root.display()));
+                            }),
+                    )
+            })
     }
 
     /// The sidebar calendar: a month at a glance, entry days dotted, today in

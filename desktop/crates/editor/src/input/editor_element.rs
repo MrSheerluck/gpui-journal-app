@@ -3,15 +3,16 @@ use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
     App, AvailableSpace, Bounds, DefiniteLength, DispatchPhase, Element, ElementId,
-    ElementInputHandler, Entity, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId,
-    Length, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, Style, Window,
-    WrappedLine, fill, point, px,
+    ElementInputHandler, Entity, FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId,
+    IntoElement, LayoutId, Length, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size,
+    StrikethroughStyle, Style, TextRun, TextStyle, Window, WrappedLine, fill, point, px,
 };
 
 use crate::{
-    display::Style as LineStyle,
+    display::{InlineStyle, ProjectedLine, Style as LineStyle},
     editor::MarkdownEditor,
     input::scroll::{EditorScrollState, clamp_offset},
+    theme::EditorTheme,
 };
 
 const THUMB_WIDTH: f32 = 6.;
@@ -106,10 +107,11 @@ impl Element for EditorElement {
                     let line_height = base_line_height * scale;
                     let mut style = text_style.clone();
                     style.font_size = font_size.into();
+                    let runs = shape_runs(projected, &style, &theme);
                     let shaped = window.text_system().shape_text(
                         SharedString::new(projected.text.as_str()),
                         font_size,
-                        &[style.to_run(projected.text.len())],
+                        &runs,
                         wrap_width,
                         None,
                     );
@@ -500,6 +502,73 @@ fn reveal_offset(
     } else {
         current
     }
+}
+
+#[derive(Default, Clone, Copy)]
+struct InlineFlags {
+    emphasis: bool,
+    strong: bool,
+    strike: bool,
+    code: bool,
+    highlight: bool,
+}
+
+/// Builds styled text runs for a projected line: fonts carry emphasis, strong
+/// and code; decoration fields carry strike-through and background chips.
+/// Overlapping runs (nesting) compose by flag union.
+fn shape_runs(line: &ProjectedLine, base: &TextStyle, theme: &EditorTheme) -> Vec<TextRun> {
+    if line.runs.is_empty() {
+        return vec![base.to_run(line.text.len())];
+    }
+    let len = line.text.len();
+    let mut points: Vec<usize> = vec![0, len];
+    for run in &line.runs {
+        points.push(run.display.start.min(len));
+        points.push(run.display.end.min(len));
+    }
+    points.sort_unstable();
+    points.dedup();
+
+    let mut runs = Vec::with_capacity(points.len().saturating_sub(1));
+    for pair in points.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        if start >= end {
+            continue;
+        }
+        let mut flags = InlineFlags::default();
+        for run in &line.runs {
+            if run.display.start <= start && start < run.display.end {
+                match run.style {
+                    InlineStyle::Emphasis => flags.emphasis = true,
+                    InlineStyle::Strong => flags.strong = true,
+                    InlineStyle::Strikethrough => flags.strike = true,
+                    InlineStyle::Code => flags.code = true,
+                    InlineStyle::Highlight => flags.highlight = true,
+                }
+            }
+        }
+        let mut style = base.clone();
+        if flags.strong {
+            style.font_weight = FontWeight::BOLD;
+        }
+        if flags.emphasis {
+            style.font_style = FontStyle::Italic;
+        }
+        if flags.code {
+            style.font_family = theme.mono_font_family.clone();
+            style.background_color = Some(theme.code_background);
+        } else if flags.highlight {
+            style.background_color = Some(theme.highlight_background);
+        }
+        if flags.strike {
+            style.strikethrough = Some(StrikethroughStyle {
+                thickness: px(1.),
+                color: None,
+            });
+        }
+        runs.push(style.to_run(end - start));
+    }
+    runs
 }
 
 #[derive(Clone, Default)]

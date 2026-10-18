@@ -1,4 +1,4 @@
-use gpui::{Hsla, rgb, rgba};
+use gpui::{Hsla, SharedString, rgb, rgba};
 
 #[derive(Clone, Debug)]
 pub struct EditorTheme {
@@ -7,6 +7,12 @@ pub struct EditorTheme {
     pub scrollbar: Hsla,
     pub caret: Hsla,
     pub selection: Hsla,
+    /// Background chip behind inline code.
+    pub code_background: Hsla,
+    /// Background behind `==highlight==`.
+    pub highlight_background: Hsla,
+    /// Family used for inline code and fenced code.
+    pub mono_font_family: SharedString,
     /// Font size multipliers for H1–H3; deeper headings use the last entry.
     pub heading_scales: [f32; 3],
 }
@@ -19,6 +25,9 @@ impl Default for EditorTheme {
             scrollbar: rgba(0x00000033).into(),
             caret: rgb(0x2F6FEB).into(),
             selection: rgba(0x2F6FEB33).into(),
+            code_background: rgba(0x0000000F).into(),
+            highlight_background: rgba(0xFFD54A80).into(),
+            mono_font_family: SharedString::new_static("Menlo"),
             heading_scales: [1.6, 1.35, 1.15],
         }
     }

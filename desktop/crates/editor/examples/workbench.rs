@@ -25,6 +25,10 @@ word, command by line, command-up/down jumps to the document bounds), shift
 extends the selection, and Enter inserts a newline. IME composition renders an
 underline until you commit it.
 
+Inline styles: **bold**, *italic*, ~~struck through~~, `inline code` and
+==highlighted== all render collapsed; put the caret inside a span to reveal its
+markers. Headings collapse to real sizes once the caret leaves their line.
+
 - Unicode shaping works too: héllo - 日本語 - emoji 🎉
 - This second item exists mainly to make the list rhythm visible.
 

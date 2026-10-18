@@ -56,6 +56,8 @@ struct DainikiApp {
     theme: EditorTheme,
     config: config::Config,
     screen: Screen,
+    /// Watches the window appearance so `System` theme follows it.
+    _appearance: Option<Subscription>,
 }
 
 enum Screen {
@@ -158,7 +160,65 @@ impl DainikiApp {
             theme,
             config,
             screen: Screen::Welcome { notice: None },
+            _appearance: None,
         }
+    }
+
+    /// Starts following the system appearance (relevant while the theme
+    /// preference is `System`).
+    fn watch_appearance(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        self._appearance = Some(window.observe_window_appearance(move |window, cx| {
+            weak.update(cx, |app, cx| app.on_system_appearance(window, cx))
+                .ok();
+        }));
+    }
+
+    /// The window's appearance changed: re-resolve when the preference is
+    /// `System`, otherwise the explicit choice wins.
+    fn on_system_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config.theme != config::ThemePreference::System {
+            return;
+        }
+        let mode = resolve_mode(config::ThemePreference::System, window.appearance());
+        if mode != brand::mode() {
+            self.apply_mode(mode, window, cx);
+        }
+    }
+
+    /// Persists and applies a theme preference.
+    fn set_theme_preference(
+        &mut self,
+        preference: config::ThemePreference,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.config.theme == preference {
+            return;
+        }
+        self.config.theme = preference;
+        if let Err(error) = config::save(&self.config) {
+            tracing::warn!(error = %error, "could not save preferences");
+        }
+        self.apply_mode(resolve_mode(preference, window.appearance()), window, cx);
+    }
+
+    /// Repaints the whole app in `mode`: the brand palette, the component
+    /// theme, the open editor, and every window.
+    fn apply_mode(&mut self, mode: brand::Mode, window: &mut Window, cx: &mut Context<Self>) {
+        brand::set_mode(mode);
+        self.theme = brand::editor_theme_for(mode);
+        let theme = self.theme.clone();
+        if let Some(session) = self.session_mut()
+            && let Some(active) = session.active.as_mut()
+        {
+            active
+                .editor
+                .update(cx, |editor, cx| editor.set_theme(theme, cx));
+        }
+        brand::apply_component_theme(cx);
+        cx.refresh_windows();
+        window.refresh();
     }
 
     fn session(&self) -> Option<&JournalSession> {
@@ -1059,6 +1119,7 @@ impl JournalSession {
         &self,
         theme: &EditorTheme,
         show_empty_days: bool,
+        theme_preference: config::ThemePreference,
         window: &Window,
         this: WeakEntity<DainikiApp>,
         cx: &App,
@@ -1454,6 +1515,13 @@ impl JournalSession {
                                             })
                                             .ok();
                                     }),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .items_center()
+                                    .child(div().w(px(180.)).text_size(px(12.)).child("Theme"))
+                                    .child(theme_picker(this.clone(), theme_preference)),
                             )
                             .child(
                                 h_flex()
@@ -2725,7 +2793,14 @@ impl Render for DainikiApp {
         let screen = match &self.screen {
             Screen::Welcome { notice } => self.welcome_view(notice, cx).into_any_element(),
             Screen::Journal(session) => session
-                .view(&self.theme, self.config.show_empty_days, window, this, cx)
+                .view(
+                    &self.theme,
+                    self.config.show_empty_days,
+                    self.config.theme,
+                    window,
+                    this,
+                    cx,
+                )
                 .into_any_element(),
         };
         div()
@@ -2806,6 +2881,51 @@ fn resolve_cli_root(arg: Option<PathBuf>) -> Option<PathBuf> {
     None
 }
 
+/// Resolves a theme preference against the current window appearance.
+fn resolve_mode(preference: config::ThemePreference, appearance: WindowAppearance) -> brand::Mode {
+    match preference {
+        config::ThemePreference::Light => brand::Mode::Light,
+        config::ThemePreference::Dark => brand::Mode::Dark,
+        config::ThemePreference::System => match appearance {
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => brand::Mode::Dark,
+            _ => brand::Mode::Light,
+        },
+    }
+}
+
+/// The System/Light/Dark picker. The group callback owns the change: the
+/// component replaces per-toggle callbacks inside a group.
+fn theme_picker(this: WeakEntity<DainikiApp>, current: config::ThemePreference) -> ToggleGroup {
+    use config::ThemePreference as Pref;
+    ToggleGroup::new("theme-pref")
+        .segmented()
+        .child(
+            Toggle::new("theme-system")
+                .label("System")
+                .checked(current == Pref::System),
+        )
+        .child(
+            Toggle::new("theme-light")
+                .label("Light")
+                .checked(current == Pref::Light),
+        )
+        .child(
+            Toggle::new("theme-dark")
+                .label("Dark")
+                .checked(current == Pref::Dark),
+        )
+        .on_click(move |next: &Vec<bool>, window, cx| {
+            let Some(index) = next.iter().position(|checked| *checked) else {
+                return;
+            };
+            let preference = [Pref::System, Pref::Light, Pref::Dark][index];
+            this.update(cx, |app, cx| {
+                app.set_theme_preference(preference, window, cx)
+            })
+            .ok();
+        })
+}
+
 fn open_app_window(cx: &mut App, config: config::Config, root: Option<PathBuf>) -> Result<()> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -2817,9 +2937,16 @@ fn open_app_window(cx: &mut App, config: config::Config, root: Option<PathBuf>) 
     };
 
     gpui_kit::open_window(options, cx, move |window, cx| {
-        let theme = brand::editor_theme();
+        // The window exists: resolve the theme against its appearance before
+        // anything paints.
+        let preference = config.theme;
+        let mode = resolve_mode(preference, window.appearance());
+        brand::set_mode(mode);
+        brand::apply_component_theme(cx);
+        let theme = brand::editor_theme_for(mode);
         cx.new(|cx| {
             let mut app = DainikiApp::new(theme, config);
+            app.watch_appearance(window, cx);
             if let Some(root) = root {
                 if root.is_dir() {
                     app.enter_journal(root, window, cx);
@@ -2848,7 +2975,7 @@ mod tests {
     // the builtin `#[test]` inside the generated harness and recurse forever.
     use super::{
         DainikiApp, Screen, brand, config, day_heading, day_number, journal, month_grid,
-        parse_jump_date, resolve_cli_root,
+        parse_jump_date, resolve_cli_root, resolve_mode,
     };
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -2882,6 +3009,33 @@ mod tests {
     #[test]
     fn no_argument_resolves_to_nothing() {
         assert_eq!(resolve_cli_root(None), None);
+    }
+
+    #[test]
+    fn theme_preference_resolves_against_the_system() {
+        use super::config::ThemePreference as Pref;
+        use gpui::WindowAppearance;
+        assert_eq!(
+            resolve_mode(Pref::System, WindowAppearance::Dark),
+            brand::Mode::Dark
+        );
+        assert_eq!(
+            resolve_mode(Pref::System, WindowAppearance::VibrantDark),
+            brand::Mode::Dark
+        );
+        assert_eq!(
+            resolve_mode(Pref::System, WindowAppearance::Light),
+            brand::Mode::Light
+        );
+        assert_eq!(
+            resolve_mode(Pref::Dark, WindowAppearance::Light),
+            brand::Mode::Dark,
+            "an explicit choice wins over the system"
+        );
+        assert_eq!(
+            resolve_mode(Pref::Light, WindowAppearance::Dark),
+            brand::Mode::Light
+        );
     }
 
     #[test]

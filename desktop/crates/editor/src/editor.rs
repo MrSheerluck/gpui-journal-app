@@ -168,6 +168,14 @@ impl MarkdownEditor {
         &self.focus_handle
     }
 
+    /// Swaps the editor's theme. Colors repaint on the next frame; tokens
+    /// that affect metrics (heading scales, body font) apply to lines shaped
+    /// after the next full re-layout.
+    pub fn set_theme(&mut self, theme: EditorTheme, cx: &mut Context<Self>) {
+        self.theme = theme;
+        cx.notify();
+    }
+
     pub(crate) fn theme(&self) -> &EditorTheme {
         &self.theme
     }

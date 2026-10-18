@@ -7,6 +7,17 @@ use std::path::{Path, PathBuf};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+/// Which palette the app paints in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreference {
+    /// Follow the system appearance.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 /// The app's configuration, persisted as typed TOML.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Config {
@@ -16,6 +27,9 @@ pub struct Config {
     /// Whether days without an entry appear in the journal timeline.
     #[serde(default = "default_show_empty_days")]
     pub show_empty_days: bool,
+    /// The colour mode; defaults to following the system.
+    #[serde(default)]
+    pub theme: ThemePreference,
 }
 
 impl Default for Config {
@@ -23,6 +37,7 @@ impl Default for Config {
         Self {
             journal_root: None,
             show_empty_days: default_show_empty_days(),
+            theme: ThemePreference::default(),
         }
     }
 }
@@ -123,6 +138,29 @@ mod tests {
         fs::write(&path, "show_empty_days = false\n").expect("seed");
         let config = load_from(&path).expect("load");
         assert!(!config.show_empty_days);
+        assert_eq!(
+            config.theme,
+            super::ThemePreference::System,
+            "default theme"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn theme_roundtrips_and_defaults_to_system() {
+        let dir = scratch_dir();
+        let path = dir.join("config.toml");
+        fs::write(&path, "theme = \"dark\"\n").expect("seed");
+        let config = load_from(&path).expect("load");
+        assert_eq!(config.theme, super::ThemePreference::Dark);
+
+        let config = Config {
+            journal_root: None,
+            show_empty_days: true,
+            theme: super::ThemePreference::Light,
+        };
+        save_to(&path, &config).expect("save");
+        assert_eq!(load_from(&path).expect("load"), config);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -153,6 +191,7 @@ mod tests {
         let config = Config {
             journal_root: Some(PathBuf::from("/journals/dainiki")),
             show_empty_days: false,
+            theme: super::ThemePreference::Dark,
         };
         save_to(&path, &config).expect("save");
         assert_eq!(load_from(&path).expect("load"), config);

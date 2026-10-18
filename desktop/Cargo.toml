@@ -18,6 +18,8 @@ ropey = { version = "=2.0.0-beta.1", features = [
     "metric_lines_lf",
     "metric_utf16",
 ] }
+tree-sitter = "=0.26.13"
+tree-sitter-md = "=0.5.1"
 unicode-segmentation = "=1.13.3"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }

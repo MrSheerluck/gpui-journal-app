@@ -3,9 +3,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    Bounds, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle, KeyDownEvent,
-    MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollWheelEvent, UTF16Selection, Window,
-    div, point, prelude::*, px, size,
+    App, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollWheelEvent,
+    UTF16Selection, Window, div, point, prelude::*, px, size,
 };
 
 use crate::{
@@ -20,6 +20,15 @@ use crate::{
 
 const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Events the host listens to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditorEvent {
+    /// The buffer text changed: typing, deletion, paste, or undo/redo.
+    Edited,
+}
+
+impl EventEmitter<EditorEvent> for MarkdownEditor {}
 
 pub struct MarkdownEditor {
     buffer: Entity<Buffer>,
@@ -106,6 +115,12 @@ impl MarkdownEditor {
 
     pub(crate) fn marked_range(&self) -> Option<Range<usize>> {
         self.marked_range.clone()
+    }
+
+    /// The editor's text content, for hosts that persist the buffer.
+    pub fn content(&self, cx: &App) -> String {
+        let buffer = self.buffer.read(cx);
+        buffer.slice(0..buffer.len_bytes())
     }
 
     pub fn scroll_by(&mut self, delta: Pixels, cx: &mut Context<Self>) {
@@ -425,6 +440,7 @@ impl MarkdownEditor {
         if let Some(selection) = selection {
             self.selection = selection;
             self.restart_blink();
+            cx.emit(EditorEvent::Edited);
             cx.notify();
         }
     }
@@ -757,6 +773,7 @@ impl MarkdownEditor {
             merge,
         );
         self.restart_blink();
+        cx.emit(EditorEvent::Edited);
         cx.notify();
     }
 }

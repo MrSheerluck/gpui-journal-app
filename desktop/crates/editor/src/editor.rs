@@ -552,7 +552,7 @@ impl MarkdownEditor {
                     cx.stop_propagation();
                     return;
                 }
-                "x" => {
+                "x" if !keystroke.modifiers.shift => {
                     self.cut_selection(cx);
                     cx.stop_propagation();
                     return;
@@ -1242,7 +1242,7 @@ mod interaction_tests {
         let (editor, cx) = setup(cx, "hello\nworld\n");
         // Render one frame so the display plan and measured layout exist.
         cx.update(|window, cx| {
-            window.draw(cx);
+            let _ = window.draw(cx);
         });
         cx.simulate_keystrokes("right right");
         cx.update(|_, app| {
@@ -1282,7 +1282,7 @@ mod interaction_tests {
     async fn clicking_places_the_caret(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx, "hello\nworld\n");
         cx.update(|window, cx| {
-            window.draw(cx);
+            let _ = window.draw(cx);
         });
         cx.simulate_click(point(px(2.), px(8.)), gpui::Modifiers::default());
         cx.update(|_, app| {
@@ -1325,7 +1325,7 @@ mod interaction_tests {
 
         // The parsed construct intercepts a second toggle and unwraps.
         cx.update(|window, cx| {
-            window.draw(cx);
+            let _ = window.draw(cx);
         });
         cx.simulate_keystrokes("cmd-b");
         cx.update(|_, app| {

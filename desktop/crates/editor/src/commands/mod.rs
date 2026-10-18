@@ -132,21 +132,17 @@ pub fn toggle_block(text: &str, selection: Selection, format: BlockFormat) -> Op
         .iter()
         .filter(|line| !line.is_blank)
         .all(|line| line.block == Some(format));
-    let stripped: Vec<(String, bool)> = lines
+    let stripped: Vec<String> = lines
         .iter()
-        .map(|line| {
-            let (content, had_prefix) = strip_block_prefix(&text[line.start..line.end]);
-            (content, had_prefix)
-        })
+        .map(|line| strip_block_prefix(&text[line.start..line.end]))
         .collect();
 
     let mut new_text = String::new();
     let mut number = 0usize;
-    for (ix, line) in lines.iter().enumerate() {
+    for (ix, content) in stripped.iter().enumerate() {
         if ix > 0 {
             new_text.push('\n');
         }
-        let (content, had_prefix) = &stripped[ix];
         if all_match {
             // Toggle off: keep the rest of the line as-is.
             new_text.push_str(content);
@@ -156,7 +152,6 @@ pub fn toggle_block(text: &str, selection: Selection, format: BlockFormat) -> Op
             // Blank lines keep their blankness (no dangling prefix).
             continue;
         }
-        let _ = had_prefix;
         let prefix = match format {
             BlockFormat::Ordered => {
                 number += 1;
@@ -301,8 +296,8 @@ fn existing_block(line: &str) -> Option<BlockFormat> {
     None
 }
 
-/// Strips any block prefix, returning the content and whether one existed.
-fn strip_block_prefix(line: &str) -> (String, bool) {
+/// Strips any block prefix, returning the content.
+fn strip_block_prefix(line: &str) -> String {
     let trimmed = line.trim_start();
     let indent_len = line.len() - trimmed.len();
     let indent = &line[..indent_len];
@@ -318,9 +313,9 @@ fn strip_block_prefix(line: &str) -> (String, bool) {
                 trimmed[digits + 2..].to_string()
             }
         };
-        return (format!("{indent}{stripped}"), true);
+        return format!("{indent}{stripped}");
     }
-    (line.to_string(), false)
+    line.to_string()
 }
 
 /// Removes an enclosing delimiter pair around a selection: `open` and `close`

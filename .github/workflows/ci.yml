@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/*"]
+  pull_request:
+
+jobs:
+  desktop:
+    name: desktop workspace
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('desktop/Cargo.lock') }}
+
+      - name: Formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Editor dependency boundary
+        run: |
+          if cargo tree -p dainiki-editor | grep -E "gpui-kit|gpui-base|gpui-component"; then
+            echo "::error::dainiki-editor must not depend on the gpui-kit stack"
+            exit 1
+          fi

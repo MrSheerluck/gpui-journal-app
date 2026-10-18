@@ -1,0 +1,35 @@
+Dainiki
+======
+Copyright (c) 2026 SMBL. Licensed under the MIT License (see LICENSE).
+
+Third-party notices
+-------------------
+
+gpui-pre 0.3.9 (the GPUI snapshot this editor is built on)
+  Copyright Zed Industries, Inc.
+  Apache License 2.0 — https://github.com/zed-industries/zed
+
+gpui-kit 0.7.3, gpui-base 0.7.3, gpui-component 0.7.3
+  (application chrome and the reading view in dainiki-desktop only)
+  Copyright Longbridge / gpui-kit contributors
+  Apache License 2.0 — https://github.com/longbridge/gpui-kit
+
+tree-sitter 0.26.13, tree-sitter-md 0.5.1 (Markdown grammars)
+  Copyright Tree-sitter contributors / ObserverOfTime and contributors
+  MIT License — https://github.com/tree-sitter-grammars/tree-sitter-markdown
+
+ropey 2.0.0-beta.1 (text rope)
+  Copyright Nathan Vegdahl and contributors
+  MIT License — https://github.com/cessen/ropey
+
+unicode-segmentation 1.13.3
+  Copyright Unicode contributors
+  MIT/Apache-2.0
+
+image 0.25.1 (image decoding)
+  Copyright the image crate developers
+  MIT/Apache-2.0
+
+No source code has been copied into this repository from the projects above;
+they are consumed as library dependencies. The editor's behavior follows the
+GPUI conventions documented by these projects' public APIs.

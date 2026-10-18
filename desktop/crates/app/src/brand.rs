@@ -58,11 +58,32 @@ pub fn outline_variant() -> Hsla {
     rgb(0xC2C8C1).into()
 }
 
-/// Serif display family for journal type. Georgia ships on every target OS;
-/// bundling Newsreader + Inter (the landing fonts) is a tracked follow-up.
-pub const SERIF_FAMILY: &str = "Georgia";
+/// The UI typeface for app chrome (bundled; see `load_fonts`).
+pub const UI_FAMILY: &str = "Inter";
+
+/// The serif for journal type — the landing's Newsreader, bundled so the app
+/// and the site are set in the same face.
+pub const SERIF_FAMILY: &str = "Newsreader";
 
 // -- themes ------------------------------------------------------------------
+
+/// Registers the bundled brand fonts with the text system. Call once at
+/// startup, before any window renders.
+pub fn load_fonts(cx: &mut App) {
+    use std::borrow::Cow;
+
+    let fonts: Vec<Cow<'static, [u8]>> = vec![
+        Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Regular.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Medium.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Inter-SemiBold.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Newsreader-Regular.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Newsreader-Medium.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Newsreader-Italic.ttf").as_slice()),
+    ];
+    if let Err(error) = cx.text_system().add_fonts(fonts) {
+        tracing::warn!(error = %error, "could not load the bundled fonts; falling back to system fonts");
+    }
+}
 
 /// The editor theme in Dainiki's palette.
 pub fn editor_theme() -> EditorTheme {
@@ -84,11 +105,11 @@ pub fn editor_theme() -> EditorTheme {
         body_font_family: Some(SERIF_FAMILY.into()),
     }
 }
-
 /// Recolors the gpui-kit components (buttons, popovers, separators, labels,
 /// scrollbars) to the same palette, so chrome and paper read as one product.
 pub fn apply_component_theme(cx: &mut App) {
     let theme = Theme::global_mut(cx);
+    theme.font_family = UI_FAMILY.into();
     let colors = &mut theme.colors;
     colors.background = surface();
     colors.foreground = on_surface();

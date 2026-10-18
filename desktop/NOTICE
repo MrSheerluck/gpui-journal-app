@@ -30,6 +30,14 @@ image 0.25.1 (image decoding)
   Copyright the image crate developers
   MIT/Apache-2.0
 
+Inter (UI typeface, bundled TTFs in crates/app/assets/fonts)
+  Copyright The Inter Project Authors (https://github.com/rsms/inter)
+  SIL Open Font License 1.1 — https://openfontlicense.org
+
+Newsreader (journal typeface, bundled TTFs in crates/app/assets/fonts)
+  Copyright Production Type / Google LLC
+  SIL Open Font License 1.1 — https://openfontlicense.org
+
 No source code has been copied into this repository from the projects above;
 they are consumed as library dependencies. The editor's behavior follows the
 GPUI conventions documented by these projects' public APIs.

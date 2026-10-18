@@ -14,7 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{Local, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate};
 use dainiki_editor::{
     Buffer, EditorEvent, EditorTheme, MarkdownEditor,
     commands::{BlockFormat, InlineFormat},
@@ -528,106 +528,144 @@ impl DainikiApp {
             .flex_col()
             .child(TitleBar::new().child("Dainiki"))
             .child(
-                v_flex()
+                div()
                     .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .gap_6()
-                    .px_8()
+                    .relative()
                     .bg(self.theme.background)
+                    // The hero glow: a soft mint wash fading down, the
+                    // closest GPUI gets to the landing's blurred gradient.
                     .child(
-                        // The landing-page badge.
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .px_3()
-                            .py_1()
-                            .rounded_full()
-                            .bg(brand::surface_container_high())
-                            .text_color(brand::on_surface_variant())
+                        div()
+                            .absolute()
+                            .top(px(-120.))
+                            .left_0()
+                            .right_0()
+                            .h(px(340.))
+                            .flex()
+                            .justify_center()
                             .child(
                                 div()
-                                    .w(px(6.))
-                                    .h(px(6.))
+                                    .w(px(840.))
+                                    .h_full()
                                     .rounded_full()
-                                    .bg(brand::primary()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .child("BUILT IN RUST & GPUI · ZERO CLOUD LOCK-IN"),
+                                    .bg(linear_gradient(
+                                        180.,
+                                        linear_color_stop(
+                                            brand::primary_fixed().opacity(0.35),
+                                            0.,
+                                        ),
+                                        linear_color_stop(
+                                            brand::primary_fixed().opacity(0.),
+                                            1.,
+                                        ),
+                                    )),
                             ),
                     )
                     .child(
                         v_flex()
+                            .size_full()
                             .items_center()
-                            .gap_4()
-                            .max_w(px(620.))
+                            .justify_center()
+                            .gap_6()
+                            .px_8()
                             .child(
-                                div()
-                                    .font_family(brand::SERIF_FAMILY)
-                                    .text_size(px(36.))
-                                    .line_height(rems(1.25))
-                                    .text_color(brand::on_surface())
-                                    .text_center()
-                                    .child("A quiet, continuous river for your thoughts."),
-                            )
-                            .child(
-                                div()
-                                    .text_center()
+                                // The landing-page badge.
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_full()
+                                    .bg(brand::surface_container_high())
                                     .text_color(brand::on_surface_variant())
                                     .child(
-                                        "Dainiki is a private, local-first daily journal. \
-                                         No cards, no document switching — just your life in an \
-                                         unbroken, beautifully typeset stream.",
+                                        div()
+                                            .w(px(6.))
+                                            .h(px(6.))
+                                            .rounded_full()
+                                            .bg(brand::primary()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .child("BUILT IN RUST & GPUI · ZERO CLOUD LOCK-IN"),
                                     ),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .mt_2()
-                            .child(
-                                Button::new("create-journal")
-                                    .label("Create new journal")
-                                    .primary()
-                                    .on_click(move |_, window, cx| {
-                                        create
-                                            .update(cx, |app, cx| {
-                                                app.create_journal_prompt(window, cx)
-                                            })
-                                            .ok();
-                                    }),
                             )
                             .child(
-                                Button::new("open-journal")
-                                    .label("Open existing folder")
-                                    .on_click(move |_, window, cx| {
-                                        open.update(cx, |app, cx| {
-                                            app.open_journal_prompt(window, cx)
-                                        })
-                                        .ok();
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .max_w(px(460.))
-                            .text_center()
-                            .text_color(brand::outline())
+                                v_flex()
+                                    .items_center()
+                                    .gap_4()
+                                    .max_w(px(720.))
+                                    .child(
+                                        div()
+                                            .font_family(brand::SERIF_FAMILY)
+                                            .text_size(px(52.))
+                                            .line_height(rems(1.15))
+                                            .text_color(brand::on_surface())
+                                            .text_center()
+                                            .child(
+                                                "A quiet, continuous river for your thoughts.",
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(19.))
+                                            .line_height(rems(1.6))
+                                            .text_center()
+                                            .text_color(brand::on_surface_variant())
+                                            .child(
+                                                "Dainiki is a private, local-first daily journal. \
+                                                 No cards, no document switching — just your life in an \
+                                                 unbroken, beautifully typeset stream.",
+                                            ),
+                                    ),
+                            )
                             .child(
-                                "Your journal is a folder of plain Markdown files you own — \
-                                 offline, no account, no lock-in.",
-                            ),
-                    )
-                    .children(notice.as_ref().map(|notice| {
-                        div()
-                            .max_w(px(460.))
-                            .text_center()
-                            .text_sm()
-                            .child(notice.clone())
-                    })),
+                                h_flex()
+                                    .gap_2()
+                                    .mt_2()
+                                    .child(
+                                        Button::new("create-journal")
+                                            .label("Create new journal")
+                                            .primary()
+                                            .on_click(move |_, window, cx| {
+                                                create
+                                                    .update(cx, |app, cx| {
+                                                        app.create_journal_prompt(window, cx)
+                                                    })
+                                                    .ok();
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("open-journal")
+                                            .label("Open existing folder")
+                                            .on_click(move |_, window, cx| {
+                                                open.update(cx, |app, cx| {
+                                                    app.open_journal_prompt(window, cx)
+                                                })
+                                                .ok();
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .max_w(px(460.))
+                                    .text_center()
+                                    .text_color(brand::outline())
+                                    .child(
+                                        "Your journal is a folder of plain Markdown files you own — \
+                                         offline, no account, no lock-in.",
+                                    ),
+                            )
+                            .children(notice.as_ref().map(|notice| {
+                                div()
+                                    .max_w(px(460.))
+                                    .text_center()
+                                    .text_sm()
+                                    .child(notice.clone())
+                            })),
+                    ),
             )
     }
 }
@@ -712,7 +750,7 @@ impl JournalSession {
                         .font_family(brand::SERIF_FAMILY)
                         .italic()
                         .text_color(brand::outline())
-                        .child("Nothing written this day — click to write it.")
+                        .child("Add thoughts for this day…")
                         .into_any_element()
                 };
                 clickable_day(item_this.clone(), date, inner)
@@ -894,39 +932,28 @@ fn read_days(root: &Path, today: NaiveDate) -> BTreeMap<NaiveDate, String> {
     days
 }
 
-/// One stream item's date header: the TODAY chip, the serif date, a hairline.
+/// One stream item's date header, following the landing's showcase: a big
+/// ghosted day number beside a serif heading ("Today, Monday, October 19").
 fn day_header(date: NaiveDate, today: NaiveDate) -> AnyElement {
-    let is_today = date == today;
-    let mut header = h_flex().items_center().gap_3();
-    if is_today {
-        header = header.child(
-            div()
-                .px_2()
-                .py(px(2.))
-                .rounded_full()
-                .bg(brand::primary_fixed())
-                .text_xs()
-                .text_color(brand::on_primary_fixed())
-                .child("TODAY"),
-        );
-    }
-    header
+    h_flex()
+        .items_center()
+        .gap_4()
         .child(
             div()
+                .w(px(64.))
+                .text_center()
                 .font_family(brand::SERIF_FAMILY)
-                .text_xl()
-                .text_color(if is_today {
-                    brand::on_surface()
-                } else {
-                    brand::on_surface_variant()
-                })
-                .child(day_label(date)),
+                .text_size(px(44.))
+                .line_height(rems(1.))
+                .text_color(brand::outline_variant())
+                .child(day_number(date)),
         )
         .child(
             div()
-                .flex_1()
-                .h(px(1.))
-                .bg(brand::outline_variant().opacity(0.55)),
+                .font_family(brand::SERIF_FAMILY)
+                .text_size(px(22.))
+                .text_color(brand::on_surface())
+                .child(day_heading(date, today)),
         )
         .into_any_element()
 }
@@ -1192,9 +1219,26 @@ impl ActiveDay {
     }
 }
 
-/// "Monday, 19 October 2026".
-fn day_label(date: NaiveDate) -> String {
-    date.format("%A, %-d %B %Y").to_string()
+/// The ghosted day number beside a day's heading, as in the landing's
+/// showcase: `19`.
+fn day_number(date: NaiveDate) -> String {
+    date.format("%-d").to_string()
+}
+
+/// A day's heading, as in the landing's showcase: `Today, Monday, October 19`
+/// — with the year only when it is not the current year.
+fn day_heading(date: NaiveDate, today: NaiveDate) -> String {
+    let base = date.format("%A, %B %-d").to_string();
+    let dated = if date.year() == today.year() {
+        base
+    } else {
+        format!("{base}, {}", date.year())
+    };
+    if date == today {
+        format!("Today, {dated}")
+    } else {
+        dated
+    }
 }
 
 /// Parses what the date-jump panel accepts: `YYYY-MM-DD` (slashes too) and
@@ -1303,6 +1347,7 @@ fn main() {
 
     gpui_kit::application().run(move |cx: &mut App| {
         gpui_kit::init(cx);
+        brand::load_fonts(cx);
         brand::apply_component_theme(cx);
         bind_keys(cx);
         open_app_window(cx, config, root.clone()).expect("failed to open the Dainiki window");
@@ -1375,15 +1420,17 @@ mod tests {
     // which re-exports gpui's `test` proc macro; globbing it in would shadow
     // the builtin `#[test]` inside the generated harness and recurse forever.
     use super::{
-        DainikiApp, Screen, brand, config, day_label, journal, parse_jump_date, resolve_cli_root,
+        DainikiApp, Screen, brand, config, day_heading, day_number, journal, parse_jump_date,
+        resolve_cli_root,
     };
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     /// The component library needs its theme global before any view renders;
-    /// production also applies the brand palette and key bindings.
+    /// production also loads the brand fonts, palette and key bindings.
     fn init(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
+        cx.update(brand::load_fonts);
         cx.update(brand::apply_component_theme);
         cx.update(super::bind_keys);
     }
@@ -1436,9 +1483,17 @@ mod tests {
     }
 
     #[test]
-    fn day_labels_name_the_day() {
+    fn day_headings_follow_the_showcase() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 19).expect("date");
         let earlier = NaiveDate::from_ymd_opt(2026, 10, 5).expect("date");
-        assert_eq!(day_label(earlier), "Monday, 5 October 2026");
+        let last_year = NaiveDate::from_ymd_opt(2025, 12, 31).expect("date");
+        assert_eq!(day_number(earlier), "5");
+        assert_eq!(day_heading(earlier, today), "Monday, October 5");
+        assert_eq!(day_heading(today, today), "Today, Monday, October 19");
+        assert_eq!(
+            day_heading(last_year, today),
+            "Wednesday, December 31, 2025"
+        );
     }
 
     #[test]

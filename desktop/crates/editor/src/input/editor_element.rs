@@ -126,6 +126,9 @@ impl Element for EditorElement {
                     }
                     let mut style = text_style.clone();
                     style.font_size = font_size.into();
+                    if let Some(family) = &theme.body_font_family {
+                        style.font_family = family.clone();
+                    }
                     match projected.style {
                         LineStyle::Quote => style.color = theme.text.opacity(0.65),
                         LineStyle::Code { marker } => {

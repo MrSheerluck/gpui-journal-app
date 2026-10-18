@@ -7,6 +7,8 @@ pub struct EditorTheme {
     pub scrollbar: Hsla,
     pub caret: Hsla,
     pub selection: Hsla,
+    /// Family for body text; `None` inherits the host's UI font.
+    pub body_font_family: Option<SharedString>,
     /// Background chip behind inline code.
     pub code_background: Hsla,
     /// Background across fenced code block content lines.
@@ -34,6 +36,7 @@ impl Default for EditorTheme {
             scrollbar: rgba(0x00000033).into(),
             caret: rgb(0x2F6FEB).into(),
             selection: rgba(0x2F6FEB33).into(),
+            body_font_family: None,
             code_background: rgba(0x0000000F).into(),
             code_block_background: rgba(0x00000012).into(),
             highlight_background: rgba(0xFFD54A80).into(),

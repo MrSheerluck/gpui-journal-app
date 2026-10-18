@@ -187,6 +187,17 @@ impl MarkdownEditor {
         buffer.slice(0..buffer.len_bytes())
     }
 
+    /// Collapses the caret to the end of the entry. Hosts call this when they
+    /// swap the buffer to a day the user just opened, so typing continues
+    /// where the entry left off. The next render reveals the caret.
+    pub fn place_caret_at_end(&mut self, cx: &mut Context<Self>) {
+        let end = self.buffer.read(cx).len_bytes();
+        self.selection = Selection::caret(end);
+        self.history.break_run();
+        self.restart_blink();
+        cx.notify();
+    }
+
     /// The current display projection (cheap `Rc` clone).
     pub(crate) fn plan(&self) -> Rc<DisplayPlan> {
         self.plan.clone()
@@ -431,10 +442,14 @@ impl MarkdownEditor {
         self.images.clone()
     }
 
-    pub fn scroll_by(&mut self, delta: Pixels, cx: &mut Context<Self>) {
-        if self.scroll.scroll_by(delta) {
+    /// Scrolls by `delta`; returns whether the offset actually changed, so
+    /// hosts can implement scroll chaining at the editor's bounds.
+    pub fn scroll_by(&mut self, delta: Pixels, cx: &mut Context<Self>) -> bool {
+        let scrolled = self.scroll.scroll_by(delta);
+        if scrolled {
             cx.notify();
         }
+        scrolled
     }
 
     fn on_scroll_wheel(
@@ -444,7 +459,12 @@ impl MarkdownEditor {
         cx: &mut Context<Self>,
     ) {
         let delta = event.delta.pixel_delta(window.line_height()).y;
-        self.scroll_by(delta, cx);
+        if self.scroll_by(delta, cx) {
+            // The editor consumed this wheel event; don't also scroll the
+            // timeline it sits in. At a scroll bound `scroll_by` is false and
+            // the event bubbles, so the timeline takes over.
+            cx.stop_propagation();
+        }
     }
 
     fn on_mouse_down(

@@ -22,9 +22,10 @@
 //!   [`MarkdownEditor::insert_image`], [`MarkdownEditor::insert_code_fence`],
 //!   [`MarkdownEditor::insert_rule`]) with their active-state queries
 //!   ([`MarkdownEditor::inline_format_active`],
-//!   [`MarkdownEditor::block_format_active`]).
+//!   [`MarkdownEditor::block_format_active`]), and place the caret at the end
+//!   of a freshly swapped buffer ([`MarkdownEditor::place_caret_at_end`]).
 //! - [`Buffer`] — the rope-backed text store.
-//! - [`EditorTheme`] — colors and heading scales.
+//! - [`EditorTheme`] — colors, heading scales and the optional body font family.
 //! - [`commands`] — pure `(text, selection) -> Edit` transforms, independently
 //!   testable and usable without any GPUI context.
 //! - [`EditorEvent`] — `Edited`, emitted once per buffer mutation.

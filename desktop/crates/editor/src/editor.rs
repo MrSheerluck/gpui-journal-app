@@ -1,9 +1,11 @@
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Render,
-    ScrollWheelEvent, Window, div, point, prelude::*,
+    Bounds, Context, Entity, EntityInputHandler, FocusHandle, KeyDownEvent, MouseButton,
+    MouseDownEvent, Pixels, Point, Render, ScrollWheelEvent, UTF16Selection, Window, div, point,
+    prelude::*, px, size,
 };
 
 use crate::{
@@ -21,6 +23,7 @@ pub struct MarkdownEditor {
     layout: EditorLayout,
     selection: Selection,
     focus_handle: FocusHandle,
+    marked_range: Option<Range<usize>>,
     caret_visible: bool,
     blink_epoch: u64,
     focused: bool,
@@ -35,6 +38,7 @@ impl MarkdownEditor {
             layout: EditorLayout::default(),
             selection: Selection::default(),
             focus_handle: cx.focus_handle(),
+            marked_range: None,
             caret_visible: true,
             blink_epoch: 0,
             focused: false,
@@ -245,6 +249,179 @@ fn snap_index(index: Result<usize, usize>) -> usize {
     }
 }
 
+/// Converts a UTF-16 offset inside `text` to a byte offset. An offset inside a
+/// surrogate pair rounds down to the character's start.
+fn utf16_to_byte_in(text: &str, utf16_offset: usize) -> usize {
+    let mut utf16 = 0;
+    for (byte, ch) in text.char_indices() {
+        let next = utf16 + ch.len_utf16();
+        if next > utf16_offset {
+            return byte;
+        }
+        utf16 = next;
+    }
+    text.len()
+}
+
+impl EntityInputHandler for MarkdownEditor {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        _adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let buffer = self.buffer.read(cx);
+        let range = buffer.utf16_to_byte(range.start)..buffer.utf16_to_byte(range.end);
+        Some(buffer.slice(range))
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let buffer = self.buffer.read(cx);
+        let range = buffer.byte_to_utf16(self.selection.start())
+            ..buffer.byte_to_utf16(self.selection.end());
+        Some(UTF16Selection {
+            range,
+            reversed: self.selection.reversed(),
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let buffer = self.buffer.read(cx);
+        let marked = self.marked_range.as_ref()?;
+        Some(buffer.byte_to_utf16(marked.start)..buffer.byte_to_utf16(marked.end))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.marked_range = None;
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = self.resolve_input_range(range, cx);
+        self.apply_input_edit(range, text, None, false, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = self.resolve_input_range(range, cx);
+        let selection = new_selected_range.map(|range| {
+            utf16_to_byte_in(new_text, range.start)..utf16_to_byte_in(new_text, range.end)
+        });
+        self.apply_input_edit(range, new_text, selection, true, cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let (line_ix, local) = {
+            let buffer = self.buffer.read(cx);
+            buffer.offset_to_line(buffer.utf16_to_byte(range_utf16.start))
+        };
+        let position = self.layout.with_line(line_ix, |line, line_height| {
+            line.position_for_index(local, line_height)
+        })??;
+        let top = self.layout.line_top(line_ix)?;
+        let line_height = self.layout.line_height()?;
+        let origin = point(
+            element_bounds.origin.x + position.x,
+            element_bounds.origin.y + top + position.y - self.scroll.offset(),
+        );
+        Some(Bounds {
+            origin,
+            size: size(px(2.), line_height),
+        })
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        position: Point<Pixels>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let bounds = self.layout.bounds()?;
+        let content_y = position.y - bounds.origin.y + self.scroll.offset();
+        let (line_ix, within_line) = self.layout.line_at_y(content_y)?;
+        let line_height = self.layout.line_height()?;
+        let x = position.x - bounds.origin.x;
+        let local = self.layout.with_line(line_ix, |line, _| {
+            snap_index(line.closest_index_for_position(point(x, within_line), line_height))
+        })?;
+        let buffer = self.buffer.read(cx);
+        Some(buffer.byte_to_utf16(buffer.line_start_byte(line_ix) + local))
+    }
+
+    fn text_length_utf16(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
+        Some(self.buffer.read(cx).len_utf16())
+    }
+}
+
+impl MarkdownEditor {
+    /// Converts a platform-supplied UTF-16 range to bytes. `None` means the
+    /// platform did not track a range: the marked range wins while composing,
+    /// otherwise the current selection.
+    fn resolve_input_range(
+        &self,
+        range: Option<Range<usize>>,
+        cx: &mut Context<Self>,
+    ) -> Range<usize> {
+        let buffer = self.buffer.read(cx);
+        match range {
+            Some(range) => buffer.utf16_to_byte(range.start)..buffer.utf16_to_byte(range.end),
+            None => match &self.marked_range {
+                Some(marked) => marked.clone(),
+                None => self.selection.start()..self.selection.end(),
+            },
+        }
+    }
+
+    /// Applies one input edit: replaces `range` with `text`, moves the caret to
+    /// `caret_in_text` (a byte range inside `text`; `None` puts it at the end),
+    /// and tracks marked text while an IME composes.
+    fn apply_input_edit(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        caret_in_text: Option<Range<usize>>,
+        mark_composition: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let caret = range.start + caret_in_text.map_or(text.len(), |range| range.end);
+        let marked = mark_composition.then(|| range.start..range.start + text.len());
+        self.buffer
+            .update(cx, |buffer, _| buffer.replace(range, text));
+        self.selection.collapse(caret);
+        self.marked_range = marked;
+        self.restart_blink();
+        cx.notify();
+    }
+}
+
 impl Render for MarkdownEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.is_focused(window);
@@ -266,5 +443,21 @@ impl Render for MarkdownEditor {
                 self.scroll.clone(),
                 self.layout.clone(),
             ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utf16_to_byte_in;
+
+    #[test]
+    fn utf16_offsets_inside_text_round_down() {
+        assert_eq!(utf16_to_byte_in("a🎉", 0), 0);
+        assert_eq!(utf16_to_byte_in("a🎉", 1), 1);
+        assert_eq!(utf16_to_byte_in("a🎉", 2), 1);
+        assert_eq!(utf16_to_byte_in("a🎉", 3), 5);
+        assert_eq!(utf16_to_byte_in("a🎉", 4), 5);
+        assert_eq!(utf16_to_byte_in("héllo", 1), 1);
+        assert_eq!(utf16_to_byte_in("héllo", 2), 3);
     }
 }

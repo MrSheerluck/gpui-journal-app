@@ -387,6 +387,50 @@ impl EditorLayout {
         let inner = inner.as_ref()?;
         inner.lines.get(ix).map(|line| f(line, inner.line_height))
     }
+
+    pub(crate) fn line_height(&self) -> Option<Pixels> {
+        let inner = self.0.borrow();
+        let inner = inner.as_ref()?;
+        Some(inner.line_height)
+    }
+
+    pub(crate) fn bounds(&self) -> Option<Bounds<Pixels>> {
+        let inner = self.0.borrow();
+        let inner = inner.as_ref()?;
+        inner.bounds
+    }
+
+    /// Content-space y of the top of the line at `ix`, before scroll offset.
+    pub(crate) fn line_top(&self, ix: usize) -> Option<Pixels> {
+        let inner = self.0.borrow();
+        let inner = inner.as_ref()?;
+        if ix >= inner.lines.len() {
+            return None;
+        }
+        let mut top = Pixels::ZERO;
+        for line in &inner.lines[..ix] {
+            top += line.size(inner.line_height).height;
+        }
+        Some(top)
+    }
+
+    /// The line containing content-space `y`, with the y within that line.
+    pub(crate) fn line_at_y(&self, y: Pixels) -> Option<(usize, Pixels)> {
+        let inner = self.0.borrow();
+        let inner = inner.as_ref()?;
+        if y < Pixels::ZERO {
+            return None;
+        }
+        let mut top = Pixels::ZERO;
+        for (ix, line) in inner.lines.iter().enumerate() {
+            let height = line.size(inner.line_height).height;
+            if y < top + height {
+                return Some((ix, y - top));
+            }
+            top += height;
+        }
+        None
+    }
 }
 
 struct EditorLayoutInner {

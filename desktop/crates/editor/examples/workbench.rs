@@ -27,7 +27,10 @@ underline until you commit it.
 
 Inline styles: **bold**, *italic*, ~~struck through~~, `inline code` and
 ==highlighted== all render collapsed; put the caret inside a span to reveal its
-markers. Headings collapse to real sizes once the caret leaves their line.
+markers. Links collapse to colored text: hover
+[the Dainiki repository](https://github.com/MrSheerluck/smbl-dainiki) for the
+URL, cmd-click to open it, click to reveal the source. Headings collapse to
+real sizes once the caret leaves their line.
 
 - Unicode shaping works too: héllo - 日本語 - emoji 🎉
 - This second item exists mainly to make the list rhythm visible.

@@ -13,6 +13,11 @@ pub struct EditorTheme {
     pub code_block_background: Hsla,
     /// Background behind `==highlight==`.
     pub highlight_background: Hsla,
+    /// Link text color.
+    pub link: Hsla,
+    /// Hover tooltip behind link URLs.
+    pub tooltip_background: Hsla,
+    pub tooltip_text: Hsla,
     /// Family used for inline code and fenced code.
     pub mono_font_family: SharedString,
     /// Font size multipliers for H1–H3; deeper headings use the last entry.
@@ -30,6 +35,9 @@ impl Default for EditorTheme {
             code_background: rgba(0x0000000F).into(),
             code_block_background: rgba(0x00000012).into(),
             highlight_background: rgba(0xFFD54A80).into(),
+            link: rgb(0x2F6FEB).into(),
+            tooltip_background: rgba(0x1F2328F2).into(),
+            tooltip_text: rgb(0xFAFAF8).into(),
             mono_font_family: SharedString::new_static("Menlo"),
             heading_scales: [1.6, 1.35, 1.15],
         }

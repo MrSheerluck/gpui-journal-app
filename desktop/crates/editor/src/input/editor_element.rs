@@ -5,7 +5,7 @@ use gpui::{
     App, AvailableSpace, Bounds, DefiniteLength, DispatchPhase, Element, ElementId,
     ElementInputHandler, Entity, FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId,
     IntoElement, LayoutId, Length, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size,
-    StrikethroughStyle, Style, TextRun, TextStyle, Window, WrappedLine, fill, point, px,
+    StrikethroughStyle, Style, TextAlign, TextRun, TextStyle, Window, WrappedLine, fill, point, px,
 };
 
 use crate::{
@@ -222,7 +222,7 @@ impl Element for EditorElement {
         let drag_view = self.view.clone();
         window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
             if phase == DispatchPhase::Bubble {
-                drag_view.update(cx, |editor, cx| editor.on_drag_move(event.position, cx));
+                drag_view.update(cx, |editor, cx| editor.on_mouse_move(event.position, cx));
             }
         });
         let up_view = self.view.clone();
@@ -384,6 +384,66 @@ impl Element for EditorElement {
             };
             window.paint_quad(fill(thumb, theme.scrollbar).corner_radii(THUMB_WIDTH / 2.));
         }
+
+        if let Some((url, position)) = self.view.read(cx).hover_link() {
+            paint_tooltip(&url, position, bounds, &theme, window, cx);
+        }
+    }
+}
+
+/// Paints the link hover tooltip near the cursor, clamped to the element.
+fn paint_tooltip(
+    url: &str,
+    position: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    theme: &EditorTheme,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let mut style = window.text_style().clone();
+    style.font_size = px(12.).into();
+    style.color = theme.tooltip_text;
+    let Ok(mut shaped) = window.text_system().shape_text(
+        SharedString::new(url),
+        px(12.),
+        &[style.to_run(url.len())],
+        None,
+        None,
+    ) else {
+        return;
+    };
+    let Some(line) = shaped.pop() else {
+        return;
+    };
+    let line_height = window.pixel_snap(px(16.));
+    let text_size = line.size(line_height);
+    let padding = px(8.);
+    let mut origin = point(position.x + px(14.), position.y + px(20.));
+    origin.x = origin
+        .x
+        .min(bounds.origin.x + bounds.size.width - text_size.width - padding * 2.)
+        .max(bounds.origin.x);
+    origin.y = origin
+        .y
+        .min(bounds.origin.y + bounds.size.height - line_height - padding)
+        .max(bounds.origin.y);
+    let backdrop = Bounds {
+        origin: point(origin.x - padding, origin.y - px(4.)),
+        size: Size {
+            width: text_size.width + padding * 2.,
+            height: line_height + px(8.),
+        },
+    };
+    window.paint_quad(fill(backdrop, theme.tooltip_background).corner_radii(6.));
+    if let Err(error) = line.paint(
+        point(origin.x, origin.y),
+        line_height,
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    ) {
+        tracing::warn!(error = %error, "failed to paint tooltip");
     }
 }
 
@@ -546,6 +606,7 @@ struct InlineFlags {
     strike: bool,
     code: bool,
     highlight: bool,
+    link: bool,
 }
 
 /// Builds styled text runs for a projected line: fonts carry emphasis, strong
@@ -579,6 +640,7 @@ fn shape_runs(line: &ProjectedLine, base: &TextStyle, theme: &EditorTheme) -> Ve
                     InlineStyle::Strikethrough => flags.strike = true,
                     InlineStyle::Code => flags.code = true,
                     InlineStyle::Highlight => flags.highlight = true,
+                    InlineStyle::Link => flags.link = true,
                 }
             }
         }
@@ -600,6 +662,9 @@ fn shape_runs(line: &ProjectedLine, base: &TextStyle, theme: &EditorTheme) -> Ve
                 thickness: px(1.),
                 color: None,
             });
+        }
+        if flags.link {
+            style.color = theme.link;
         }
         runs.push(style.to_run(end - start));
     }

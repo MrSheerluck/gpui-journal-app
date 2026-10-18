@@ -16,7 +16,7 @@ use crate::{
         history::{Edit, History, MergeKind},
         movement,
     },
-    markdown::MarkdownIndex,
+    markdown::{ConstructKind, MarkdownIndex},
     theme::EditorTheme,
 };
 
@@ -51,6 +51,7 @@ pub struct MarkdownEditor {
     focused: bool,
     dragging: bool,
     drag_position: Point<Pixels>,
+    hover_link: Option<(String, Point<Pixels>)>,
     autoscroll_active: bool,
 }
 
@@ -75,6 +76,7 @@ impl MarkdownEditor {
             focused: false,
             dragging: false,
             drag_position: Point::default(),
+            hover_link: None,
             autoscroll_active: false,
         };
         this.spawn_blink(cx);
@@ -180,6 +182,7 @@ impl MarkdownEditor {
         self.history.break_run();
         self.dragging = true;
         self.drag_position = event.position;
+        self.hover_link = None;
         let Some(hit) = self.hit_test(event.position, cx) else {
             return;
         };
@@ -187,6 +190,13 @@ impl MarkdownEditor {
             && let Some((marker, WidgetKind::Task { checked })) = hit.widget
         {
             self.toggle_task(marker, checked, cx);
+            return;
+        }
+        if event.modifiers.platform
+            && !event.modifiers.shift
+            && let Some(url) = self.link_at(hit.offset, cx)
+        {
+            cx.open_url(&url);
             return;
         }
         match event.click_count {
@@ -240,6 +250,53 @@ impl MarkdownEditor {
         self.restart_blink();
         cx.emit(EditorEvent::Edited);
         cx.notify();
+    }
+
+    /// Entry point for window-level mouse moves: extends a drag while the
+    /// button is held, otherwise tracks link hover for the tooltip.
+    pub(crate) fn on_mouse_move(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.dragging {
+            self.on_drag_move(position, cx);
+        } else {
+            self.update_hover(position, cx);
+        }
+    }
+
+    fn update_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let url = self.link_position(position, cx);
+        let previous = self.hover_link.clone();
+        let next = url.map(|url| (url, position));
+        let changed = match (&previous, &next) {
+            (None, None) => false,
+            (Some((before, at)), Some((after, to))) => {
+                before != after || (at.x - to.x).abs() > px(2.) || (at.y - to.y).abs() > px(2.)
+            }
+            _ => true,
+        };
+        if changed {
+            self.hover_link = next;
+            cx.notify();
+        }
+    }
+
+    fn link_position(&self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<String> {
+        let hit = self.hit_test(position, cx)?;
+        self.link_at(hit.offset, cx)
+    }
+
+    /// The URL of the link construct covering `offset`, if any.
+    fn link_at(&self, offset: usize, cx: &App) -> Option<String> {
+        let construct = self
+            .index
+            .constructs_in(offset..offset + 1)
+            .find(|construct| construct.kind == ConstructKind::Link)?;
+        let destination = construct.inner.get(1)?;
+        let buffer = self.buffer.read(cx);
+        Some(buffer.slice(destination.clone()))
+    }
+
+    pub(crate) fn hover_link(&self) -> Option<(String, Point<Pixels>)> {
+        self.hover_link.clone()
     }
 
     pub(crate) fn on_drag_move(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {

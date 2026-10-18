@@ -34,6 +34,7 @@ pub enum InlineStyle {
     Strikethrough,
     Code,
     Highlight,
+    Link,
 }
 
 /// A styled stretch of a projected line's display text.
@@ -307,6 +308,27 @@ fn project_line(
                     }
                 } else if line_style == Style::Body {
                     line_style = Style::Code { marker: false };
+                }
+            }
+            ConstructKind::Link => {
+                if !revealed(construct, selection)
+                    && let Some(text_range) = construct.inner.first()
+                {
+                    let prefix_start = source.start.max(construct.range.start);
+                    if prefix_start < text_range.start {
+                        pieces.push((prefix_start..text_range.start, Piece::Hide));
+                    }
+                    let suffix_end = source.end.min(construct.range.end);
+                    if text_range.end < suffix_end {
+                        pieces.push((text_range.end..suffix_end, Piece::Hide));
+                    }
+                }
+                if let Some(text_range) = construct.inner.first() {
+                    let start = text_range.start.max(source.start);
+                    let end = text_range.end.min(source.end);
+                    if start < end {
+                        pending_runs.push((start..end, InlineStyle::Link));
+                    }
                 }
             }
             ConstructKind::Emphasis
@@ -733,6 +755,26 @@ mod tests {
         assert_eq!(line.source_for_display(7), 5);
         assert_eq!(line.source_for_display(8), 6);
         assert_eq!(line.source_for_display(99), 10);
+    }
+
+    #[test]
+    fn links_collapse_to_styled_text() {
+        let text = "see [the docs](https://example.com) now\n";
+        let plan = plan_for(text, Selection::caret(0));
+        let line = &plan.lines[0];
+        assert_eq!(line.text, "see the docs now");
+        let styles: Vec<(std::ops::Range<usize>, InlineStyle)> = line
+            .runs
+            .iter()
+            .map(|run| (run.display.clone(), run.style))
+            .collect();
+        assert_eq!(styles, vec![(4..12, InlineStyle::Link)]);
+
+        let plan = plan_for(text, Selection::caret(8));
+        assert_eq!(
+            plan.lines[0].text,
+            "see [the docs](https://example.com) now"
+        );
     }
 
     #[test]

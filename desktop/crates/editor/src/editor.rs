@@ -279,6 +279,10 @@ impl MarkdownEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        tracing::debug!(
+            focused = self.focus_handle.is_focused(window),
+            "editor mouse down"
+        );
         window.focus(&self.focus_handle, cx);
         self.restart_blink();
         self.history.break_run();
@@ -524,7 +528,8 @@ impl MarkdownEditor {
                 .and_then(|d| projected.widget_at_display(d))
         });
         Some(PointHit {
-            offset: projected.source.start + projected.source_for_display(display),
+            // `source_for_display` returns a document-level byte offset.
+            offset: projected.source_for_display(display),
             widget,
         })
     }
@@ -538,6 +543,7 @@ impl MarkdownEditor {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        tracing::debug!(key = %keystroke.key, "editor key down");
         if keystroke.modifiers.platform {
             match keystroke.key.as_str() {
                 "c" => {
@@ -759,7 +765,8 @@ impl MarkdownEditor {
             let index = self.layout.with_line(line_ix, |line, line_height| {
                 snap_index(line.closest_index_for_position(point(x, target_y), line_height))
             })?;
-            return Some(projected.source.start + projected.source_for_display(index));
+            // `source_for_display` returns a document-level byte offset.
+            return Some(projected.source_for_display(index));
         }
 
         if direction < 0 {
@@ -772,7 +779,7 @@ impl MarkdownEditor {
             let index = self.layout.with_line(ix, |line, line_height| {
                 snap_index(line.closest_index_for_position(point(x, last_y), line_height))
             })?;
-            Some(target.source.start + target.source_for_display(index))
+            Some(target.source_for_display(index))
         } else {
             let ix = line_ix + 1;
             if ix >= buffer.len_lines() {
@@ -782,7 +789,7 @@ impl MarkdownEditor {
             let index = self.layout.with_line(ix, |line, line_height| {
                 snap_index(line.closest_index_for_position(point(x, Pixels::ZERO), line_height))
             })?;
-            Some(target.source.start + target.source_for_display(index))
+            Some(target.source_for_display(index))
         }
     }
 }
@@ -1021,6 +1028,7 @@ impl MarkdownEditor {
     ) {
         let selection_before = self.selection;
         let caret = range.start + caret_in_text.map_or(text.len(), |range| range.end);
+        tracing::debug!(chars = text.chars().count(), "editor input edit");
         let removed = self
             .buffer
             .update(cx, |buffer, _| buffer.replace(range.clone(), text));
@@ -1049,6 +1057,7 @@ impl Render for MarkdownEditor {
         self.sync_display(cx);
         let focused = self.focus_handle.is_focused(window);
         if focused != self.focused {
+            tracing::info!(focused, "editor focus changed");
             self.focused = focused;
             self.restart_blink();
         }
@@ -1065,6 +1074,118 @@ impl Render for MarkdownEditor {
                 self.scroll.clone(),
                 self.layout.clone(),
             ))
+    }
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::*;
+    use crate::buffer::Buffer;
+    use gpui::{TestAppContext, VisualTestContext};
+
+    fn setup<'a>(
+        cx: &'a mut TestAppContext,
+        text: &str,
+    ) -> (Entity<MarkdownEditor>, &'a mut VisualTestContext) {
+        let text = text.to_string();
+        cx.add_window_view(move |window, cx| {
+            let buffer = cx.new(|_| Buffer::from_text(&text));
+            let theme = EditorTheme::default();
+            let editor = MarkdownEditor::new(buffer, theme, cx);
+            window.focus(editor.focus_handle(), cx);
+            editor
+        })
+    }
+
+    #[gpui::test]
+    async fn typing_inserts_characters(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "");
+        cx.simulate_input("hi");
+        cx.update(|_, app| {
+            assert_eq!(
+                editor.read(app).content(app),
+                "hi",
+                "typing produced no text"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn arrow_keys_move_the_caret(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "hello\nworld\n");
+        // Render one frame so the display plan and measured layout exist.
+        cx.update(|window, cx| {
+            window.draw(cx);
+        });
+        cx.simulate_keystrokes("right right");
+        cx.update(|_, app| {
+            assert_eq!(
+                editor.read(app).selection().head(),
+                2,
+                "right arrows moved nothing"
+            );
+        });
+        cx.simulate_keystrokes("left");
+        cx.update(|_, app| {
+            assert_eq!(
+                editor.read(app).selection().head(),
+                1,
+                "left arrow moved nothing"
+            );
+        });
+        cx.simulate_keystrokes("down");
+        cx.update(|_, app| {
+            assert_eq!(
+                editor.read(app).selection().head(),
+                7,
+                "down arrow moved nothing"
+            );
+        });
+        cx.simulate_keystrokes("up");
+        cx.update(|_, app| {
+            assert_eq!(
+                editor.read(app).selection().head(),
+                1,
+                "up arrow moved nothing"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn clicking_places_the_caret(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "hello\nworld\n");
+        cx.update(|window, cx| {
+            window.draw(cx);
+        });
+        cx.simulate_click(point(px(2.), px(8.)), gpui::Modifiers::default());
+        cx.update(|_, app| {
+            assert_eq!(
+                editor.read(app).selection().head(),
+                0,
+                "click on the first line landed elsewhere"
+            );
+        });
+        cx.simulate_click(point(px(2.), px(30.)), gpui::Modifiers::default());
+        cx.update(|_, app| {
+            assert_eq!(
+                editor.read(app).selection().head(),
+                6,
+                "click on the second line landed elsewhere"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn backspace_and_undo_work(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "abc");
+        cx.simulate_keystrokes("right right right backspace");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "ab", "backspace did nothing");
+        });
+        cx.simulate_keystrokes("cmd-z");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "abc", "undo did nothing");
+        });
     }
 }
 

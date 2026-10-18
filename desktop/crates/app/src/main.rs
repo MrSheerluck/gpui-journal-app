@@ -593,12 +593,13 @@ impl JournalSession {
                 };
                 clickable_day(item_this.clone(), date, inner)
             };
-            v_flex()
-                .gap_4()
-                .pb_8()
-                .child(header)
-                .child(body)
-                .into_any_element()
+            let day = v_flex().w_full().gap_4().pb_8().child(header).child(body);
+            if Some(date) == active_date {
+                day.into_any_element()
+            } else {
+                // The whole day is the click target, header included.
+                clickable_day(item_this.clone(), date, day.into_any_element())
+            }
         });
 
         let mut column = div()
@@ -756,10 +757,13 @@ fn stream_edge() -> AnyElement {
 }
 
 /// Wraps a rendered day so a click opens it for editing.
+/// Wraps a whole rendered day so a click anywhere opens it for editing.
 fn clickable_day(this: WeakEntity<DainikiApp>, date: NaiveDate, body: AnyElement) -> AnyElement {
     div()
         .id(ElementId::Name(format!("day-{date}").into()))
+        .w_full()
         .cursor_text()
+        .debug_selector(|| "day-body".to_string())
         .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
             this.update(cx, |app, cx| app.activate_day(date, window, cx))
                 .ok();
@@ -1366,6 +1370,50 @@ mod tests {
                 session.stream.bounds_for_item(700).is_none(),
                 "days far below the fold are not mounted"
             );
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn clicking_a_rendered_day_opens_it(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let yesterday = today.pred_opt().expect("yesterday");
+        seed_day(&journal, yesterday, "# yesterday's words\n");
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // Click into yesterday's day body (the interactive wrapper); the
+        // item's geometric center can fall in the gap between its header
+        // and its body.
+        let target = cx
+            .debug_bounds("day-body")
+            .expect("yesterday's body is painted")
+            .center();
+        cx.simulate_click(target, gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            let active = session.active.as_ref().expect("yesterday opened");
+            assert_eq!(active.date, yesterday);
+            assert_eq!(active.editor.read(cx).content(cx), "# yesterday's words\n");
         });
         fs::remove_dir_all(&dir).ok();
     }

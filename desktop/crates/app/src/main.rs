@@ -418,32 +418,48 @@ impl DainikiApp {
     }
 
     fn save_active(&mut self, cx: &mut Context<Self>) {
-        let Some(active) = self
-            .session_mut()
-            .and_then(|session| session.active.as_mut())
-        else {
-            return;
+        let status = {
+            let Some(active) = self
+                .session_mut()
+                .and_then(|session| session.active.as_mut())
+            else {
+                return;
+            };
+            let path = active.path.clone();
+            let text = active.editor.read(cx).content(cx);
+            match persistence::save(&path, &text, active.last_seen.as_deref()) {
+                persistence::SaveOutcome::Saved => {
+                    active.dirty = false;
+                    let bytes = text.len();
+                    active.last_seen = Some(text);
+                    tracing::info!(path = %path.display(), bytes, "journal saved");
+                    None
+                }
+                persistence::SaveOutcome::ConflictCopy(conflict) => {
+                    active.dirty = false;
+                    active.last_seen = std::fs::read_to_string(&path).ok();
+                    tracing::error!(
+                        path = %conflict.display(),
+                        "the journal changed on disk; preserved this version as a conflict copy"
+                    );
+                    let name = conflict
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    Some(format!(
+                        "This day changed on disk — your version was kept as {name}"
+                    ))
+                }
+                persistence::SaveOutcome::Failed(error) => {
+                    tracing::error!(path = %path.display(), error = %error, "journal save failed");
+                    Some(format!("Could not save {} — {error}", path.display()))
+                }
+            }
         };
-        let path = active.path.clone();
-        let text = active.editor.read(cx).content(cx);
-        match persistence::save(&path, &text, active.last_seen.as_deref()) {
-            persistence::SaveOutcome::Saved => {
-                active.dirty = false;
-                let bytes = text.len();
-                active.last_seen = Some(text);
-                tracing::info!(path = %path.display(), bytes, "journal saved");
-            }
-            persistence::SaveOutcome::ConflictCopy(conflict) => {
-                active.dirty = false;
-                active.last_seen = std::fs::read_to_string(&path).ok();
-                tracing::error!(
-                    path = %conflict.display(),
-                    "the journal changed on disk; preserved this version as a conflict copy"
-                );
-            }
-            persistence::SaveOutcome::Failed(error) => {
-                tracing::error!(path = %path.display(), error = %error, "journal save failed");
-            }
+        if let Some(message) = status
+            && let Some(session) = self.session_mut()
+        {
+            session.status = Some(message);
         }
         cx.notify();
     }
@@ -3461,6 +3477,56 @@ mod tests {
             assert!(!session.filter.is_active());
             assert_eq!(session.stream.item_count(), 4);
         });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn a_failed_save_surfaces_in_the_status_banner(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let entry = journal.entry_path(today);
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_input("words that cannot be saved");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // Make the entry's folder read-only, then force the save.
+        let month = entry.parent().expect("month folder");
+        fs::set_permissions(month, fs::Permissions::from_mode(0o555)).expect("chmod");
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| app.save_active(cx));
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            let status = session.status.as_deref().expect("a save failure is shown");
+            assert!(status.contains("Could not save"), "{status:?}");
+            assert!(
+                session.active.as_ref().is_some_and(|a| a.dirty),
+                "still dirty"
+            );
+        });
+
+        // Restore permissions so cleanup works.
+        fs::set_permissions(month, fs::Permissions::from_mode(0o755)).expect("chmod back");
         fs::remove_dir_all(&dir).ok();
     }
 

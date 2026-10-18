@@ -4,8 +4,9 @@ use std::{cell::RefCell, rc::Rc};
 use gpui::{
     App, AvailableSpace, Bounds, DefiniteLength, DispatchPhase, Element, ElementId,
     ElementInputHandler, Entity, FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, LayoutId, Length, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size,
-    StrikethroughStyle, Style, TextAlign, TextRun, TextStyle, Window, WrappedLine, fill, point, px,
+    IntoElement, LayoutId, Length, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
+    SharedString, Size, StrikethroughStyle, Style, TextAlign, TextRun, TextStyle, Window,
+    WrappedLine, fill, point, px,
 };
 
 use crate::{
@@ -234,6 +235,7 @@ impl Element for EditorElement {
             plan,
             images,
             reveal_pending,
+            hover_task,
         ) = {
             let view = self.view.read(cx);
             (
@@ -245,6 +247,7 @@ impl Element for EditorElement {
                 view.plan(),
                 view.image_metrics(),
                 view.reveal_pending(),
+                view.hover_task(),
             )
         };
         window.handle_input(
@@ -380,20 +383,17 @@ impl Element for EditorElement {
                     {
                         tracing::warn!(error = %error, "failed to paint a line");
                     }
-                    if let Some(projected) = plan.lines.get(ix)
-                        && projected
-                            .fragments
-                            .iter()
-                            .any(|fragment| fragment.kind == FragmentKind::Widget(WidgetKind::Rule))
-                    {
-                        let rule = Bounds {
-                            origin: point(bounds.origin.x, line_origin.y + height / 2.),
-                            size: Size {
-                                width: bounds.size.width,
-                                height: px(1.),
-                            },
-                        };
-                        window.paint_quad(fill(rule, theme.text.opacity(0.25)));
+                    if let Some(projected) = plan.lines.get(ix) {
+                        paint_widgets(
+                            &laid.wrapped,
+                            line_origin,
+                            height,
+                            projected,
+                            bounds,
+                            &theme,
+                            hover_task.as_ref(),
+                            window,
+                        );
                     }
                     if show_caret
                         && let Some(source) = caret_source
@@ -489,6 +489,173 @@ fn line_image(fragments: &[Fragment]) -> Option<String> {
         FragmentKind::Widget(WidgetKind::Image { path }) => Some(path.clone()),
         _ => None,
     })
+}
+
+/// Where a widget fragment sits on its line, and the horizontal centre of the
+/// glyph it replaces.
+struct WidgetGeometry {
+    /// The widget's full footprint in window coordinates.
+    cover: Bounds<Pixels>,
+    /// The centre of the fragment's first character.
+    glyph_center_x: Pixels,
+}
+
+/// Measures a widget fragment: the glyph stand-in keeps the layout width, so
+/// the painting covers that same box. Widgets never span wrapped segments.
+fn widget_geometry(
+    line: &WrappedLine,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    projected: &ProjectedLine,
+    fragment: &Fragment,
+) -> Option<WidgetGeometry> {
+    let text = projected.text.get(fragment.display.clone())?;
+    let first = text.chars().next()?;
+    let start = line.position_for_index(fragment.display.start, line_height)?;
+    let after_first =
+        line.position_for_index(fragment.display.start + first.len_utf8(), line_height)?;
+    let end = line.position_for_index(fragment.display.end, line_height)?;
+    if start.y != end.y {
+        return None;
+    }
+    Some(WidgetGeometry {
+        cover: Bounds {
+            origin: point(origin.x + start.x, origin.y + start.y),
+            size: Size {
+                width: end.x - start.x,
+                height: line_height,
+            },
+        },
+        glyph_center_x: origin.x + (start.x + after_first.x) / 2.,
+    })
+}
+
+/// Paints the rendered stand-ins for collapsed markup: bullet dots, quote
+/// bars, task checkboxes and rules. Each widget first covers the glyph that
+/// reserves its layout width, so this must run after the line's text.
+#[allow(clippy::too_many_arguments)]
+fn paint_widgets(
+    line: &WrappedLine,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    projected: &ProjectedLine,
+    bounds: Bounds<Pixels>,
+    theme: &EditorTheme,
+    hover_task: Option<&Range<usize>>,
+    window: &mut Window,
+) {
+    for fragment in &projected.fragments {
+        let FragmentKind::Widget(kind) = &fragment.kind else {
+            continue;
+        };
+        match kind {
+            WidgetKind::Bullet => {
+                let Some(geometry) =
+                    widget_geometry(line, origin, line_height, projected, fragment)
+                else {
+                    continue;
+                };
+                window.paint_quad(fill(geometry.cover, theme.background));
+                let radius = (line_height.as_f32() * 0.105).clamp(2., 3.4);
+                let side = px(radius * 2.);
+                let dot = Bounds {
+                    origin: point(
+                        geometry.glyph_center_x - px(radius),
+                        geometry.cover.origin.y + (line_height - side) / 2.,
+                    ),
+                    size: Size {
+                        width: side,
+                        height: side,
+                    },
+                };
+                window.paint_quad(fill(dot, theme.bullet).corner_radii(px(radius)));
+            }
+            WidgetKind::QuoteBar => {
+                let Some(geometry) =
+                    widget_geometry(line, origin, line_height, projected, fragment)
+                else {
+                    continue;
+                };
+                window.paint_quad(fill(geometry.cover, theme.background));
+                let width = px((line_height.as_f32() * 0.12).clamp(2.5, 3.5));
+                let height = px(line_height.as_f32() * 0.66);
+                let bar = Bounds {
+                    origin: point(
+                        geometry.glyph_center_x - width / 2.,
+                        geometry.cover.origin.y + (line_height - height) / 2.,
+                    ),
+                    size: Size { width, height },
+                };
+                window.paint_quad(fill(bar, theme.quote_bar).corner_radii(width / 2.));
+            }
+            WidgetKind::Task { checked } => {
+                let Some(geometry) =
+                    widget_geometry(line, origin, line_height, projected, fragment)
+                else {
+                    continue;
+                };
+                window.paint_quad(fill(geometry.cover, theme.background));
+                let side = px((line_height.as_f32() * 0.6).clamp(11., 15.5));
+                let task_box = Bounds {
+                    origin: point(
+                        geometry.glyph_center_x - side / 2.,
+                        geometry.cover.origin.y + (line_height - side) / 2.,
+                    ),
+                    size: Size {
+                        width: side,
+                        height: side,
+                    },
+                };
+                let hovered = hover_task == Some(&fragment.source);
+                let background = if *checked {
+                    theme.checkbox_checked_background
+                } else if hovered {
+                    theme.checkbox_hover_background
+                } else {
+                    theme.checkbox_background
+                };
+                let mut quad = fill(task_box, background).corner_radii(side * 0.28);
+                if !*checked {
+                    quad = quad.border_widths(1.25).border_color(theme.checkbox_border);
+                }
+                window.paint_quad(quad);
+                if *checked {
+                    paint_check_mark(task_box, theme.checkbox_check, window);
+                }
+            }
+            WidgetKind::Rule => {
+                let rule = Bounds {
+                    origin: point(bounds.origin.x, origin.y + line_height / 2.),
+                    size: Size {
+                        width: bounds.size.width,
+                        height: px(1.),
+                    },
+                };
+                window.paint_quad(fill(rule, theme.rule));
+            }
+            WidgetKind::Image { .. } => {
+                // Painted by `paint_image_line`.
+            }
+        }
+    }
+}
+
+/// The check mark inside a checked task box: a two-segment stroke.
+fn paint_check_mark(task_box: Bounds<Pixels>, color: Hsla, window: &mut Window) {
+    let side = task_box.size.width.as_f32();
+    let at = |fx: f32, fy: f32| {
+        point(
+            task_box.origin.x + px(side * fx),
+            task_box.origin.y + px(side * fy),
+        )
+    };
+    let mut builder = PathBuilder::stroke(px((side * 0.13).clamp(1.4, 2.2)));
+    builder.move_to(at(0.26, 0.53));
+    builder.line_to(at(0.44, 0.70));
+    builder.line_to(at(0.76, 0.32));
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
 }
 
 /// Paints a whole-line image at its natural size (clamped to the content

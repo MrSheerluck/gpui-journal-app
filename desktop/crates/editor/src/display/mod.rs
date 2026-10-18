@@ -57,9 +57,11 @@ pub enum FragmentKind {
 /// Widgets that replace source markup while collapsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WidgetKind {
-    /// A `-`/`*`/`+` marker rendered as `•`.
+    /// A `-`/`*`/`+` marker rendered as a painted dot.
     Bullet,
-    /// A `[ ]`/`[x]` marker rendered as `☐`/`☑` and toggled by clicking.
+    /// A `>` marker rendered as a painted vertical bar.
+    QuoteBar,
+    /// A `[ ]`/`[x]` marker rendered as a painted checkbox and toggled by clicking.
     Task { checked: bool },
     /// A `---` rule rendered as a full-width painted line.
     Rule,
@@ -271,7 +273,7 @@ fn project_line(
                         reveal_range,
                         Piece::Glyph {
                             text: "▎ ".to_string(),
-                            widget: WidgetKind::Bullet,
+                            widget: WidgetKind::QuoteBar,
                         },
                     ));
                     if line_style == Style::Body {
@@ -751,7 +753,7 @@ mod tests {
         assert_eq!(plan.lines[0].style, Style::Quote);
         let (range, widget) = plan.lines[0].widget_at_display(0).expect("bar widget");
         assert_eq!(range, 0..2);
-        assert_eq!(widget, WidgetKind::Bullet);
+        assert_eq!(widget, WidgetKind::QuoteBar);
 
         let plan = plan_for(text, Selection::caret(3));
         assert_eq!(plan.lines[0].text, "> quoted line");

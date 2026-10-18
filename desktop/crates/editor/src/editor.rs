@@ -55,6 +55,8 @@ pub struct MarkdownEditor {
     dragging: bool,
     drag_position: Point<Pixels>,
     hover_link: Option<(String, Point<Pixels>)>,
+    /// The source range of the task marker under the pointer, for hover feedback.
+    hover_task: Option<Range<usize>>,
     autoscroll_active: bool,
     base_dir: Option<PathBuf>,
     images: HashMap<String, ImageState>,
@@ -121,6 +123,7 @@ impl MarkdownEditor {
             dragging: false,
             drag_position: Point::default(),
             hover_link: None,
+            hover_task: None,
             autoscroll_active: false,
             base_dir: None,
             images: HashMap::new(),
@@ -577,25 +580,31 @@ impl MarkdownEditor {
     }
 
     fn update_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let url = self.link_position(position, cx);
+        let hit = self.hit_test(position, cx);
+        let url = hit.as_ref().and_then(|hit| self.link_at(hit.offset, cx));
+        let hover_task = hit.as_ref().and_then(|hit| match &hit.widget {
+            Some((range, WidgetKind::Task { .. })) => Some(range.clone()),
+            _ => None,
+        });
+        let task_changed = self.hover_task != hover_task;
+        if task_changed {
+            self.hover_task = hover_task;
+        }
         let previous = self.hover_link.clone();
         let next = url.map(|url| (url, position));
-        let changed = match (&previous, &next) {
+        let link_changed = match (&previous, &next) {
             (None, None) => false,
             (Some((before, at)), Some((after, to))) => {
                 before != after || (at.x - to.x).abs() > px(2.) || (at.y - to.y).abs() > px(2.)
             }
             _ => true,
         };
-        if changed {
+        if link_changed {
             self.hover_link = next;
+        }
+        if task_changed || link_changed {
             cx.notify();
         }
-    }
-
-    fn link_position(&self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<String> {
-        let hit = self.hit_test(position, cx)?;
-        self.link_at(hit.offset, cx)
     }
 
     /// The URL of the link construct covering `offset`, if any.
@@ -611,6 +620,11 @@ impl MarkdownEditor {
 
     pub(crate) fn hover_link(&self) -> Option<(String, Point<Pixels>)> {
         self.hover_link.clone()
+    }
+
+    /// The task marker under the pointer, for painting its hover state.
+    pub(crate) fn hover_task(&self) -> Option<Range<usize>> {
+        self.hover_task.clone()
     }
 
     pub(crate) fn on_drag_move(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
@@ -1620,6 +1634,58 @@ mod interaction_tests {
                 editor.read(app).selection().head(),
                 6,
                 "click on the second line landed elsewhere"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn hovering_the_task_widget_tracks_its_marker(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "\n- [ ] todo\n");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        // Measure where the checkbox stand-in sits: the fragment's display
+        // start on the shaped line. The caret sits on the empty first line, so
+        // the task line renders collapsed.
+        let checkbox_x = cx.update(|_, app| {
+            let editor = editor.read(app);
+            let line = &editor.plan().lines[1];
+            let display = line
+                .fragments
+                .iter()
+                .find_map(|fragment| match &fragment.kind {
+                    crate::display::FragmentKind::Widget(WidgetKind::Task { .. }) => {
+                        Some(fragment.display.start)
+                    }
+                    _ => None,
+                })
+                .expect("task widget fragment");
+            let x = editor
+                .layout
+                .with_line(1, |wrapped, height| {
+                    wrapped
+                        .position_for_index(display, height)
+                        .map(|position| position.x)
+                })
+                .flatten()
+                .expect("checkbox position");
+            x + px(2.)
+        });
+
+        cx.simulate_mouse_move(point(checkbox_x, px(34.)), None, gpui::Modifiers::default());
+        cx.update(|_, app| {
+            assert_eq!(
+                editor.read(app).hover_task(),
+                Some(3..6),
+                "the checkbox marker should be marked hovered"
+            );
+        });
+
+        cx.simulate_mouse_move(point(px(220.), px(34.)), None, gpui::Modifiers::default());
+        cx.update(|_, app| {
+            assert!(
+                editor.read(app).hover_task().is_none(),
+                "hover should clear away from the checkbox"
             );
         });
     }

@@ -431,10 +431,14 @@ impl MarkdownEditor {
         self.images.clone()
     }
 
-    pub fn scroll_by(&mut self, delta: Pixels, cx: &mut Context<Self>) {
-        if self.scroll.scroll_by(delta) {
+    /// Scrolls by `delta`; returns whether the offset actually changed, so
+    /// hosts can implement scroll chaining at the editor's bounds.
+    pub fn scroll_by(&mut self, delta: Pixels, cx: &mut Context<Self>) -> bool {
+        let scrolled = self.scroll.scroll_by(delta);
+        if scrolled {
             cx.notify();
         }
+        scrolled
     }
 
     fn on_scroll_wheel(
@@ -444,7 +448,12 @@ impl MarkdownEditor {
         cx: &mut Context<Self>,
     ) {
         let delta = event.delta.pixel_delta(window.line_height()).y;
-        self.scroll_by(delta, cx);
+        if self.scroll_by(delta, cx) {
+            // The editor consumed this wheel event; don't also scroll the
+            // timeline it sits in. At a scroll bound `scroll_by` is false and
+            // the event bubbles, so the timeline takes over.
+            cx.stop_propagation();
+        }
     }
 
     fn on_mouse_down(

@@ -6,9 +6,28 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{Datelike, NaiveDate};
+
+/// Creates `<parent>/Dainiki` and returns it, adding a numeric suffix when
+/// the name is taken. Used by "Create new journal".
+pub fn create_journal_dir(parent: &Path) -> io::Result<PathBuf> {
+    let first = parent.join("Dainiki");
+    if !first.exists() {
+        fs::create_dir_all(&first)?;
+        return Ok(first);
+    }
+    let mut index = 2u32;
+    loop {
+        let candidate = parent.join(format!("Dainiki {index}"));
+        if !candidate.exists() {
+            fs::create_dir_all(&candidate)?;
+            return Ok(candidate);
+        }
+        index += 1;
+    }
+}
 
 /// A journal rooted at a user-chosen folder.
 #[derive(Debug, Clone)]
@@ -57,7 +76,7 @@ mod tests {
 
     use chrono::NaiveDate;
 
-    use super::Journal;
+    use super::{Journal, create_journal_dir};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -108,6 +127,27 @@ mod tests {
         let again = journal.ensure_entry(date(2026, 10, 18)).expect("ensure");
         assert_eq!(again, path);
         assert_eq!(fs::read_to_string(&path).unwrap(), "# already written\n");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_journal_dir_creates_the_folder_in_a_free_location() {
+        let dir = scratch_dir();
+        let root = create_journal_dir(&dir).expect("create");
+        assert_eq!(root, dir.join("Dainiki"));
+        assert!(root.is_dir());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_journal_dir_suffixes_when_the_name_is_taken() {
+        let dir = scratch_dir();
+        let first = create_journal_dir(&dir).expect("first");
+        let second = create_journal_dir(&dir).expect("second");
+        let third = create_journal_dir(&dir).expect("third");
+        assert_eq!(first, dir.join("Dainiki"));
+        assert_eq!(second, dir.join("Dainiki 2"));
+        assert_eq!(third, dir.join("Dainiki 3"));
         fs::remove_dir_all(&dir).ok();
     }
 }

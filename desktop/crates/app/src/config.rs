@@ -34,6 +34,28 @@ pub fn load() -> Config {
     }
 }
 
+/// Persists a chosen journal root.
+pub fn save_journal_root(root: &Path) -> io::Result<()> {
+    save(&Config {
+        journal_root: Some(root.to_path_buf()),
+    })
+}
+
+/// Writes the config atomically, creating the config directory as needed.
+fn save(config: &Config) -> io::Result<()> {
+    let path = path().ok_or_else(|| io::Error::other("no config directory on this platform"))?;
+    save_to(&path, config)
+}
+
+fn save_to(path: &Path, config: &Config) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let text = toml::to_string_pretty(config)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    crate::persistence::write_atomic(path, &text)
+}
+
 fn load_from(path: &Path) -> io::Result<Config> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -49,7 +71,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{Config, load_from};
+    use super::{Config, load_from, save_to};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -101,6 +123,18 @@ mod tests {
         fs::write(&path, "journal_root = [not valid\n").expect("seed");
         let error = load_from(&path).expect_err("corrupt config must not load");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_to_then_load_from_roundtrips() {
+        let dir = scratch_dir();
+        let path = dir.join("nested/config.toml");
+        let config = Config {
+            journal_root: Some(PathBuf::from("/journals/dainiki")),
+        };
+        save_to(&path, &config).expect("save");
+        assert_eq!(load_from(&path).expect("load"), config);
         fs::remove_dir_all(&dir).ok();
     }
 }

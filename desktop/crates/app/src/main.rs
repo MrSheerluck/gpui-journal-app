@@ -1,9 +1,10 @@
-//! Dainiki desktop shell: window chrome, journal persistence and the editor.
+//! Dainiki desktop shell: window chrome, journal onboarding and the editor.
 
 mod config;
 mod journal;
 mod persistence;
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use dainiki_editor::{
 };
 use gpui_kit::component::Disableable;
 use gpui_kit::component::TitleBar;
-use gpui_kit::component::button::{Button, Toggle, ToggleGroup};
+use gpui_kit::component::button::{Button, ButtonVariants, Toggle, ToggleGroup};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::text::markdown;
@@ -22,24 +23,30 @@ use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::*;
 
-actions!(dainiki, [Save, TogglePreview]);
+actions!(dainiki, [Save, TogglePreview, CreateJournal, OpenJournal]);
 
 /// Autosave runs this long after the last keystroke.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
-const WELCOME: &str = "\
-# Dainiki
-
-Your journal lives here: local-first, offline, and file-first.
-
-Open a journal folder — `cargo run -p dainiki-desktop -- ~/journal` —
-and today's entry opens ready to write.
-";
-
+/// The app shell. A chosen folder turns into a [`JournalSession`]; until then
+/// the welcome screen asks for one.
 struct DainikiApp {
-    editor: Entity<MarkdownEditor>,
     theme: EditorTheme,
-    path: Option<PathBuf>,
+    screen: Screen,
+}
+
+enum Screen {
+    /// First run: no journal folder yet — create one or open an existing one.
+    Welcome {
+        notice: Option<String>,
+    },
+    Journal(Box<JournalSession>),
+}
+
+/// An open journal: today's entry in the editor, autosave and chrome state.
+struct JournalSession {
+    path: PathBuf,
+    editor: Entity<MarkdownEditor>,
     dirty: bool,
     last_seen: Option<String>,
     save_task: Option<Task<()>>,
@@ -50,65 +57,197 @@ struct DainikiApp {
 }
 
 impl DainikiApp {
-    fn new(
-        editor: Entity<MarkdownEditor>,
-        theme: EditorTheme,
-        path: Option<PathBuf>,
-        last_seen: Option<String>,
+    fn new(theme: EditorTheme) -> Self {
+        Self {
+            theme,
+            screen: Screen::Welcome { notice: None },
+        }
+    }
+
+    fn session_mut(&mut self) -> Option<&mut JournalSession> {
+        match &mut self.screen {
+            Screen::Journal(session) => Some(session),
+            Screen::Welcome { .. } => None,
+        }
+    }
+
+    fn show_notice(&mut self, message: String, cx: &mut Context<Self>) {
+        self.screen = Screen::Welcome {
+            notice: Some(message),
+        };
+        cx.notify();
+    }
+
+    /// Opens `root` as the journal; a failure lands back on the welcome
+    /// screen with the reason shown.
+    fn enter_journal(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        match self.open_session(&root, window, cx) {
+            Ok(()) => {}
+            Err(error) => {
+                tracing::error!(root = %root.display(), error = %error, "could not open journal");
+                self.show_notice(format!("Could not open {} — {error}", root.display()), cx);
+            }
+        }
+    }
+
+    /// Makes sure today's entry exists, loads it, builds the editor, and
+    /// swaps the screen to the journal.
+    fn open_session(
+        &mut self,
+        root: &Path,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Self {
+    ) -> io::Result<()> {
+        let journal = journal::Journal::new(root);
+        let today = Local::now().date_naive();
+        let path = journal.ensure_entry(today)?;
+        let loaded = persistence::load(&path)?;
+        let content = loaded.clone().unwrap_or_default();
+        let base_dir = path.parent().map(Path::to_path_buf);
+
+        let theme = self.theme.clone();
+        let buffer = cx.new(|_| Buffer::from_text(&content));
+        let editor = cx.new(|cx| {
+            let mut editor = MarkdownEditor::new(buffer, theme.clone(), cx);
+            editor.set_base_dir(base_dir, cx);
+            editor
+        });
         let link_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("URL to link — select the text first")
         });
         let events = cx.subscribe(&editor, |app, _editor, event, cx| {
             if matches!(event, EditorEvent::Edited) {
-                app.dirty = true;
+                if let Some(session) = app.session_mut() {
+                    session.dirty = true;
+                }
                 app.schedule_save(cx);
                 cx.notify();
             }
         });
         let observer = cx.observe(&editor, |_app, _editor, cx| cx.notify());
-        Self {
-            editor,
-            theme,
+
+        window.focus(&editor.read(cx).focus_handle().clone(), cx);
+        tracing::info!(root = %root.display(), path = %path.display(), "journal opened");
+        self.screen = Screen::Journal(Box::new(JournalSession {
             path,
+            editor,
             dirty: false,
-            last_seen,
+            last_seen: loaded,
             save_task: None,
             link_input,
             preview: false,
             _editor_events: events,
             _editor_observer: observer,
+        }));
+        cx.notify();
+        Ok(())
+    }
+
+    // -- welcome actions ----------------------------------------------------
+
+    fn on_create_journal(
+        &mut self,
+        _: &CreateJournal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose where to create your journal".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = prompt.await else {
+                return;
+            };
+            let Some(parent) = paths.into_iter().next() else {
+                return;
+            };
+            this.update_in(cx, |app, window, cx| {
+                app.create_journal_in(parent, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn create_journal_in(&mut self, parent: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        match journal::create_journal_dir(&parent) {
+            Ok(root) => {
+                self.remember_journal(&root);
+                self.enter_journal(root, window, cx);
+            }
+            Err(error) => {
+                tracing::error!(parent = %parent.display(), error = %error, "could not create the journal folder");
+                self.show_notice(
+                    format!("Could not create a journal in {}", parent.display()),
+                    cx,
+                );
+            }
         }
     }
 
+    fn on_open_journal(&mut self, _: &OpenJournal, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose your journal folder".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = prompt.await else {
+                return;
+            };
+            let Some(root) = paths.into_iter().next() else {
+                return;
+            };
+            this.update_in(cx, |app, window, cx| {
+                app.remember_journal(&root);
+                app.enter_journal(root, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Best-effort persistence of the chosen journal; a failed config write
+    /// only means the choice is asked again next launch.
+    fn remember_journal(&self, root: &Path) {
+        if let Err(error) = config::save_journal_root(root) {
+            tracing::warn!(root = %root.display(), error = %error, "could not save the journal choice");
+        }
+    }
+
+    // -- journal actions ----------------------------------------------------
+
     /// Restarts the debounce window; the previous pending save is dropped.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
-        if self.path.is_none() {
+        let Some(session) = self.session_mut() else {
             return;
-        }
-        self.save_task = Some(cx.spawn(async move |this, cx| {
+        };
+        session.save_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SAVE_DEBOUNCE).await;
             this.update(cx, |app, cx| app.save_now(cx)).ok();
         }));
     }
 
     fn save_now(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.path.clone() else {
+        let Some(session) = self.session_mut() else {
             return;
         };
-        let text = self.editor.read(cx).content(cx);
-        match persistence::save(&path, &text, self.last_seen.as_deref()) {
+        let path = session.path.clone();
+        let text = session.editor.read(cx).content(cx);
+        match persistence::save(&path, &text, session.last_seen.as_deref()) {
             persistence::SaveOutcome::Saved => {
-                self.dirty = false;
+                session.dirty = false;
                 let bytes = text.len();
-                self.last_seen = Some(text);
+                session.last_seen = Some(text);
                 tracing::info!(path = %path.display(), bytes, "journal saved");
             }
             persistence::SaveOutcome::ConflictCopy(conflict) => {
-                self.dirty = false;
-                self.last_seen = std::fs::read_to_string(&path).ok();
+                session.dirty = false;
+                session.last_seen = std::fs::read_to_string(&path).ok();
                 tracing::error!(
                     path = %conflict.display(),
                     "the journal changed on disk; preserved this version as a conflict copy"
@@ -131,12 +270,111 @@ impl DainikiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.preview = !self.preview;
-        if !self.preview {
-            let focus = self.editor.read(cx).focus_handle().clone();
+        let Some(session) = self.session_mut() else {
+            return;
+        };
+        session.preview = !session.preview;
+        if !session.preview {
+            let focus = session.editor.read(cx).focus_handle().clone();
             window.focus(&focus, cx);
         }
         cx.notify();
+    }
+
+    fn welcome_view(&self, notice: &Option<String>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(TitleBar::new().child("Dainiki"))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .bg(self.theme.background)
+                    .child(div().text_2xl().child("Welcome to Dainiki"))
+                    .child(div().max_w(px(440.)).text_sm().child(
+                        "Your journal is a folder of plain Markdown files you own — \
+                                 offline, no account, no lock-in. Create one, or open a folder \
+                                 you already have.",
+                    ))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .mt_2()
+                            .child(
+                                Button::new("create-journal")
+                                    .label("Create new journal")
+                                    .primary()
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(CreateJournal), cx);
+                                    }),
+                            )
+                            .child(
+                                Button::new("open-journal")
+                                    .label("Open existing folder")
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(OpenJournal), cx);
+                                    }),
+                            ),
+                    )
+                    .children(notice.as_ref().map(|notice| {
+                        div().mt_2().max_w(px(440.)).text_sm().child(notice.clone())
+                    })),
+            )
+    }
+}
+
+impl JournalSession {
+    fn view(&self, theme: &EditorTheme, cx: &App) -> impl IntoElement {
+        let content = if self.preview {
+            let text = self.editor.read(cx).content(cx);
+            div()
+                .id("reading-view")
+                .w_full()
+                .max_w(px(720.))
+                .overflow_y_scroll()
+                .child(markdown(text))
+                .into_any_element()
+        } else {
+            self.editor.clone().into_any_element()
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(TitleBar::new().child(self.window_title()))
+            .child(
+                div().w_full().px_3().py_1().child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Toolbar::new("editor-toolbar")
+                                .child(self.inline_toolbar(cx))
+                                .child(self.block_toolbar(cx)),
+                        )
+                        .child(self.insert_menu())
+                        .child(self.preview_toggle())
+                        .child(self.help_menu()),
+                ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .bg(theme.background)
+                    .px_10()
+                    .py_6()
+                    .child(content),
+            )
+    }
+
+    fn window_title(&self) -> String {
+        let dirty = if self.dirty { " •" } else { "" };
+        format!("Dainiki — {}{dirty}", self.path.display())
     }
 
     fn preview_toggle(&self) -> Toggle {
@@ -149,21 +387,13 @@ impl DainikiApp {
             })
     }
 
-    fn window_title(&self) -> String {
-        let dirty = if self.dirty { " •" } else { "" };
-        match &self.path {
-            Some(path) => format!("Dainiki — {}{dirty}", path.display()),
-            None => format!("Dainiki{dirty}"),
-        }
-    }
-
     fn inline_toggle(
         &self,
         id: &'static str,
         label: &'static str,
         format: InlineFormat,
         tooltip: &'static str,
-        cx: &Context<Self>,
+        cx: &App,
     ) -> Toggle {
         let active = self.editor.read(cx).inline_format_active(format);
         let editor = self.editor.clone();
@@ -182,7 +412,7 @@ impl DainikiApp {
         label: &'static str,
         format: BlockFormat,
         tooltip: &'static str,
-        cx: &Context<Self>,
+        cx: &App,
     ) -> Toggle {
         let active = self.editor.read(cx).block_format_active(format, cx);
         let editor = self.editor.clone();
@@ -195,7 +425,7 @@ impl DainikiApp {
             })
     }
 
-    fn block_toolbar(&self, cx: &mut Context<Self>) -> ToggleGroup {
+    fn block_toolbar(&self, cx: &App) -> ToggleGroup {
         ToggleGroup::new("block-formats").segmented().children([
             self.block_toggle("h1", "H1", BlockFormat::Heading(1), "Heading 1 — ⌘1", cx),
             self.block_toggle("h2", "H2", BlockFormat::Heading(2), "Heading 2 — ⌘2", cx),
@@ -213,7 +443,7 @@ impl DainikiApp {
         ])
     }
 
-    fn inline_toolbar(&self, cx: &mut Context<Self>) -> ToggleGroup {
+    fn inline_toolbar(&self, cx: &App) -> ToggleGroup {
         ToggleGroup::new("inline-formats").segmented().children([
             self.inline_toggle("bold", "B", InlineFormat::Bold, "Bold — ⌘B", cx),
             self.inline_toggle("italic", "I", InlineFormat::Italic, "Italic — ⌘I", cx),
@@ -269,10 +499,7 @@ impl DainikiApp {
     fn insert_menu(&self) -> Popover {
         let editor = self.editor.clone();
         let link_input = self.link_input.clone();
-        let document_dir = self
-            .path
-            .as_ref()
-            .and_then(|path| path.parent().map(Path::to_path_buf));
+        let document_dir = self.path.parent().map(Path::to_path_buf);
 
         let link_editor = editor.clone();
         let link_state = link_input.clone();
@@ -405,49 +632,17 @@ fn copy_image(source: &Path, assets: &Path) -> Result<(String, String), String> 
 
 impl Render for DainikiApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content = if self.preview {
-            let text = self.editor.read(cx).content(cx);
-            div()
-                .id("reading-view")
-                .w_full()
-                .max_w(px(720.))
-                .overflow_y_scroll()
-                .child(markdown(text))
-                .into_any_element()
-        } else {
-            self.editor.clone().into_any_element()
+        let screen = match &self.screen {
+            Screen::Welcome { notice } => self.welcome_view(notice).into_any_element(),
+            Screen::Journal(session) => session.view(&self.theme, cx).into_any_element(),
         };
         div()
             .size_full()
-            .flex()
-            .flex_col()
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_toggle_preview))
-            .child(TitleBar::new().child(self.window_title()))
-            .child(
-                div().w_full().px_3().py_1().child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            Toolbar::new("editor-toolbar")
-                                .child(self.inline_toolbar(cx))
-                                .child(self.block_toolbar(cx)),
-                        )
-                        .child(self.insert_menu())
-                        .child(self.preview_toggle())
-                        .child(self.help_menu()),
-                ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .bg(self.theme.background)
-                    .px_10()
-                    .py_6()
-                    .child(content),
-            )
+            .on_action(cx.listener(Self::on_create_journal))
+            .on_action(cx.listener(Self::on_open_journal))
+            .child(screen)
     }
 }
 
@@ -494,57 +689,119 @@ fn open_app_window(cx: &mut App, root: Option<PathBuf>) -> Result<()> {
         ..TitleBar::window_options()
     };
 
-    // Opening the journal means opening today's entry, creating it (and its
-    // folders) on first launch of the day.
-    let entry = match &root {
-        Some(root) => {
-            let journal = journal::Journal::new(root);
-            let today = Local::now().date_naive();
-            match journal.ensure_entry(today) {
-                Ok(path) => Some(path),
-                Err(error) => {
-                    tracing::error!(root = %root.display(), error = %error, "could not open today's entry");
-                    None
-                }
-            }
-        }
-        None => None,
-    };
-
-    let loaded = match &entry {
-        Some(path) => match persistence::load(path) {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                tracing::error!(path = %path.display(), error = %error, "failed to read journal");
-                None
-            }
-        },
-        None => None,
-    };
-    let last_seen = loaded.clone();
-    let content = loaded.unwrap_or_else(|| {
-        if entry.is_some() {
-            String::new()
-        } else {
-            WELCOME.to_string()
-        }
-    });
-    let base_dir = entry
-        .as_ref()
-        .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
-
     gpui_kit::open_window(options, cx, move |window, cx| {
         let theme = EditorTheme::default();
-        let buffer = cx.new(|_| Buffer::from_text(&content));
-        let editor = cx.new(|cx| {
-            let mut editor = MarkdownEditor::new(buffer, theme.clone(), cx);
-            editor.set_base_dir(base_dir.clone(), cx);
-            editor
-        });
-        let focus_handle = editor.read(cx).focus_handle().clone();
-        window.focus(&focus_handle, cx);
-        cx.new(|cx| DainikiApp::new(editor, theme, entry, last_seen, window, cx))
+        cx.new(|cx| {
+            let mut app = DainikiApp::new(theme);
+            if let Some(root) = root {
+                if root.is_dir() {
+                    app.enter_journal(root, window, cx);
+                } else {
+                    app.show_notice(format!("Journal folder not found — {}", root.display()), cx);
+                }
+            }
+            app
+        })
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use chrono::Local;
+    use gpui::TestAppContext;
+
+    // NOTE: no `use super::*` here. The crate root glob-imports `gpui_kit::*`,
+    // which re-exports gpui's `test` proc macro; globbing it in would shadow
+    // the builtin `#[test]` inside the generated harness and recurse forever.
+    use super::{DainikiApp, EditorTheme, Screen, journal};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// The component library needs its theme global before any view renders.
+    fn init(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+    }
+
+    fn scratch_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dainiki-app-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[gpui::test]
+    async fn the_app_starts_on_the_welcome_screen(cx: &mut TestAppContext) {
+        init(cx);
+        let (app, cx) = cx.add_window_view(|_window, _cx| DainikiApp::new(EditorTheme::default()));
+        cx.update(|_window, cx| {
+            assert!(matches!(
+                app.read(cx).screen,
+                Screen::Welcome { notice: None }
+            ));
+        });
+    }
+
+    #[gpui::test]
+    async fn entering_a_journal_creates_and_loads_todays_entry(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let path = journal.ensure_entry(today).expect("ensure");
+        fs::write(&path, "# written earlier today\n").expect("seed");
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(EditorTheme::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert_eq!(session.path, path);
+            assert_eq!(
+                session.editor.read(cx).content(cx),
+                "# written earlier today\n"
+            );
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn a_failed_open_lands_on_welcome_with_a_notice(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let not_a_folder = dir.join("entry.md");
+        fs::write(&not_a_folder, "not a journal").expect("seed");
+
+        let (app, cx) = cx.add_window_view({
+            let root = not_a_folder.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(EditorTheme::default());
+                app.enter_journal(root, window, cx);
+                app
+            }
+        });
+        cx.update(|_window, cx| {
+            assert!(matches!(
+                app.read(cx).screen,
+                Screen::Welcome { notice: Some(_) }
+            ));
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
 }

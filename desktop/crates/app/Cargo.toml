@@ -16,3 +16,5 @@ serde = { version = "=1.0.229", features = ["derive"] }
 toml = "=1.1.8"
 
 [dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+gpui_platform.workspace = true

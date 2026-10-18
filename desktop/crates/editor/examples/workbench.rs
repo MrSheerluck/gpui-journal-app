@@ -1,9 +1,12 @@
 use std::fs;
 
-use dainiki_editor::{Buffer, EditorTheme, MarkdownEditor};
+use dainiki_editor::{
+    Buffer, EditorTheme, MarkdownEditor,
+    commands::{BlockFormat, InlineFormat},
+};
 use gpui::{
-    App, Bounds, Context, Entity, Render, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    div, prelude::*, px, size,
+    App, Bounds, Context, Entity, Hsla, MouseButton, Render, Subscription, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use gpui_platform::application;
 use tracing_subscriber::EnvFilter;
@@ -62,23 +65,146 @@ code, links — all keyboard-driven.
 struct Workbench {
     theme: EditorTheme,
     editor: Entity<MarkdownEditor>,
+    _editor_events: Subscription,
+}
+
+impl Workbench {
+    /// The same operations as the app toolbar, so the harness always shows
+    /// every action the editor supports. Active states follow the caret.
+    fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme.clone();
+        let mut buttons: Vec<gpui::AnyElement> = Vec::new();
+
+        for (label, format) in [
+            ("B", InlineFormat::Bold),
+            ("I", InlineFormat::Italic),
+            ("S", InlineFormat::Strike),
+            ("H", InlineFormat::Highlight),
+            ("`", InlineFormat::Code),
+        ] {
+            let active = self.editor.read(cx).inline_format_active(format);
+            let editor = self.editor.clone();
+            buttons.push(
+                toolbar_button(label, active, &theme, move |_window, cx| {
+                    editor.update(cx, |editor, cx| editor.toggle_inline_format(format, cx));
+                })
+                .into_any_element(),
+            );
+        }
+        buttons.push(toolbar_separator(&theme).into_any_element());
+
+        for (label, format) in [
+            ("H1", BlockFormat::Heading(1)),
+            ("H2", BlockFormat::Heading(2)),
+            ("H3", BlockFormat::Heading(3)),
+            ("•", BlockFormat::Bullet),
+            ("1.", BlockFormat::Ordered),
+            ("☐", BlockFormat::Task),
+            (">", BlockFormat::Quote),
+        ] {
+            let active = self.editor.read(cx).block_format_active(format, cx);
+            let editor = self.editor.clone();
+            buttons.push(
+                toolbar_button(label, active, &theme, move |_window, cx| {
+                    editor.update(cx, |editor, cx| editor.toggle_block_format(format, cx));
+                })
+                .into_any_element(),
+            );
+        }
+        buttons.push(toolbar_separator(&theme).into_any_element());
+
+        let editor = self.editor.clone();
+        buttons.push(
+            toolbar_button("Link", false, &theme, move |_window, cx| {
+                editor.update(cx, |editor, cx| editor.insert_link("", cx));
+            })
+            .into_any_element(),
+        );
+        let editor = self.editor.clone();
+        buttons.push(
+            toolbar_button("Code block", false, &theme, move |_window, cx| {
+                editor.update(cx, |editor, cx| editor.insert_code_fence(cx));
+            })
+            .into_any_element(),
+        );
+        let editor = self.editor.clone();
+        buttons.push(
+            toolbar_button("Divider", false, &theme, move |_window, cx| {
+                editor.update(cx, |editor, cx| editor.insert_rule(cx));
+            })
+            .into_any_element(),
+        );
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.))
+            .px(px(10.))
+            .py(px(6.))
+            .border_b(px(1.))
+            .border_color(Hsla {
+                a: 0.08,
+                ..theme.text
+            })
+            .children(buttons)
+    }
+}
+
+fn toolbar_button(
+    label: &'static str,
+    active: bool,
+    theme: &EditorTheme,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let background = if active {
+        theme.selection
+    } else {
+        theme.background
+    };
+    let hover_background = Hsla {
+        a: 0.08,
+        ..theme.text
+    };
+    div()
+        .px(px(7.))
+        .py(px(3.))
+        .rounded(px(6.))
+        .text_sm()
+        .text_color(theme.text)
+        .bg(background)
+        .hover(move |style| style.bg(hover_background))
+        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+            on_click(window, cx);
+        })
+        .child(label)
+}
+
+fn toolbar_separator(theme: &EditorTheme) -> impl IntoElement {
+    div().w(px(1.)).h(px(16.)).mx(px(4.)).bg(Hsla {
+        a: 0.15,
+        ..theme.text
+    })
 }
 
 impl Render for Workbench {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .bg(self.theme.background)
             .flex()
-            .justify_center()
+            .flex_col()
+            .child(self.toolbar(cx))
             .child(
-                div()
-                    .w_full()
-                    .max_w(px(720.0))
-                    .h_full()
-                    .px_6()
-                    .py_6()
-                    .child(self.editor.clone()),
+                div().flex_1().w_full().flex().justify_center().child(
+                    div()
+                        .w_full()
+                        .max_w(px(720.0))
+                        .h_full()
+                        .px_6()
+                        .py_6()
+                        .child(self.editor.clone()),
+                ),
             )
     }
 }
@@ -130,7 +256,14 @@ fn main() {
                 });
                 let focus_handle = editor.read(cx).focus_handle().clone();
                 window.focus(&focus_handle, cx);
-                cx.new(|_cx| Workbench { theme, editor })
+                cx.new(|cx| {
+                    let _editor_events = cx.observe(&editor, |_this, _editor, cx| cx.notify());
+                    Workbench {
+                        theme,
+                        editor,
+                        _editor_events,
+                    }
+                })
             },
         )
         .expect("failed to open workbench window");

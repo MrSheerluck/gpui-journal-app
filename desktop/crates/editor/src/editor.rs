@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{
     Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Render,
@@ -11,6 +12,8 @@ use crate::{
     theme::EditorTheme,
 };
 
+const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
 pub struct MarkdownEditor {
     buffer: Entity<Buffer>,
     theme: EditorTheme,
@@ -18,18 +21,54 @@ pub struct MarkdownEditor {
     layout: EditorLayout,
     selection: Selection,
     focus_handle: FocusHandle,
+    caret_visible: bool,
+    blink_epoch: u64,
+    focused: bool,
 }
 
 impl MarkdownEditor {
     pub fn new(buffer: Entity<Buffer>, theme: EditorTheme, cx: &mut Context<Self>) -> Self {
-        Self {
+        let mut this = Self {
             buffer,
             theme,
             scroll: Rc::new(EditorScrollState::default()),
             layout: EditorLayout::default(),
             selection: Selection::default(),
             focus_handle: cx.focus_handle(),
-        }
+            caret_visible: true,
+            blink_epoch: 0,
+            focused: false,
+        };
+        this.spawn_blink(cx);
+        this
+    }
+
+    /// Toggles caret visibility while the editor is focused. Movement calls
+    /// [`Self::restart_blink`], which delays the next toggle by bumping the
+    /// epoch; the loop only toggles when the epoch it last saw still matches.
+    fn spawn_blink(&mut self, cx: &mut Context<Self>) {
+        let mut seen_epoch = self.blink_epoch;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(CARET_BLINK_INTERVAL).await;
+                let Ok(epoch) = this.update(cx, |this, cx| {
+                    if this.focused && this.blink_epoch == seen_epoch {
+                        this.caret_visible = !this.caret_visible;
+                        cx.notify();
+                    }
+                    this.blink_epoch
+                }) else {
+                    break;
+                };
+                seen_epoch = epoch;
+            }
+        })
+        .detach();
+    }
+
+    fn restart_blink(&mut self) {
+        self.caret_visible = true;
+        self.blink_epoch = self.blink_epoch.wrapping_add(1);
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -59,6 +98,7 @@ impl MarkdownEditor {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle, cx);
+        self.restart_blink();
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -77,6 +117,7 @@ impl MarkdownEditor {
         let Some(target) = target else {
             return;
         };
+        self.restart_blink();
         if extend {
             self.selection.move_head(target);
         } else if !self.selection.is_caret() {
@@ -194,7 +235,12 @@ fn snap_index(index: Result<usize, usize>) -> usize {
 
 impl Render for MarkdownEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let show_caret = self.focus_handle.is_focused(window);
+        let focused = self.focus_handle.is_focused(window);
+        if focused != self.focused {
+            self.focused = focused;
+            self.restart_blink();
+        }
+        let show_caret = self.focused && self.caret_visible;
         div()
             .size_full()
             .overflow_hidden()

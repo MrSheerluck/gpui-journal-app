@@ -23,7 +23,6 @@ use crate::{
     markdown::{Construct, ConstructKind, MarkdownIndex},
     theme::EditorTheme,
 };
-
 const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -59,6 +58,7 @@ pub struct MarkdownEditor {
     autoscroll_active: bool,
     base_dir: Option<PathBuf>,
     images: HashMap<String, ImageState>,
+    pending_edit: Option<PendingEdit>,
     /// Set when the caret or text changed; consumed by one paint to scroll
     /// the caret into view. Scrolling never triggers it, so the wheel is
     /// never fought by the reveal.
@@ -71,6 +71,14 @@ pub(crate) enum ImageState {
     Loading,
     Loaded(Arc<RenderImage>),
     Failed,
+}
+
+/// The edit a render pass should hand the markdown index. Multiple edits
+/// between frames collapse into a full rebuild for safety.
+#[derive(Clone)]
+enum PendingEdit {
+    One { range: Range<usize>, new_len: usize },
+    Full,
 }
 
 impl MarkdownEditor {
@@ -98,6 +106,7 @@ impl MarkdownEditor {
             autoscroll_active: false,
             base_dir: None,
             images: HashMap::new(),
+            pending_edit: None,
             reveal_pending: true,
         };
         this.spawn_blink(cx);
@@ -163,6 +172,15 @@ impl MarkdownEditor {
         self.plan.clone()
     }
 
+    /// Records a buffer edit for the next render's incremental re-parse.
+    fn record_edit(&mut self, range: Range<usize>, new_len: usize) {
+        self.pending_edit = match self.pending_edit.take() {
+            None => Some(PendingEdit::One { range, new_len }),
+            Some(_) => Some(PendingEdit::Full),
+        };
+        self.revision += 1;
+    }
+
     /// Re-projects the display when the text or selection changed since the
     /// last call. Called at the top of every render; a no-op otherwise.
     fn sync_display(&mut self, cx: &mut Context<Self>) {
@@ -170,7 +188,12 @@ impl MarkdownEditor {
             return;
         }
         let text = self.content(cx);
-        self.index.update(&text);
+        match self.pending_edit.take() {
+            Some(PendingEdit::One { range, new_len }) => {
+                self.index.update_edited(&text, range, new_len)
+            }
+            Some(PendingEdit::Full) | None => self.index.update(&text),
+        }
         self.plan = Rc::new(DisplayPlan::compute(&text, &self.index, self.selection));
         self.display_revision = self.revision;
         self.display_selection = self.selection;
@@ -191,6 +214,7 @@ impl MarkdownEditor {
     pub fn set_base_dir(&mut self, dir: Option<PathBuf>, cx: &mut Context<Self>) {
         self.base_dir = dir;
         self.images.clear();
+        self.pending_edit = Some(PendingEdit::Full);
         self.revision += 1;
         cx.notify();
     }
@@ -346,6 +370,7 @@ impl MarkdownEditor {
         let removed = self
             .buffer
             .update(cx, |buffer, _| buffer.replace(marker.clone(), text));
+        self.record_edit(marker.clone(), text.len());
         self.history.record(
             Edit {
                 range: marker,
@@ -357,7 +382,6 @@ impl MarkdownEditor {
             },
             MergeKind::None,
         );
-        self.revision += 1;
         self.restart_blink();
         cx.emit(EditorEvent::Edited);
         cx.notify();
@@ -707,7 +731,6 @@ impl MarkdownEditor {
             },
             MergeKind::None,
         );
-        self.revision += 1;
         self.restart_blink();
         cx.emit(EditorEvent::Edited);
         cx.notify();
@@ -879,16 +902,16 @@ impl MarkdownEditor {
     }
 
     fn undo_redo(&mut self, redo: bool, cx: &mut Context<Self>) {
-        let selection = self.buffer.update(cx, |buffer, _| {
+        let applied = self.buffer.update(cx, |buffer, _| {
             if redo {
                 self.history.redo(buffer)
             } else {
                 self.history.undo(buffer)
             }
         });
-        if let Some(selection) = selection {
-            self.selection = selection;
-            self.revision += 1;
+        if let Some(applied) = applied {
+            self.selection = applied.selection;
+            self.record_edit(applied.range, applied.new_len);
             self.restart_blink();
             cx.emit(EditorEvent::Edited);
             cx.notify();
@@ -1245,6 +1268,7 @@ impl MarkdownEditor {
             .update(cx, |buffer, _| buffer.replace(range.clone(), text));
         self.selection.collapse(caret);
         self.marked_range = mark_composition.then(|| range.start..range.start + text.len());
+        self.record_edit(range.clone(), text.len());
         self.history.record(
             Edit {
                 range,
@@ -1256,7 +1280,6 @@ impl MarkdownEditor {
             },
             merge,
         );
-        self.revision += 1;
         self.restart_blink();
         cx.emit(EditorEvent::Edited);
         cx.notify();
@@ -1548,6 +1571,23 @@ mod interaction_tests {
         cx.simulate_keystrokes("cmd-z");
         cx.update(|_, app| {
             assert_eq!(editor.read(app).content(app), "[hello](https://x.dev)");
+        });
+    }
+
+    #[gpui::test]
+    async fn typing_flows_through_incremental_index_into_the_display(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "");
+        cx.simulate_input("**bold**");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "**bold**");
+            let plan = editor.read(app).plan();
+            assert_eq!(
+                plan.lines[0].text, "bold",
+                "typed markers should collapse in the display"
+            );
         });
     }
 

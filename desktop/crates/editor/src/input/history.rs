@@ -37,6 +37,16 @@ impl Edit {
     }
 }
 
+/// What an undo/redo application did to the buffer.
+#[derive(Clone, Debug)]
+pub struct AppliedEdit {
+    pub selection: Selection,
+    /// The byte range as it was before this application.
+    pub range: Range<usize>,
+    /// How many bytes were written.
+    pub new_len: usize,
+}
+
 #[derive(Default)]
 pub struct History {
     undo_stack: Vec<Edit>,
@@ -66,23 +76,31 @@ impl History {
         }
     }
 
-    /// Undoes the newest edit; returns the selection to restore.
-    pub fn undo(&mut self, buffer: &mut Buffer) -> Option<Selection> {
+    /// Undoes the newest edit; returns what was applied.
+    pub fn undo(&mut self, buffer: &mut Buffer) -> Option<AppliedEdit> {
         let edit = self.undo_stack.pop()?;
         let applied = edit.applied_range();
-        buffer.replace(applied, &edit.removed);
-        let selection = edit.selection_before;
+        buffer.replace(applied.clone(), &edit.removed);
+        let summary = AppliedEdit {
+            selection: edit.selection_before,
+            range: applied,
+            new_len: edit.removed.len(),
+        };
         self.redo_stack.push(edit);
-        Some(selection)
+        Some(summary)
     }
 
-    /// Redoes the newest undone edit; returns the selection to restore.
-    pub fn redo(&mut self, buffer: &mut Buffer) -> Option<Selection> {
+    /// Redoes the newest undone edit; returns what was applied.
+    pub fn redo(&mut self, buffer: &mut Buffer) -> Option<AppliedEdit> {
         let edit = self.redo_stack.pop()?;
         buffer.replace(edit.range.clone(), &edit.inserted);
-        let selection = edit.selection_after;
+        let summary = AppliedEdit {
+            selection: edit.selection_after,
+            range: edit.range.clone(),
+            new_len: edit.inserted.len(),
+        };
         self.undo_stack.push(edit);
-        Some(selection)
+        Some(summary)
     }
 
     fn adjacent(last: &Edit, edit: &Edit, merge: MergeKind) -> bool {
@@ -291,8 +309,8 @@ mod tests {
         assert_eq!(buffer.slice(0..buffer.len_bytes()), "1 two");
 
         let before = history.undo(&mut buffer).expect("edit to undo");
-        assert_eq!(before, Selection::new(0, 3));
+        assert_eq!(before.selection, Selection::new(0, 3));
         let after = history.redo(&mut buffer).expect("edit to redo");
-        assert_eq!(after, Selection::caret(1));
+        assert_eq!(after.selection, Selection::caret(1));
     }
 }

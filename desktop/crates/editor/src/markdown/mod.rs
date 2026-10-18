@@ -12,7 +12,7 @@
 
 use std::ops::Range;
 
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
 /// Everything the live preview currently understands.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +62,16 @@ pub struct MarkdownIndex {
     block_parser: Parser,
     inline_parser: Parser,
     block_tree: Option<Tree>,
+    /// The text the current trees were parsed from; needed to build edit
+    /// positions for incremental updates.
+    last_text: String,
+    /// Parsed inline regions, keyed by their byte range in the current text.
+    inline_regions: Vec<InlineRegion>,
+    constructs: Vec<Construct>,
+}
+
+struct InlineRegion {
+    range: Range<usize>,
     constructs: Vec<Construct>,
 }
 
@@ -79,26 +89,116 @@ impl MarkdownIndex {
             block_parser,
             inline_parser,
             block_tree: None,
+            last_text: String::new(),
+            inline_regions: Vec::new(),
             constructs: Vec::new(),
         }
     }
 
     /// Re-parses `text` and rebuilds the construct list.
     pub fn update(&mut self, text: &str) {
-        let Some(tree) = self.block_parser.parse(text, None) else {
-            return;
+        self.rebuild(text, None);
+    }
+
+    /// Applies a known edit `old_range` (as it was before the edit) that was
+    /// replaced by `new_len` bytes, reusing both trees for everything the
+    /// edit did not touch.
+    pub fn update_edited(&mut self, text: &str, old_range: Range<usize>, new_len: usize) {
+        self.rebuild(text, Some((old_range, new_len)));
+    }
+
+    fn rebuild(&mut self, text: &str, edit: Option<(Range<usize>, usize)>) {
+        let t0 = std::time::Instant::now();
+        let input_edit = edit.as_ref().and_then(|(old_range, new_len)| {
+            let new_len = *new_len;
+            let old_len = self.last_text.len();
+            if old_range.start > old_range.end || old_range.end > old_len {
+                return None;
+            }
+            Some(InputEdit {
+                start_byte: old_range.start,
+                old_end_byte: old_range.end,
+                new_end_byte: old_range.start + new_len,
+                start_position: point_in(&self.last_text, old_range.start),
+                old_end_position: point_in(&self.last_text, old_range.end),
+                new_end_position: point_in(text, old_range.start + new_len),
+            })
+        });
+
+        let tree = match (input_edit, self.block_tree.take()) {
+            (Some(edit), Some(mut old_tree)) => {
+                old_tree.edit(&edit);
+                self.block_parser
+                    .parse(text, Some(&old_tree))
+                    .unwrap_or(old_tree)
+            }
+            (_, _) => match self.block_parser.parse(text, None) {
+                Some(tree) => tree,
+                None => return,
+            },
         };
+
         let root = tree.root_node();
+        let t1 = std::time::Instant::now();
         let mut constructs = Vec::new();
         self.walk_blocks(root, text, &mut constructs);
-        let inline_nodes = collect_kind_nodes(root, "inline");
-        for inline in inline_nodes {
-            let start = inline.start_byte();
-            let source = &text[start..inline.end_byte()];
+
+        // Incremental inline pass: shift kept regions by the edit, drop the
+        // ones the edit touched, and re-parse only regions without a cached
+        // tree.
+        let regions = collect_kind_nodes(root, "inline");
+        let mut kept = std::mem::take(&mut self.inline_regions);
+        if let Some((old_range, new_len)) = edit {
+            let delta = new_len as isize - (old_range.end - old_range.start) as isize;
+            kept.retain_mut(|region| {
+                if region.range.end <= old_range.start {
+                    true
+                } else if region.range.start >= old_range.end {
+                    region.range = shift_signed(&region.range, delta);
+                    for construct in &mut region.constructs {
+                        shift_construct(construct, delta);
+                    }
+                    true
+                } else {
+                    false
+                }
+            });
+        } else {
+            kept.clear();
+        }
+
+        let mut inline_regions = Vec::with_capacity(regions.len());
+        let mut kept_iter = kept.into_iter().peekable();
+        for region in regions {
+            let range = region.byte_range();
+            // Both sequences are sorted; skip kept entries that no longer
+            // correspond to any region.
+            while let Some(next) = kept_iter.peek() {
+                if next.range.end < range.start {
+                    kept_iter.next();
+                } else {
+                    break;
+                }
+            }
+            if let Some(next) = kept_iter.peek()
+                && next.range == range
+            {
+                inline_regions.push(kept_iter.next().expect("peeked"));
+                continue;
+            }
+            let source = &text[range.clone()];
             if let Some(tree) = self.inline_parser.parse(source, None) {
-                self.walk_inline(tree.root_node(), start, text, &mut constructs);
+                let mut constructs = Vec::new();
+                self.walk_inline(tree.root_node(), range.start, text, &mut constructs);
+                inline_regions.push(InlineRegion { range, constructs });
             }
         }
+        for region in &inline_regions {
+            constructs.extend(region.constructs.iter().cloned());
+        }
+        let t2 = std::time::Instant::now();
+        self.inline_regions = inline_regions;
+
         constructs.sort_by_key(|construct| (construct.range.start, construct.range.end));
         self.block_tree = Some(tree);
         self.constructs = constructs;
@@ -107,6 +207,17 @@ impl MarkdownIndex {
         self.constructs.extend(highlights);
         self.constructs
             .sort_by_key(|construct| (construct.range.start, construct.range.end));
+        self.last_text.clear();
+        self.last_text.push_str(text);
+        let t3 = std::time::Instant::now();
+        if std::env::var_os("SMBL_PERF_DEBUG").is_some() {
+            eprintln!(
+                "rebuild block={:.2}ms walk={:.2}ms tail={:.2}ms",
+                (t1 - t0).as_secs_f64() * 1000.0,
+                (t2 - t1).as_secs_f64() * 1000.0,
+                (t3 - t2).as_secs_f64() * 1000.0,
+            );
+        }
     }
 
     pub fn constructs(&self) -> &[Construct] {
@@ -313,6 +424,35 @@ impl MarkdownIndex {
 /// Shifts a slice-relative byte range into document coordinates.
 fn shift(range: Range<usize>, offset: usize) -> Range<usize> {
     range.start + offset..range.end + offset
+}
+
+/// Shifts a byte range by a signed delta, clamped at zero.
+fn shift_signed(range: &Range<usize>, delta: isize) -> Range<usize> {
+    let start = (range.start as isize + delta).max(0) as usize;
+    let end = (range.end as isize + delta).max(0) as usize;
+    start..end
+}
+
+/// Shifts every range of a construct by a signed delta.
+fn shift_construct(construct: &mut Construct, delta: isize) {
+    construct.range = shift_signed(&construct.range, delta);
+    for marker in &mut construct.markers {
+        *marker = shift_signed(marker, delta);
+    }
+    for inner in &mut construct.inner {
+        *inner = shift_signed(inner, delta);
+    }
+}
+
+/// The tree-sitter point (byte-based column) for a byte offset.
+fn point_in(text: &str, offset: usize) -> Point {
+    let offset = offset.min(text.len());
+    let row = text[..offset].bytes().filter(|byte| *byte == b'\n').count();
+    let line_start = text[..offset].rfind('\n').map(|ix| ix + 1).unwrap_or(0);
+    Point {
+        row,
+        column: offset - line_start,
+    }
 }
 
 /// Finds `==text==` pairs the Markdown grammar does not know about, outside
@@ -625,6 +765,43 @@ mod tests {
             vec![15..21],
             "wrong pairs matched: {highlights:?}"
         );
+    }
+
+    #[test]
+    fn incremental_update_matches_full_update() {
+        let base = "# Title\n\nA **bold** word and [link](https://x.dev).\n\n- [ ] task\n\n```rs\nfn main() {}\n```\n\n==hot== tail\n";
+        let scenarios: Vec<(usize, Range<usize>, &str)> = vec![
+            (base.find("A **").unwrap(), 0..0, "very "),
+            (base.find("**bold**").unwrap() + 2, 2..2, "very "),
+            (base.find("- [ ]").unwrap() + 2, 2..5, "[x]"),
+            (base.find("```rs").unwrap(), 0..0, "> "),
+            (base.find("tail").unwrap(), 0..5, ""),
+            (base.len(), 0..0, "\n# New\n"),
+            (0, 0..0, "pre "),
+        ];
+        for (position, old_range, replacement) in scenarios {
+            let mut edited = base.to_string();
+            edited.replace_range(
+                position + old_range.start..position + old_range.end,
+                replacement,
+            );
+
+            let mut full = MarkdownIndex::new();
+            full.update(&edited);
+            let mut incremental = MarkdownIndex::new();
+            incremental.update(base);
+            incremental.update_edited(
+                &edited,
+                position + old_range.start..position + old_range.end,
+                replacement.len(),
+            );
+
+            assert_eq!(
+                incremental.constructs().to_vec(),
+                full.constructs().to_vec(),
+                "constructs diverged for edit at {position} with {replacement:?}"
+            );
+        }
     }
 
     #[test]

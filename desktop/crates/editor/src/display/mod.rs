@@ -20,6 +20,23 @@ pub enum Style {
     },
 }
 
+/// Inline character-level styles carried as display runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineStyle {
+    Emphasis,
+    Strong,
+    Strikethrough,
+    Code,
+    Highlight,
+}
+
+/// A styled stretch of a projected line's display text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StyleRun {
+    pub display: Range<usize>,
+    pub style: InlineStyle,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FragmentKind {
     /// Text the user sees; maps linearly from source to display.
@@ -48,6 +65,8 @@ pub struct ProjectedLine {
     pub text: String,
     /// Source ↔ display mapping, in display order.
     pub fragments: Vec<Fragment>,
+    /// Inline styles over the display text; may overlap when nested.
+    pub runs: Vec<StyleRun>,
     pub style: Style,
 }
 
@@ -154,107 +173,174 @@ fn project_line(
     index: &MarkdownIndex,
     selection: Selection,
 ) -> ProjectedLine {
-    let heading = index.constructs_in(source.clone()).find(|construct| {
-        matches!(construct.kind, ConstructKind::Heading { .. })
-            && !line_revealed(
-                &(construct.range.start.max(source.start)..construct.range.end.min(source.end)),
-                selection,
-            )
-    });
+    let mut hidden: Vec<Range<usize>> = Vec::new();
+    let mut pending_runs: Vec<(Range<usize>, InlineStyle)> = Vec::new();
+    let mut line_style = Style::Body;
 
-    let Some(heading) = heading else {
-        return plain_line(text, source);
-    };
-    let ConstructKind::Heading { level } = heading.kind else {
-        return plain_line(text, source);
-    };
-
-    // Hidden markup: from the leading marker through the gap before the
-    // content. A trailing marker (e.g. `# Title #`) is hidden as well.
-    let content = heading.inner.first().cloned();
-    let mut fragments = Vec::new();
-    let mut display = 0;
-    let mut cursor = source.start;
-
-    let hidden_end = content
-        .as_ref()
-        .map(|range| range.start)
-        .unwrap_or(source.end);
-    if cursor < hidden_end {
-        fragments.push(Fragment {
-            source: cursor..hidden_end,
-            display: display..display,
-            kind: FragmentKind::Hidden,
-        });
-        cursor = hidden_end;
-    }
-    if let Some(content) = &content {
-        let visible_end = content.end.min(source.end);
-        let visible = &text[cursor..visible_end];
-        fragments.push(Fragment {
-            source: cursor..visible_end,
-            display: display..display + visible.len(),
-            kind: FragmentKind::Visible,
-        });
-        display += visible.len();
-        cursor = visible_end;
-
-        if let Some(trailing) = heading
-            .markers
-            .iter()
-            .find(|marker| marker.start >= visible_end)
-            && cursor < trailing.end
-        {
-            fragments.push(Fragment {
-                source: cursor..trailing.end,
-                display: display..display,
-                kind: FragmentKind::Hidden,
-            });
-            cursor = trailing.end;
+    for construct in index.constructs_in(source.clone()) {
+        match construct.kind {
+            ConstructKind::Heading { level } => {
+                let reveal_range =
+                    construct.range.start.max(source.start)..construct.range.end.min(source.end);
+                if line_revealed(&reveal_range, selection) {
+                    continue;
+                }
+                line_style = Style::Heading { level };
+                let content_start = construct
+                    .inner
+                    .first()
+                    .map(|range| range.start)
+                    .unwrap_or(source.end)
+                    .min(source.end);
+                if source.start < content_start {
+                    hidden.push(source.start..content_start);
+                }
+                if let Some(content) = construct.inner.first() {
+                    let visible_end = content.end.min(source.end);
+                    if let Some(trailing) = construct
+                        .markers
+                        .iter()
+                        .find(|marker| marker.start >= visible_end)
+                    {
+                        let start = trailing.start.max(visible_end).max(source.start);
+                        let end = trailing.end.min(source.end);
+                        if start < end {
+                            hidden.push(start..end);
+                        }
+                    }
+                }
+            }
+            ConstructKind::Emphasis
+            | ConstructKind::Strong
+            | ConstructKind::Strikethrough
+            | ConstructKind::CodeSpan
+            | ConstructKind::Highlight => {
+                if !revealed(construct, selection) {
+                    for marker in &construct.markers {
+                        let start = marker.start.max(source.start);
+                        let end = marker.end.min(source.end);
+                        if start < end {
+                            hidden.push(start..end);
+                        }
+                    }
+                }
+                if construct.markers.len() >= 2 {
+                    let first = &construct.markers[0];
+                    let last = &construct.markers[construct.markers.len() - 1];
+                    let start = first.end.max(source.start);
+                    let end = last.start.min(source.end);
+                    if start < end {
+                        pending_runs.push((start..end, inline_style(&construct.kind)));
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    if cursor < source.end {
-        let visible = &text[cursor..source.end];
-        fragments.push(Fragment {
-            source: cursor..source.end,
-            display: display..display + visible.len(),
-            kind: FragmentKind::Visible,
-        });
-    }
 
-    let text_visible: String = fragments
-        .iter()
-        .filter(|fragment| fragment.kind == FragmentKind::Visible)
-        .map(|fragment| &text[fragment.source.clone()])
-        .collect();
+    let (visible_text, fragments) = build_fragments(text, &source, hidden);
+    let runs = map_runs(&fragments, pending_runs);
+
     ProjectedLine {
         source,
-        text: text_visible,
+        text: visible_text,
         fragments,
-        style: Style::Heading { level },
+        runs,
+        style: line_style,
     }
 }
 
-fn plain_line(text: &str, source: Range<usize>) -> ProjectedLine {
+fn inline_style(kind: &ConstructKind) -> InlineStyle {
+    match kind {
+        ConstructKind::Emphasis => InlineStyle::Emphasis,
+        ConstructKind::Strong => InlineStyle::Strong,
+        ConstructKind::Strikethrough => InlineStyle::Strikethrough,
+        ConstructKind::CodeSpan => InlineStyle::Code,
+        ConstructKind::Highlight => InlineStyle::Highlight,
+        _ => unreachable!("only inline constructs carry inline styles"),
+    }
+}
+
+/// Splits a line into visible and hidden fragments around the hidden ranges.
+fn build_fragments(
+    text: &str,
+    source: &Range<usize>,
+    hidden: Vec<Range<usize>>,
+) -> (String, Vec<Fragment>) {
+    let mut ranges: Vec<Range<usize>> = hidden
+        .into_iter()
+        .map(|range| range.start.max(source.start)..range.end.min(source.end))
+        .filter(|range| range.start < range.end)
+        .collect();
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+
+    let mut output = String::new();
     let mut fragments = Vec::new();
-    if source.start <= source.end {
+    let mut display = 0;
+    let mut cursor = source.start;
+    for range in merged {
+        if cursor < range.start {
+            output.push_str(&text[cursor..range.start]);
+            fragments.push(Fragment {
+                source: cursor..range.start,
+                display: display..display + (range.start - cursor),
+                kind: FragmentKind::Visible,
+            });
+            display += range.start - cursor;
+        }
         fragments.push(Fragment {
-            source: source.clone(),
-            display: 0..source.end - source.start,
+            source: range.clone(),
+            display: display..display,
+            kind: FragmentKind::Hidden,
+        });
+        cursor = range.end;
+    }
+    if cursor < source.end {
+        output.push_str(&text[cursor..source.end]);
+        fragments.push(Fragment {
+            source: cursor..source.end,
+            display: display..display + (source.end - cursor),
             kind: FragmentKind::Visible,
         });
     }
-    ProjectedLine {
-        text: text[source.clone()].to_string(),
-        fragments,
-        source,
-        style: Style::Body,
+    (output, fragments)
+}
+
+/// Maps source-space style runs through the fragments, splitting them when
+/// hidden markup interrupts the visible text.
+fn map_runs(fragments: &[Fragment], pending: Vec<(Range<usize>, InlineStyle)>) -> Vec<StyleRun> {
+    let mut runs = Vec::new();
+    for (range, style) in pending {
+        for fragment in fragments {
+            if fragment.kind != FragmentKind::Visible {
+                continue;
+            }
+            let start = range.start.max(fragment.source.start);
+            let end = range.end.min(fragment.source.end);
+            if start >= end {
+                continue;
+            }
+            runs.push(StyleRun {
+                display: fragment.display.start + (start - fragment.source.start)
+                    ..fragment.display.start + (end - fragment.source.start),
+                style,
+            });
+        }
     }
+    runs.sort_by_key(|run| (run.display.start, run.display.end));
+    runs
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DisplayPlan, FragmentKind, Style, revealed};
+    use super::{DisplayPlan, FragmentKind, InlineStyle, Style, revealed};
     use crate::buffer::Buffer;
     use crate::input::Selection;
     use crate::markdown::MarkdownIndex;
@@ -373,5 +459,67 @@ mod tests {
         assert_eq!(plan.lines[1].text, "");
         assert_eq!(plan.lines[3].text, "end");
         assert_eq!(plan.lines.len(), 4);
+    }
+
+    #[test]
+    fn inline_markers_collapse_and_styles_run() {
+        let text = "Plain *em* and **strong** and `code` and ~~gone~~ and ==hot==.\n";
+        let plan = plan_for(text, Selection::caret(0));
+        let line = &plan.lines[0];
+        assert_eq!(line.text, "Plain em and strong and code and gone and hot.");
+        let styles: Vec<(std::ops::Range<usize>, InlineStyle)> = line
+            .runs
+            .iter()
+            .map(|run| (run.display.clone(), run.style))
+            .collect();
+        assert_eq!(
+            styles,
+            vec![
+                (6..8, InlineStyle::Emphasis),
+                (13..19, InlineStyle::Strong),
+                (24..28, InlineStyle::Code),
+                (33..37, InlineStyle::Strikethrough),
+                (42..45, InlineStyle::Highlight),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_revealed_inline_keeps_others_collapsed() {
+        let text = "**a** and **b**\n";
+        let plan = plan_for(text, Selection::caret(12));
+        let line = &plan.lines[0];
+        assert_eq!(line.text, "a and **b**");
+        let styles: Vec<(std::ops::Range<usize>, InlineStyle)> = line
+            .runs
+            .iter()
+            .map(|run| (run.display.clone(), run.style))
+            .collect();
+        assert_eq!(
+            styles,
+            vec![(0..1, InlineStyle::Strong), (8..9, InlineStyle::Strong),]
+        );
+    }
+
+    #[test]
+    fn nested_emphasis_produces_overlapping_runs() {
+        let text = "**bold *and em* tail**\n";
+        let plan = plan_for(text, Selection::caret(0));
+        let line = &plan.lines[0];
+        assert_eq!(line.text, "bold and em tail");
+        let styles: Vec<(std::ops::Range<usize>, InlineStyle)> = line
+            .runs
+            .iter()
+            .map(|run| (run.display.clone(), run.style))
+            .collect();
+        assert_eq!(
+            styles,
+            vec![
+                (0..5, InlineStyle::Strong),
+                (5..11, InlineStyle::Strong),
+                (5..11, InlineStyle::Emphasis),
+                (11..16, InlineStyle::Strong),
+            ]
+        );
     }
 }

@@ -295,45 +295,91 @@ pub fn editor_theme() -> EditorTheme {
 
 /// Recolors the gpui-kit components (buttons, popovers, separators, labels,
 /// scrollbars) to the same palette, so chrome and paper read as one product.
+/// `Theme::update` reconciles the legacy tokens from the colors, which is
+/// what the components actually read.
 pub fn apply_component_theme(cx: &mut App) {
     let palette = current();
-    let theme = Theme::global_mut(cx);
-    theme.font_family = UI_FAMILY.into();
-    theme.font_size = px(13.);
-    // The landing's radius scale: DEFAULT 2px, lg 4px, xl 8px, full 12px.
-    theme.radius = px(2.);
-    theme.radius_lg = px(8.);
-    let colors = &mut theme.colors;
-    colors.background = palette.surface;
-    colors.foreground = palette.on_surface;
-    colors.border = palette.outline_variant;
-    colors.muted = palette.surface_container;
-    colors.muted_foreground = palette.outline;
-    colors.selection = match mode() {
-        Mode::Light => rgba(0x32533F2E).into(),
-        Mode::Dark => rgba(0x9BC9A83D).into(),
-    };
-    colors.caret = palette.primary;
-    colors.primary = palette.primary;
-    colors.primary_foreground = palette.primary_foreground;
-    colors.primary_hover = palette.primary_container;
-    colors.primary_active = palette.primary_active;
-    colors.accent = palette.primary_fixed;
-    colors.accent_foreground = palette.on_primary_fixed;
-    colors.popover = palette.surface;
-    colors.popover_foreground = palette.on_surface;
-    colors.button = palette.surface_container;
-    colors.button_foreground = palette.on_surface;
-    colors.button_hover = palette.surface_container_high;
-    colors.button_active = palette.surface_container_high;
-    // Window chrome: the title bar, status bar and border follow the palette
-    // so a dark window does not sit under a light bar.
-    colors.title_bar = palette.surface_container_low;
-    colors.title_bar_border = palette.outline_variant;
-    colors.status_bar = palette.surface_container_low;
-    colors.status_bar_border = palette.outline_variant;
-    colors.window_border = palette.outline_variant;
-    theme.tokens.background = palette.surface.into();
+    Theme::update(cx, |theme| {
+        theme.font_family = UI_FAMILY.into();
+        theme.font_size = px(13.);
+        // The landing's radius scale: DEFAULT 2px, lg 4px, xl 8px, full 12px.
+        theme.radius = px(2.);
+        theme.radius_lg = px(8.);
+        let colors = &mut theme.colors;
+        colors.background = palette.surface;
+        colors.foreground = palette.on_surface;
+        colors.border = palette.outline_variant;
+        colors.muted = palette.surface_container;
+        colors.muted_foreground = palette.outline;
+        colors.selection = match mode() {
+            Mode::Light => rgba(0x32533F2E).into(),
+            Mode::Dark => rgba(0x9BC9A83D).into(),
+        };
+        colors.caret = palette.primary;
+        colors.primary = palette.primary;
+        colors.primary_foreground = palette.primary_foreground;
+        colors.primary_hover = palette.primary_container;
+        colors.primary_active = palette.primary_active;
+        colors.accent = palette.primary_fixed;
+        colors.accent_foreground = palette.on_primary_fixed;
+        colors.popover = palette.surface;
+        colors.popover_foreground = palette.on_surface;
+        colors.button = palette.surface_container;
+        colors.button_foreground = palette.on_surface;
+        colors.button_hover = palette.surface_container_high;
+        colors.button_active = palette.surface_container_high;
+        colors.button_primary = palette.primary;
+        colors.button_primary_foreground = palette.primary_foreground;
+        colors.button_primary_hover = palette.primary_container;
+        colors.button_primary_active = palette.primary_active;
+        colors.button_secondary = palette.surface_container;
+        colors.button_secondary_foreground = palette.on_surface;
+        colors.button_secondary_hover = palette.surface_container_high;
+        colors.button_secondary_active = palette.surface_container_high;
+        colors.secondary = palette.surface_container;
+        colors.secondary_foreground = palette.on_surface;
+        colors.secondary_hover = palette.surface_container_high;
+        colors.secondary_active = palette.surface_container_high;
+        // Failure reds, warm like the rest of the palette.
+        let (danger, danger_hover, danger_active, danger_foreground) = match mode() {
+            Mode::Light => (
+                rgb(0xB3372C).into(),
+                rgb(0xC24036).into(),
+                rgb(0x9E2B21).into(),
+                rgb(0xFFFFFF).into(),
+            ),
+            Mode::Dark => (
+                rgb(0xE4A5A0).into(),
+                rgb(0xECB5B0).into(),
+                rgb(0xD69A96).into(),
+                rgb(0x4A1210).into(),
+            ),
+        };
+        colors.danger = danger;
+        colors.danger_hover = danger_hover;
+        colors.danger_active = danger_active;
+        colors.danger_foreground = danger_foreground;
+        colors.button_danger = danger;
+        colors.button_danger_hover = danger_hover;
+        colors.button_danger_active = danger_active;
+        colors.button_danger_foreground = danger_foreground;
+        colors.input = palette.surface_container_lowest;
+        colors.ring = palette.primary;
+        colors.link = palette.primary;
+        colors.scrollbar = rgba(0x00000000).into();
+        colors.scrollbar_thumb = match mode() {
+            Mode::Light => rgba(0x727973E6).into(),
+            Mode::Dark => rgba(0x8E8880E6).into(),
+        };
+        colors.scrollbar_thumb_hover = palette.outline;
+        // Window chrome: the title bar, status bar and border follow the
+        // palette so a dark window does not sit under a light bar.
+        colors.title_bar = palette.surface_container_low;
+        colors.title_bar_border = palette.outline_variant;
+        colors.status_bar = palette.surface_container_low;
+        colors.status_bar_border = palette.outline_variant;
+        colors.window_border = palette.outline_variant;
+    });
 }
 
 #[cfg(test)]

@@ -573,57 +573,57 @@ impl MarkdownEditor {
                     return;
                 }
                 "b" if !keystroke.modifiers.shift => {
-                    self.format_inline(InlineFormat::Bold, cx);
+                    self.toggle_inline_format(InlineFormat::Bold, cx);
                     cx.stop_propagation();
                     return;
                 }
                 "i" if !keystroke.modifiers.shift => {
-                    self.format_inline(InlineFormat::Italic, cx);
+                    self.toggle_inline_format(InlineFormat::Italic, cx);
                     cx.stop_propagation();
                     return;
                 }
                 "x" if keystroke.modifiers.shift => {
-                    self.format_inline(InlineFormat::Strike, cx);
+                    self.toggle_inline_format(InlineFormat::Strike, cx);
                     cx.stop_propagation();
                     return;
                 }
                 "h" if keystroke.modifiers.shift => {
-                    self.format_inline(InlineFormat::Highlight, cx);
+                    self.toggle_inline_format(InlineFormat::Highlight, cx);
                     cx.stop_propagation();
                     return;
                 }
                 "`" => {
-                    self.format_inline(InlineFormat::Code, cx);
+                    self.toggle_inline_format(InlineFormat::Code, cx);
                     cx.stop_propagation();
                     return;
                 }
                 "1" if !keystroke.modifiers.shift => {
-                    self.toggle_block_command(BlockFormat::Heading(1), cx);
+                    self.toggle_block_format(BlockFormat::Heading(1), cx);
                     cx.stop_propagation();
                     return;
                 }
                 "2" if !keystroke.modifiers.shift => {
-                    self.toggle_block_command(BlockFormat::Heading(2), cx);
+                    self.toggle_block_format(BlockFormat::Heading(2), cx);
                     cx.stop_propagation();
                     return;
                 }
                 "3" if !keystroke.modifiers.shift => {
-                    self.toggle_block_command(BlockFormat::Heading(3), cx);
+                    self.toggle_block_format(BlockFormat::Heading(3), cx);
                     cx.stop_propagation();
                     return;
                 }
                 "7" if keystroke.modifiers.shift => {
-                    self.toggle_block_command(BlockFormat::Ordered, cx);
+                    self.toggle_block_format(BlockFormat::Ordered, cx);
                     cx.stop_propagation();
                     return;
                 }
                 "8" if keystroke.modifiers.shift => {
-                    self.toggle_block_command(BlockFormat::Bullet, cx);
+                    self.toggle_block_format(BlockFormat::Bullet, cx);
                     cx.stop_propagation();
                     return;
                 }
                 "9" if keystroke.modifiers.shift => {
-                    self.toggle_block_command(BlockFormat::Task, cx);
+                    self.toggle_block_format(BlockFormat::Task, cx);
                     cx.stop_propagation();
                     return;
                 }
@@ -695,9 +695,11 @@ impl MarkdownEditor {
         cx.notify();
     }
 
-    /// Toggles an inline format: first unwraps a parsed construct that
-    /// contains the selection, then falls back to the pure text command.
-    fn format_inline(&mut self, format: InlineFormat, cx: &mut Context<Self>) {
+    /// Toggles an inline format around the selection: wraps, unwraps, or
+    /// inserts a delimiter pair. Always one undo step.
+    ///
+    /// This is the toolbar/shortcut entry point.
+    pub fn toggle_inline_format(&mut self, format: InlineFormat, cx: &mut Context<Self>) {
         let text = self.content(cx);
         if let Some(construct) = self.containing_construct(format)
             && construct.markers.len() >= 2
@@ -713,16 +715,47 @@ impl MarkdownEditor {
         }
     }
 
+    /// Toggles a block format across the selected lines. One undo step.
+    pub fn toggle_block_format(&mut self, format: BlockFormat, cx: &mut Context<Self>) {
+        let text = self.content(cx);
+        if let Some(command) = commands::toggle_block(&text, self.selection, format) {
+            self.apply_command(command, cx);
+        }
+    }
+
+    /// Wraps the selection in a fenced code block, or inserts an empty one.
+    pub fn insert_code_fence(&mut self, cx: &mut Context<Self>) {
+        let text = self.content(cx);
+        if let Some(command) = commands::insert_code_fence(&text, self.selection) {
+            self.apply_command(command, cx);
+        }
+    }
+
+    /// Inserts a horizontal rule on its own line.
+    pub fn insert_rule(&mut self, cx: &mut Context<Self>) {
+        let text = self.content(cx);
+        if let Some(command) = commands::insert_rule(&text, self.selection) {
+            self.apply_command(command, cx);
+        }
+    }
+
+    /// Whether the selection is inside a construct of the format, or wraps
+    /// one: the toolbar's active state.
+    pub fn inline_format_active(&self, format: InlineFormat) -> bool {
+        let kind = inline_construct_kind(format);
+        self.index.constructs().iter().any(|construct| {
+            construct.kind == kind
+                && (construct.range.start < self.selection.start()
+                    && self.selection.end() < construct.range.end
+                    || construct.range.start >= self.selection.start()
+                        && construct.range.end <= self.selection.end())
+        })
+    }
+
     /// The parsed construct of the matching kind that strictly contains the
     /// selection, if any.
     fn containing_construct(&self, format: InlineFormat) -> Option<Construct> {
-        let kind = match format {
-            InlineFormat::Bold => Some(ConstructKind::Strong),
-            InlineFormat::Italic => Some(ConstructKind::Emphasis),
-            InlineFormat::Strike => Some(ConstructKind::Strikethrough),
-            InlineFormat::Highlight => Some(ConstructKind::Highlight),
-            InlineFormat::Code => Some(ConstructKind::CodeSpan),
-        }?;
+        let kind = inline_construct_kind(format);
         self.index
             .constructs()
             .iter()
@@ -732,13 +765,6 @@ impl MarkdownEditor {
                     && self.selection.end() < construct.range.end
             })
             .cloned()
-    }
-
-    fn toggle_block_command(&mut self, format: BlockFormat, cx: &mut Context<Self>) {
-        let text = self.content(cx);
-        if let Some(command) = commands::toggle_block(&text, self.selection, format) {
-            self.apply_command(command, cx);
-        }
     }
 
     /// Backspace/delete: removes the selection, or one grapheme/word/line
@@ -941,6 +967,17 @@ fn autoscroll_step(
         Some(margin)
     } else {
         None
+    }
+}
+
+/// The construct kind that backs an inline format.
+fn inline_construct_kind(format: InlineFormat) -> ConstructKind {
+    match format {
+        InlineFormat::Bold => ConstructKind::Strong,
+        InlineFormat::Italic => ConstructKind::Emphasis,
+        InlineFormat::Strike => ConstructKind::Strikethrough,
+        InlineFormat::Highlight => ConstructKind::Highlight,
+        InlineFormat::Code => ConstructKind::CodeSpan,
     }
 }
 
@@ -1343,6 +1380,33 @@ mod interaction_tests {
         cx.simulate_keystrokes("cmd-1");
         cx.update(|_, app| {
             assert_eq!(editor.read(app).content(app), "title\nbody");
+        });
+    }
+
+    #[gpui::test]
+    async fn toolbar_api_toggles_and_reports_active(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "title");
+        cx.simulate_keystrokes("cmd-a");
+        cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.toggle_inline_format(InlineFormat::Bold, cx)
+            });
+        });
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "**title**");
+            assert!(
+                editor.read(app).inline_format_active(InlineFormat::Bold),
+                "toolbar should show bold active"
+            );
+        });
+        cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.toggle_block_format(BlockFormat::Bullet, cx)
+            });
+        });
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "- **title**");
+            assert!(editor.read(app).inline_format_active(InlineFormat::Bold));
         });
     }
 

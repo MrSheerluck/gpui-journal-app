@@ -47,6 +47,10 @@ impl Render for MarkdownEditor {
             .overflow_hidden()
             .text_color(self.theme.text)
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
-            .child(EditorElement::new(self.buffer.clone(), self.scroll.clone()))
+            .child(EditorElement::new(
+                self.buffer.clone(),
+                self.theme.clone(),
+                self.scroll.clone(),
+            ))
     }
 }

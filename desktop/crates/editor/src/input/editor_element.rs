@@ -3,22 +3,32 @@ use std::{cell::RefCell, rc::Rc};
 use gpui::{
     App, AvailableSpace, Bounds, DefiniteLength, Element, ElementId, Entity, GlobalElementId,
     InspectorElementId, IntoElement, LayoutId, Length, Pixels, SharedString, Size, Style, Window,
-    WrappedLine, point,
+    WrappedLine, fill, point, px,
 };
 
 use crate::{
     buffer::Buffer,
     input::scroll::{EditorScrollState, clamp_offset},
+    theme::EditorTheme,
 };
+
+const THUMB_WIDTH: f32 = 6.;
+const THUMB_MIN_HEIGHT: f32 = 24.;
+const THUMB_MARGIN: f32 = 4.;
 
 pub struct EditorElement {
     buffer: Entity<Buffer>,
+    theme: EditorTheme,
     scroll: Rc<EditorScrollState>,
 }
 
 impl EditorElement {
-    pub fn new(buffer: Entity<Buffer>, scroll: Rc<EditorScrollState>) -> Self {
-        Self { buffer, scroll }
+    pub fn new(buffer: Entity<Buffer>, theme: EditorTheme, scroll: Rc<EditorScrollState>) -> Self {
+        Self {
+            buffer,
+            theme,
+            scroll,
+        }
     }
 }
 
@@ -164,6 +174,11 @@ impl Element for EditorElement {
         let viewport_bottom = bounds.origin.y + bounds.size.height;
         let max_offset = (inner.content_height - bounds.size.height).max(Pixels::ZERO);
         let offset = clamp_offset(self.scroll.offset(), max_offset);
+        let scroll_progress = if max_offset > Pixels::ZERO {
+            offset.as_f32() / max_offset.as_f32()
+        } else {
+            0.0
+        };
 
         window.paint_layer(bounds, |window| {
             let mut line_origin = point(bounds.origin.x, bounds.origin.y - offset);
@@ -186,6 +201,27 @@ impl Element for EditorElement {
                 line_origin.y += height;
             }
         });
+
+        if max_offset > Pixels::ZERO {
+            let viewport_height = bounds.size.height.as_f32();
+            let content_height = inner.content_height.as_f32();
+            let thumb_height = (viewport_height * (viewport_height / content_height))
+                .max(THUMB_MIN_HEIGHT)
+                .min(viewport_height);
+            let travel = viewport_height - thumb_height;
+            let thumb_y = bounds.origin.y + px(travel * scroll_progress);
+            let thumb = Bounds {
+                origin: point(
+                    bounds.origin.x + bounds.size.width - px(THUMB_MARGIN + THUMB_WIDTH),
+                    thumb_y,
+                ),
+                size: Size {
+                    width: px(THUMB_WIDTH),
+                    height: px(thumb_height),
+                },
+            };
+            window.paint_quad(fill(thumb, self.theme.scrollbar).corner_radii(THUMB_WIDTH / 2.));
+        }
     }
 }
 

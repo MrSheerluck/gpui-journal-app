@@ -49,7 +49,7 @@ pub mod theme;
 mod editor;
 
 pub use buffer::Buffer;
-pub use display::MediaKind;
+pub use display::{MediaKind, media_kind};
 pub use editor::{EditorEvent, MarkdownEditor, MediaPlaybackState};
 pub use input::EditorElement;
 pub use theme::EditorTheme;

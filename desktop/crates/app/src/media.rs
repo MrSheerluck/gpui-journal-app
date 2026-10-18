@@ -140,6 +140,14 @@ impl Player {
         Some((destination, self.state_for_current()))
     }
 
+    /// A read-only snapshot of the current state, for painting outside the
+    /// tick (the reading view's cards). Natural ends are folded by
+    /// [`Self::state`] during the tick.
+    pub fn peek(&self) -> Option<(String, MediaPlaybackState)> {
+        let destination = self.current.as_ref()?.destination.clone();
+        Some((destination, self.state_for_current()))
+    }
+
     fn state_for_current(&self) -> MediaPlaybackState {
         let Some(current) = &self.current else {
             return MediaPlaybackState::default();

@@ -14,12 +14,14 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Datelike, Local, NaiveDate};
 use dainiki_editor::{
     Buffer, EditorEvent, EditorTheme, MarkdownEditor, MediaKind, MediaPlaybackState,
     commands::{BlockFormat, InlineFormat},
+    media_kind,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Disableable;
@@ -129,6 +131,8 @@ struct JournalSession {
     video: Option<video::Pump>,
     /// Which destination the frame pump belongs to.
     video_destination: Option<String>,
+    /// The latest decoded frame, for read-only video cards.
+    latest_frame: Option<(String, Arc<RenderImage>)>,
     _jump_events: Subscription,
 }
 
@@ -240,6 +244,19 @@ impl DainikiApp {
         }
     }
 
+    /// Marks the app dirty and asks every window for a frame.
+    ///
+    /// `cx.notify()` alone can be lost when background work lands between
+    /// frames: gpui only wakes a window that holds a registered invalidator
+    /// for the entity, and a notify that arrives during a draw is settled
+    /// without a wake. Everything asynchronous (the journal scan, the file
+    /// watcher, the playback tick, frame pushes, debounced saves) repaints
+    /// through here.
+    fn repaint(&self, cx: &mut Context<Self>) {
+        cx.notify();
+        cx.refresh_windows();
+    }
+
     fn show_notice(&mut self, message: String, cx: &mut Context<Self>) {
         self.screen = Screen::Welcome {
             notice: Some(message),
@@ -311,6 +328,7 @@ impl DainikiApp {
             media_ticks: Cell::new(false),
             video: None,
             video_destination: None,
+            latest_frame: None,
             _jump_events: jump_events,
         }));
         cx.notify();
@@ -329,8 +347,8 @@ impl DainikiApp {
                         session.days.entry(date).or_insert(text);
                     }
                     session.rebuild_tags();
-                    cx.notify();
                 }
+                app.repaint(cx);
             })
             .ok();
         })
@@ -514,7 +532,7 @@ impl DainikiApp {
         if kind == MediaKind::Video {
             self.sync_video_pump(&destination, &resolved, playing, cx);
         }
-        cx.notify();
+        self.repaint(cx);
     }
 
     /// Keeps the frame pump in step with the player: a fresh pump for a new
@@ -587,6 +605,7 @@ impl DainikiApp {
                 let Some(image) = frame.into_render_image() else {
                     return;
                 };
+                session.latest_frame = Some((destination.to_string(), image.clone()));
                 let editor = session.active.as_ref().map(|active| active.editor.clone());
                 if let Some(editor) = editor {
                     editor.update(cx, |editor, cx| {
@@ -608,7 +627,7 @@ impl DainikiApp {
                 }
             }
         }
-        cx.notify();
+        self.repaint(cx);
     }
 
     /// Starts the playback tick unless it is already running.
@@ -654,7 +673,7 @@ impl DainikiApp {
         if !keep_going {
             session.media_ticks.set(false);
         }
-        cx.notify();
+        self.repaint(cx);
         keep_going
     }
 
@@ -716,7 +735,7 @@ impl DainikiApp {
         {
             session.status = Some(message);
         }
-        cx.notify();
+        self.repaint(cx);
     }
 
     fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1153,7 +1172,7 @@ impl DainikiApp {
         }
         if dirty || reload.is_some() {
             tracing::info!(changed = changed_count, "reconciled external changes");
-            cx.notify();
+            self.repaint(cx);
         }
     }
 
@@ -1472,6 +1491,205 @@ impl JournalSession {
             .collect()
     }
 
+    /// A read-only day's body: markdown runs with media cards where whole-line
+    /// media references sit. Days without media keep the single text view.
+    fn day_body(&self, date: NaiveDate, text: &str, this: &WeakEntity<DainikiApp>) -> AnyElement {
+        let segments = day_segments(text);
+        if !segments
+            .iter()
+            .any(|segment| matches!(segment, DaySegment::Media { .. }))
+        {
+            return markdown(text.to_string()).into_any_element();
+        }
+        let playback = self.media.peek();
+        v_flex()
+            .children(segments.into_iter().map(|segment| match segment {
+                DaySegment::Text(text) => markdown(text).into_any_element(),
+                DaySegment::Media { kind, destination } => {
+                    self.media_card(date, kind, &destination, playback.as_ref(), this)
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// A media card in a read-only day: an image at its natural size, or a
+    /// player row/card whose click toggles playback in the app's player.
+    fn media_card(
+        &self,
+        date: NaiveDate,
+        kind: MediaKind,
+        destination: &str,
+        playback: Option<&(String, MediaPlaybackState)>,
+        this: &WeakEntity<DainikiApp>,
+    ) -> AnyElement {
+        let resolved = journal::Journal::new(&self.root)
+            .entry_path(date)
+            .parent()
+            .map(|directory| directory.join(destination))
+            .unwrap_or_else(|| PathBuf::from(destination));
+        let state = playback
+            .filter(|(current, _)| current == destination)
+            .map(|(_, state)| state.clone())
+            .unwrap_or_default();
+        let name = destination.rsplit('/').next().unwrap_or(destination);
+
+        if kind == MediaKind::Image {
+            return div()
+                .debug_selector({
+                    let destination = destination.to_string();
+                    move || format!("media-card-{destination}")
+                })
+                .child(img(resolved).max_w(px(560.)).max_h(px(360.)).rounded_lg())
+                .into_any_element();
+        }
+
+        let playing = state.playing;
+        let toggle = {
+            let this = this.clone();
+            let destination = destination.to_string();
+            let resolved = resolved.clone();
+            move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                this.update(cx, |app, cx| {
+                    app.on_media_toggle(destination.clone(), resolved.clone(), kind, cx)
+                })
+                .ok();
+            }
+        };
+        let fraction = state
+            .duration_ms
+            .filter(|duration| *duration > 0)
+            .map(|duration| (state.position_ms as f32 / duration as f32).clamp(0., 1.))
+            .unwrap_or(0.);
+        let progress = div()
+            .h(px(3.))
+            .w_full()
+            .rounded_full()
+            .bg(brand::outline_variant().opacity(0.5))
+            .child(
+                div()
+                    .h_full()
+                    .w(relative(fraction))
+                    .rounded_full()
+                    .bg(brand::primary()),
+            );
+        let icon = Icon::new(if playing {
+            IconName::Pause
+        } else {
+            IconName::Play
+        })
+        .size(px(if kind == MediaKind::Video { 28. } else { 16. }))
+        .text_color(brand::primary());
+        let error = state.error.as_ref().map(|error| {
+            div()
+                .text_size(px(11.))
+                .text_color(brand::secondary())
+                .child(error.clone())
+        });
+
+        let card = div()
+            .id(ElementId::Name(format!("media-card-{destination}").into()))
+            .debug_selector({
+                let destination = destination.to_string();
+                move || format!("media-card-{destination}")
+            })
+            .w_full()
+            .max_w(px(560.))
+            .rounded_lg()
+            .bg(brand::surface_container_low())
+            .border_1()
+            .border_color(brand::outline_variant().opacity(0.6))
+            .cursor_pointer()
+            .on_click(toggle);
+
+        match kind {
+            MediaKind::Video => {
+                let framed = self
+                    .latest_frame
+                    .as_ref()
+                    .filter(|(current, _)| current == destination);
+                let area = if let Some((_, frame)) = framed {
+                    div()
+                        .w_full()
+                        .h(px(150.))
+                        .relative()
+                        .child(img(frame.clone()).object_fit(ObjectFit::Cover).size_full())
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .w_full()
+                        .h(px(150.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon)
+                        .into_any_element()
+                };
+                card.h(px(200.))
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .justify_between()
+                    .child(area)
+                    .child(
+                        v_flex()
+                            .px_3()
+                            .pb_3()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(brand::on_surface_variant())
+                                            .child(name.to_string()),
+                                    )
+                                    .children(error),
+                            )
+                            .child(progress),
+                    )
+                    .into_any_element()
+            }
+            _ => card
+                .flex()
+                .flex_row()
+                .gap_3()
+                .items_center()
+                .px_3()
+                .py_3()
+                .child(icon)
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(brand::on_surface_variant())
+                                        .child(name.to_string()),
+                                )
+                                .children(error),
+                        )
+                        .child(progress),
+                )
+                .into_any_element(),
+        }
+    }
+
     fn view(
         &self,
         theme: &EditorTheme,
@@ -1676,7 +1894,15 @@ impl JournalSession {
                         .font_family(brand::SERIF_FAMILY)
                         .text_size(px(15.2))
                         .line_height(px(24.7))
-                        .child(markdown(text))
+                        .children(item_this.upgrade().and_then(|app| {
+                            let app = app.read(cx);
+                            match &app.screen {
+                                Screen::Journal(session) => {
+                                    Some(session.day_body(date, &text, &item_this))
+                                }
+                                Screen::Welcome { .. } => None,
+                            }
+                        }))
                         .into_any_element()
                 } else {
                     div()
@@ -2828,6 +3054,53 @@ fn palette_excerpt(text: &str) -> Option<String> {
     Some(excerpt)
 }
 
+/// One piece of a read-only day's body: a markdown run or a media card.
+enum DaySegment {
+    Text(String),
+    Media {
+        kind: MediaKind,
+        destination: String,
+    },
+}
+
+/// Splits day text at whole-line `![alt](destination)` references. Inline
+/// references stay inside the text runs and render as markdown.
+fn day_segments(text: &str) -> Vec<DaySegment> {
+    let mut segments: Vec<DaySegment> = Vec::new();
+    let mut pending = String::new();
+    for line in text.split_inclusive('\n') {
+        match whole_line_media(line.trim()) {
+            Some((destination, kind)) => {
+                if !pending.is_empty() {
+                    segments.push(DaySegment::Text(std::mem::take(&mut pending)));
+                }
+                segments.push(DaySegment::Media { destination, kind });
+            }
+            None => pending.push_str(line),
+        }
+    }
+    if !pending.is_empty() {
+        segments.push(DaySegment::Text(pending));
+    }
+    segments
+}
+
+/// The destination and kind of a whole-line `![alt](destination)`, when the
+/// line is exactly that and the kind renders as a card.
+fn whole_line_media(line: &str) -> Option<(String, MediaKind)> {
+    let rest = line.strip_prefix("![")?;
+    let (alt, rest) = rest.split_once("](")?;
+    let destination = rest.strip_suffix(')')?;
+    if destination.is_empty() || alt.contains('[') || destination.contains('(') {
+        return None;
+    }
+    let kind = media_kind(destination);
+    if kind == MediaKind::File {
+        return None;
+    }
+    Some((destination.to_string(), kind))
+}
+
 /// The cells of a month's calendar grid, Monday first, padded with the
 /// neighbouring months' dates: `(date, in_this_month)`.
 fn month_grid(year: i32, month: u32) -> Vec<(NaiveDate, bool)> {
@@ -2949,7 +3222,7 @@ fn start_rollover_timer(cx: &mut Context<DainikiApp>) {
                         && Local::now().date_naive() > session.today
                     {
                         session.pending_rollover.set(true);
-                        cx.notify();
+                        app.repaint(cx);
                     }
                 })
                 .is_ok();
@@ -4044,6 +4317,109 @@ mod tests {
             assert_eq!(session.stream.item_count(), 4);
         });
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn reading_days_render_media_cards(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let yesterday = today.pred_opt().expect("yesterday");
+        fs::create_dir_all(yesterday.format("%Y/%m").to_string()).ok();
+        seed_day(
+            &journal,
+            yesterday,
+            "# Media day\n\nAn audio take:\n\n![](assets/take.mp3)\n\nA clip:\n\n![](assets/clip.mp4)\n",
+        );
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        // Reading mode: the past day renders as a day, not as today's editor.
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| app.stop_editing(cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // The whole-line media references became cards in the reading view.
+        assert!(
+            cx.debug_bounds("media-card-assets/take.mp3").is_some(),
+            "the audio reference renders as a card"
+        );
+        assert!(
+            cx.debug_bounds("media-card-assets/clip.mp4").is_some(),
+            "the video reference renders as a card"
+        );
+        // And the markdown around them still renders: the day exists and its
+        // text body is not the media lines.
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let session = app.session().expect("session");
+            let day = session.days.get(&yesterday).expect("the stored day");
+            assert_eq!(
+                super::day_segments(day)
+                    .iter()
+                    .filter(|segment| matches!(segment, super::DaySegment::Media { .. }))
+                    .count(),
+                2,
+                "two media segments"
+            );
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn day_segments_split_whole_line_media_only() {
+        use super::{DaySegment, day_segments};
+        use dainiki_editor::MediaKind;
+
+        let text = "intro\n\n![](assets/a.mp3)\n\nmiddle\n\n![](assets/b.mp4)\n\nend\n";
+        let segments = day_segments(text);
+        assert_eq!(segments.len(), 5);
+        assert!(matches!(&segments[0], DaySegment::Text(text) if text == "intro\n\n"));
+        assert!(
+            matches!(&segments[1], DaySegment::Media { kind, destination }
+                if *kind == MediaKind::Audio && destination == "assets/a.mp3")
+        );
+        assert!(matches!(&segments[2], DaySegment::Text(text) if text == "\nmiddle\n\n"));
+        assert!(
+            matches!(&segments[3], DaySegment::Media { kind, destination }
+                if *kind == MediaKind::Video && destination == "assets/b.mp4")
+        );
+        assert!(matches!(&segments[4], DaySegment::Text(text) if text == "\nend\n"));
+
+        // Inline references stay markdown, and unknown files stay text.
+        let inline = "text ![a](p.png) more\n";
+        assert!(matches!(
+            day_segments(inline).as_slice(),
+            [DaySegment::Text(_)]
+        ));
+        let file = "![](notes.txt)\n";
+        assert!(matches!(
+            day_segments(file).as_slice(),
+            [DaySegment::Text(_)]
+        ));
+        // Images are media too.
+        let image = "![](assets/photo.png)\n";
+        assert!(matches!(
+            day_segments(image).as_slice(),
+            [DaySegment::Media {
+                kind: MediaKind::Image,
+                ..
+            }]
+        ));
     }
 
     #[gpui::test]

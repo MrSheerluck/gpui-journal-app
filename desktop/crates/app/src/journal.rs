@@ -124,6 +124,44 @@ impl Journal {
     }
 }
 
+/// The tags in an entry: `#word` at a word boundary, with a body of letters,
+/// digits, `-` and `_`, lowercased. Markdown headings never match because the
+/// character after `#` must be alphanumeric.
+pub fn tags_in(text: &str) -> BTreeSet<String> {
+    let mut tags = BTreeSet::new();
+    let mut boundary = true;
+    let mut current: Option<String> = None;
+    let is_boundary =
+        |ch: char| ch.is_whitespace() || matches!(ch, '(' | '[' | ')' | ']' | '"' | '\'');
+    for ch in text.chars() {
+        if let Some(tag) = current.as_mut() {
+            if ch.is_alphanumeric() || ch == '-' || ch == '_' {
+                for lower in ch.to_lowercase() {
+                    tag.push(lower);
+                }
+            } else {
+                if !tag.is_empty() {
+                    tags.insert(std::mem::take(tag));
+                }
+                current = None;
+                boundary = is_boundary(ch);
+            }
+            continue;
+        }
+        if ch == '#' && boundary {
+            current = Some(String::new());
+            continue;
+        }
+        boundary = is_boundary(ch);
+    }
+    if let Some(tag) = current
+        && !tag.is_empty()
+    {
+        tags.insert(tag);
+    }
+    tags
+}
+
 /// A folder component that is exactly `digits` ASCII digits, parsed.
 fn parse_component(name: &OsStr, digits: usize) -> Option<i32> {
     let name = name.to_str()?;
@@ -183,7 +221,7 @@ mod tests {
 
     use chrono::NaiveDate;
 
-    use super::{Journal, create_journal_dir, stream_dates};
+    use super::{Journal, create_journal_dir, stream_dates, tags_in};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -352,5 +390,34 @@ mod tests {
         let existing = BTreeSet::from([date(2026, 10, 21)]);
         assert_eq!(stream_dates(&existing, today, true), vec![today]);
         assert_eq!(stream_dates(&existing, today, false), vec![today]);
+    }
+
+    #[test]
+    fn tags_are_found_at_word_boundaries() {
+        let tags = |text: &str| tags_in(text).into_iter().collect::<Vec<_>>();
+        assert_eq!(tags("a #reflections day"), vec!["reflections"]);
+        assert_eq!(tags("#travel and #work"), vec!["travel", "work"]);
+        assert_eq!(tags("(#morning)"), vec!["morning"]);
+        assert_eq!(
+            tags("a#b"),
+            Vec::<String>::new(),
+            "mid-word hash is not a tag"
+        );
+        assert_eq!(tags("#tag-one_two"), vec!["tag-one_two"]);
+        assert_eq!(tags("#Morning"), vec!["morning"], "tags index lowercased");
+        assert_eq!(tags("#café"), vec!["café"], "unicode letters are fine");
+        assert_eq!(tags("#"), Vec::<String>::new());
+        assert_eq!(tags(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn markdown_headings_are_not_tags() {
+        assert_eq!(tags_in("# Heading\n## Two\n### Three").len(), 0);
+        assert_eq!(
+            tags_in("# Heading\n\nsome #real words")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["real"]
+        );
     }
 }

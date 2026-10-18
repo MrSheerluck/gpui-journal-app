@@ -58,6 +58,11 @@ pub fn outline_variant() -> Hsla {
     rgb(0xC2C8C1).into()
 }
 
+/// Burnt orange — tag hashes and journal accents.
+pub fn secondary() -> Hsla {
+    rgb(0x944924).into()
+}
+
 /// The UI typeface for app chrome (bundled; see `load_fonts`).
 pub const UI_FAMILY: &str = "Inter";
 

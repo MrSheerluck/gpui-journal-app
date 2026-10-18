@@ -28,6 +28,7 @@ use gpui_kit::component::scroll::{Scrollbar, ScrollbarAxis};
 use gpui_kit::component::text::markdown;
 use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 actions!(
@@ -61,6 +62,11 @@ struct JournalSession {
     active: Option<ActiveDay>,
     /// Every day with content except the active one, rendered read-only.
     days: BTreeMap<NaiveDate, String>,
+    /// Tags over the non-active days; the active day's tags merge in per
+    /// render, so the sidebar follows the open editor.
+    tags: BTreeMap<String, BTreeSet<NaiveDate>>,
+    /// What the stream is narrowed to (a tag, a search query, or both).
+    filter: Filter,
     /// The virtualized stream: one item per visible-range day, plus the edge.
     stream: ListState,
     /// Which day the stream last rendered as the live editor, so a day that
@@ -76,6 +82,28 @@ struct JournalSession {
     /// A date the next rendered frame should reveal in the stream.
     pending_reveal: Cell<Option<NaiveDate>>,
     _jump_events: Subscription,
+}
+
+/// What the stream is narrowed to: a tag, a search query, or both.
+#[derive(Default, Clone, Debug, PartialEq)]
+struct Filter {
+    tag: Option<String>,
+    query: String,
+}
+
+impl Filter {
+    fn is_active(&self) -> bool {
+        self.tag.is_some() || !self.query.trim().is_empty()
+    }
+
+    /// Whether an entry's text passes the query part of the filter.
+    fn text_matches(&self, text: &str) -> bool {
+        let query = self.query.trim();
+        if query.is_empty() {
+            return true;
+        }
+        text.to_lowercase().contains(&query.to_lowercase())
+    }
 }
 
 /// The day currently open in the editor, with its autosave state.
@@ -160,6 +188,8 @@ impl DainikiApp {
             root: root.to_path_buf(),
             active: Some(active),
             days: BTreeMap::new(),
+            tags: BTreeMap::new(),
+            filter: Filter::default(),
             stream: ListState::new(0, ListAlignment::Top, px(600.)),
             active_rendered: Cell::new(None),
             jump_input,
@@ -184,6 +214,7 @@ impl DainikiApp {
                     for (date, text) in days {
                         session.days.entry(date).or_insert(text);
                     }
+                    session.rebuild_tags();
                     cx.notify();
                 }
             })
@@ -291,6 +322,7 @@ impl DainikiApp {
             } else {
                 session.days.insert(previous.date, text);
             }
+            session.rebuild_tags();
         }
         cx.notify();
     }
@@ -421,6 +453,29 @@ impl DainikiApp {
         if let Some(session) = self.session_mut() {
             session.jump_open = false;
             session.jump_error = None;
+        }
+        cx.notify();
+    }
+
+    // -- filters ------------------------------------------------------------
+
+    /// Narrows the stream to `tag`, or clears the tag filter when it is
+    /// already the selected one.
+    fn toggle_tag_filter(&mut self, tag: &str, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut() {
+            if session.filter.tag.as_deref() == Some(tag) {
+                session.filter.tag = None;
+            } else {
+                session.filter.tag = Some(tag.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Back to the full stream.
+    fn clear_filter(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut() {
+            session.filter = Filter::default();
         }
         cx.notify();
     }
@@ -686,7 +741,47 @@ impl JournalSession {
             // still counts as a day that exists.
             existing.insert(active.date);
         }
-        let dates = journal::stream_dates(&existing, today, show_empty_days);
+        let mut dates = journal::stream_dates(&existing, today, show_empty_days);
+
+        // The active day's tags come from the open editor, so the sidebar and
+        // the filter follow it keystroke by keystroke.
+        let active_date = self.active.as_ref().map(|active| active.date);
+        let active_text = self
+            .active
+            .as_ref()
+            .map(|active| active.editor.read(cx).content(cx));
+        let active_tags: BTreeSet<String> = active_text
+            .as_deref()
+            .map(journal::tags_in)
+            .unwrap_or_default();
+
+        // Narrow the stream. The open day always stays visible — you are
+        // editing it.
+        if self.filter.is_active() {
+            dates.retain(|date| {
+                let tag_ok = match &self.filter.tag {
+                    None => true,
+                    Some(tag) => {
+                        self.tags.get(tag).is_some_and(|days| days.contains(date))
+                            || (Some(*date) == active_date && active_tags.contains(tag))
+                    }
+                };
+                let text_ok = match self.days.get(date) {
+                    Some(text) => self.filter.text_matches(text),
+                    None if Some(*date) == active_date => self
+                        .filter
+                        .text_matches(active_text.as_deref().unwrap_or_default()),
+                    None => false,
+                };
+                tag_ok && text_ok
+            });
+            if let Some(date) = active_date
+                && !dates.contains(&date)
+            {
+                dates.push(date);
+                dates.sort_unstable_by(|a, b| b.cmp(a));
+            }
+        }
 
         // The list renders one item per day plus the closing edge. Keep its
         // item count in step with the day set.
@@ -700,7 +795,6 @@ impl JournalSession {
 
         // A day that swapped between editor and render changed height; the
         // list must remeasure it (preserving the scroll anchor).
-        let active_date = self.active.as_ref().map(|active| active.date);
         if self.active_rendered.get() != active_date {
             if let Some(date) = active_date.or(self.active_rendered.get())
                 && let Some(ix) = dates.iter().position(|day| *day == date)
@@ -764,11 +858,7 @@ impl JournalSession {
             }
         });
 
-        let mut column = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(TitleBar::new().child(self.window_title()));
+        let mut main = div().flex_1().min_h_0().flex().flex_col();
 
         // The date-jump panel: available in reading mode too, so a day is
         // always one keystroke away.
@@ -776,7 +866,7 @@ impl JournalSession {
             let jump_this = this.clone();
             let today_this = this.clone();
             let close_this = this.clone();
-            column = column.child(
+            main = main.child(
                 div()
                     .w_full()
                     .px_3()
@@ -833,7 +923,7 @@ impl JournalSession {
         // open in the editor.
         if let Some(active) = &self.active {
             let today_this = this.clone();
-            column = column.child(
+            main = main.child(
                 div()
                     .w_full()
                     .px_3()
@@ -869,7 +959,7 @@ impl JournalSession {
             );
         }
 
-        column.child(
+        main = main.child(
             div()
                 .flex_1()
                 .min_h_0()
@@ -878,7 +968,7 @@ impl JournalSession {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(760.))
+                        .max_w(px(672.))
                         .mx_auto()
                         .h_full()
                         .child(stream_list.size_full().px_10().pt_6()),
@@ -888,7 +978,207 @@ impl JournalSession {
                         .id("stream-scrollbar")
                         .axis(ScrollbarAxis::Vertical),
                 ),
-        )
+        );
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(TitleBar::new().child(self.window_title()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_row()
+                    .child(self.sidebar(&this, cx))
+                    .child(main),
+            )
+    }
+
+    /// The left rail: Timeline, Tags, and the bottom block.
+    fn sidebar(&self, this: &WeakEntity<DainikiApp>, cx: &App) -> AnyElement {
+        // Tag counts: the index over stored days, plus the open day's tags
+        // when they are not already counted for it.
+        let active_date = self.active.as_ref().map(|active| active.date);
+        let active_tags = self
+            .active
+            .as_ref()
+            .map(|active| journal::tags_in(&active.editor.read(cx).content(cx)))
+            .unwrap_or_default();
+        let mut counts: BTreeMap<String, usize> = self
+            .tags
+            .iter()
+            .map(|(tag, days)| (tag.clone(), days.len()))
+            .collect();
+        if let Some(date) = active_date {
+            for tag in &active_tags {
+                let already = self.tags.get(tag).is_some_and(|days| days.contains(&date));
+                if !already {
+                    *counts.entry(tag.clone()).or_default() += 1;
+                }
+            }
+        }
+
+        let timeline_this = this.clone();
+        let timeline_active = !self.filter.is_active();
+
+        v_flex()
+            .w(px(220.))
+            .h_full()
+            .flex_shrink_0()
+            .bg(brand::surface_container_low())
+            .border_r_1()
+            .border_color(brand::outline_variant().opacity(0.5))
+            .child(
+                v_flex()
+                    .id("sidebar")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_2()
+                    .pt_2()
+                    .gap_3()
+                    .child(
+                        // Timeline: the whole stream, no filters.
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(timeline_active, |el| {
+                                el.bg(brand::surface_container_high())
+                                    .font_weight(FontWeight::MEDIUM)
+                            })
+                            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                                timeline_this
+                                    .update(cx, |app, cx| app.clear_filter(cx))
+                                    .ok();
+                            })
+                            .child(div().text_sm().child("Timeline"))
+                            .when(timeline_active, |el| {
+                                el.child(
+                                    div()
+                                        .w(px(6.))
+                                        .h(px(6.))
+                                        .rounded_full()
+                                        .bg(brand::primary()),
+                                )
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .text_size(px(10.))
+                                    .text_color(brand::outline())
+                                    .child("TAGS"),
+                            )
+                            .children(
+                                counts
+                                    .iter()
+                                    .map(|(tag, count)| self.tag_row(tag, *count, this)),
+                            )
+                            .when(counts.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .px_2()
+                                        .text_size(px(11.))
+                                        .text_color(brand::outline())
+                                        .child("Tag entries with #tags."),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                // The bottom block; the calendar and settings land here.
+                v_flex()
+                    .gap_2()
+                    .p_2()
+                    .border_t_1()
+                    .border_color(brand::outline_variant().opacity(0.4))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .px_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .w(px(6.))
+                                    .h(px(6.))
+                                    .rounded_full()
+                                    .bg(brand::primary()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(brand::outline())
+                                    .child("Directly editable stream"),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// One tag row: `#name` with its day count; clicking filters the stream.
+    fn tag_row(&self, tag: &str, count: usize, this: &WeakEntity<DainikiApp>) -> AnyElement {
+        let selected = self.filter.tag.as_deref() == Some(tag);
+        let tag_owned = tag.to_string();
+        let this = this.clone();
+        h_flex()
+            .justify_between()
+            .items_center()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .when(selected, |el| el.bg(brand::surface_container_high()))
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                this.update(cx, |app, cx| app.toggle_tag_filter(&tag_owned, cx))
+                    .ok();
+            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_color(brand::secondary().opacity(0.75))
+                            .child("#"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(if selected {
+                                brand::on_surface()
+                            } else {
+                                brand::on_surface_variant()
+                            })
+                            .child(tag.to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(brand::outline())
+                    .child(count.to_string()),
+            )
+            .into_any_element()
+    }
+
+    /// Rebuilds the tag index over the non-active days. Called whenever
+    /// `days` changes; the active day's tags are merged in per render.
+    fn rebuild_tags(&mut self) {
+        self.tags.clear();
+        for (date, text) in &self.days {
+            for tag in journal::tags_in(text) {
+                self.tags.entry(tag).or_default().insert(*date);
+            }
+        }
     }
 
     fn window_title(&self) -> String {
@@ -1382,10 +1672,10 @@ fn resolve_cli_root(arg: Option<PathBuf>) -> Option<PathBuf> {
 fn open_app_window(cx: &mut App, config: config::Config, root: Option<PathBuf>) -> Result<()> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: point(px(160.0), px(120.0)),
-            size: size(px(880.0), px(700.0)),
+            origin: point(px(140.0), px(100.0)),
+            size: size(px(1180.0), px(780.0)),
         })),
-        window_min_size: Some(size(px(480.0), px(360.0))),
+        window_min_size: Some(size(px(720.0), px(480.0))),
         ..TitleBar::window_options()
     };
 
@@ -1849,6 +2139,86 @@ mod tests {
             let active = session.active.as_ref().expect("yesterday opened");
             assert_eq!(active.date, yesterday);
             assert_eq!(active.editor.read(cx).content(cx), "# yesterday's words\n");
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn a_tag_filters_the_stream(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let tagged = today.pred_opt().expect("yesterday");
+        let other = tagged.pred_opt().expect("the day before");
+        seed_day(
+            &journal,
+            tagged,
+            "# travel\n\nA #travel day through the mountains.\n",
+        );
+        seed_day(&journal, other, "# work\n\nPlain words without tags.\n");
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // The scan lands, the index sees the tag, and the full stream shows
+        // today + two days + the edge.
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert_eq!(
+                session.tags.get("travel").map(|days| days.len()),
+                Some(1),
+                "the tag index sees yesterday"
+            );
+            assert_eq!(session.stream.item_count(), 4);
+        });
+
+        // Filtering by the tag keeps the tagged day and the open day only.
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| app.toggle_tag_filter("travel", cx));
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert_eq!(session.filter.tag.as_deref(), Some("travel"));
+            assert_eq!(
+                session.stream.item_count(),
+                3,
+                "today + the tagged day + the edge"
+            );
+        });
+
+        // Clicking the tag again clears the filter.
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| app.toggle_tag_filter("travel", cx));
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert!(!session.filter.is_active());
+            assert_eq!(session.stream.item_count(), 4);
         });
         fs::remove_dir_all(&dir).ok();
     }

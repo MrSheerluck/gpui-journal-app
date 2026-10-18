@@ -19,6 +19,7 @@ use dainiki_editor::{
     Buffer, EditorEvent, EditorTheme, MarkdownEditor,
     commands::{BlockFormat, InlineFormat},
 };
+use gpui_kit::assets::IconName;
 use gpui_kit::component::Disableable;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::button::{Button, ButtonVariants, Toggle, ToggleGroup};
@@ -27,7 +28,7 @@ use gpui_kit::component::popover::Popover;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarAxis};
 use gpui_kit::component::text::markdown;
 use gpui_kit::component::toolbar::Toolbar;
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -39,7 +40,8 @@ actions!(
         ToggleJumpToDate,
         PreviousDay,
         NextDay,
-        FocusSearch
+        FocusSearch,
+        ToggleSettings
     ]
 );
 
@@ -86,6 +88,8 @@ struct JournalSession {
     /// The search bar: input and open state.
     search_input: Entity<InputState>,
     search_open: bool,
+    /// The settings panel's open state.
+    settings_open: bool,
     /// The month the sidebar calendar shows, `(year, month)`.
     calendar_month: (i32, u32),
     /// Set by the jump input's Enter event; processed in render, which has a
@@ -220,6 +224,7 @@ impl DainikiApp {
             jump_error: None,
             search_input,
             search_open: false,
+            settings_open: false,
             calendar_month: (today.year(), today.month()),
             pending_submit: Cell::new(false),
             pending_reveal: Cell::new(None),
@@ -545,6 +550,24 @@ impl DainikiApp {
         cx.notify();
     }
 
+    // -- settings -----------------------------------------------------------
+
+    fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut() {
+            session.settings_open = !session.settings_open;
+        }
+        cx.notify();
+    }
+
+    fn on_toggle_settings(
+        &mut self,
+        _: &ToggleSettings,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_settings(cx);
+    }
+
     fn on_previous_day(&mut self, _: &PreviousDay, window: &mut Window, cx: &mut Context<Self>) {
         let Some(date) = self
             .session()
@@ -656,59 +679,54 @@ impl DainikiApp {
     fn welcome_view(&self, notice: &Option<String>, cx: &Context<Self>) -> impl IntoElement {
         let create = cx.weak_entity();
         let open = cx.weak_entity();
+
+        // The hero glow, as two stacked washes approximating the landing's
+        // three-stop gradient (gpui gradients take two stops, and there is no
+        // blur): surface-container-high/40 over the full 340px, primary-fixed
+        // /20 over the top half.
+        let glow_layer = |height: f32, color: Hsla| {
+            div()
+                .absolute()
+                .top(px(-128.))
+                .left_0()
+                .right_0()
+                .h(px(height))
+                .flex()
+                .justify_center()
+                .child(div().w(px(840.)).h_full().bg(linear_gradient(
+                    180.,
+                    linear_color_stop(color, 0.),
+                    linear_color_stop(color.opacity(0.), 1.),
+                )))
+        };
+
         div()
             .size_full()
             .flex()
             .flex_col()
-            .child(TitleBar::new().child("Dainiki"))
+            .child(brand_title_bar(None, None))
             .child(
                 div()
                     .flex_1()
                     .relative()
+                    .overflow_hidden()
                     .bg(self.theme.background)
-                    // The hero glow: a soft mint wash fading down, the
-                    // closest GPUI gets to the landing's blurred gradient.
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(-120.))
-                            .left_0()
-                            .right_0()
-                            .h(px(340.))
-                            .flex()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .w(px(840.))
-                                    .h_full()
-                                    .rounded_full()
-                                    .bg(linear_gradient(
-                                        180.,
-                                        linear_color_stop(
-                                            brand::primary_fixed().opacity(0.35),
-                                            0.,
-                                        ),
-                                        linear_color_stop(
-                                            brand::primary_fixed().opacity(0.),
-                                            1.,
-                                        ),
-                                    )),
-                            ),
-                    )
+                    .child(glow_layer(340., brand::surface_container_high().opacity(0.4)))
+                    .child(glow_layer(170., brand::primary_fixed().opacity(0.2)))
                     .child(
                         v_flex()
                             .size_full()
                             .items_center()
                             .justify_center()
-                            .gap_6()
-                            .px_8()
+                            .px_6()
                             .child(
-                                // The landing-page badge.
+                                // The landing hero's badge.
                                 h_flex()
                                     .gap_2()
                                     .items_center()
-                                    .px_3()
-                                    .py_1()
+                                    .px(px(14.))
+                                    .py(px(6.))
+                                    .mb_8()
                                     .rounded_full()
                                     .bg(brand::surface_container_high())
                                     .text_color(brand::on_surface_variant())
@@ -721,43 +739,73 @@ impl DainikiApp {
                                     )
                                     .child(
                                         div()
-                                            .text_xs()
-                                            .child("BUILT IN RUST & GPUI · ZERO CLOUD LOCK-IN"),
+                                            .text_size(px(12.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child("DESIGNED BY SMBL"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(brand::outline_variant())
+                                            .child("•"),
+                                    )
+                                    .child(div().text_size(px(11.)).child("Built in Rust & GPUI"))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(brand::outline_variant())
+                                            .child("•"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(brand::primary())
+                                            .child("Zero Cloud Lock-in"),
                                     ),
                             )
                             .child(
                                 v_flex()
                                     .items_center()
-                                    .gap_4()
-                                    .max_w(px(720.))
+                                    .max_w(px(896.))
                                     .child(
                                         div()
                                             .font_family(brand::SERIF_FAMILY)
                                             .text_size(px(52.))
-                                            .line_height(rems(1.15))
+                                            .line_height(px(60.))
                                             .text_color(brand::on_surface())
                                             .text_center()
-                                            .child(
-                                                "A quiet, continuous river for your thoughts.",
-                                            ),
+                                            .child("A quiet, continuous river"),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(19.))
-                                            .line_height(rems(1.6))
+                                            .font_family(brand::SERIF_FAMILY)
+                                            .text_size(px(52.))
+                                            .line_height(px(60.))
+                                            .text_color(brand::on_surface())
                                             .text_center()
-                                            .text_color(brand::on_surface_variant())
-                                            .child(
-                                                "Dainiki is a private, local-first daily journal. \
-                                                 No cards, no document switching — just your life in an \
-                                                 unbroken, beautifully typeset stream.",
-                                            ),
+                                            .child("for your thoughts."),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mt_6()
+                                    .max_w(px(672.))
+                                    .text_size(px(19.))
+                                    .line_height(px(31.))
+                                    .text_center()
+                                    .text_color(brand::on_surface_variant())
+                                    .child(
+                                        "Dainiki is a private, local-first daily journal crafted \
+                                         for those who value reflection over productivity metrics. \
+                                         No cards. No document switching. Just your life in an \
+                                         unbroken, beautifully typeset stream.",
                                     ),
                             )
                             .child(
                                 h_flex()
-                                    .gap_2()
-                                    .mt_2()
+                                    .mt_10()
+                                    .gap(px(10.))
                                     .child(
                                         Button::new("create-journal")
                                             .label("Create new journal")
@@ -783,10 +831,11 @@ impl DainikiApp {
                             )
                             .child(
                                 div()
-                                    .text_xs()
-                                    .max_w(px(460.))
+                                    .mt_4()
+                                    .max_w(px(512.))
+                                    .text_size(px(11.))
                                     .text_center()
-                                    .text_color(brand::outline())
+                                    .text_color(brand::on_surface_variant())
                                     .child(
                                         "Your journal is a folder of plain Markdown files you own — \
                                          offline, no account, no lock-in.",
@@ -794,9 +843,10 @@ impl DainikiApp {
                             )
                             .children(notice.as_ref().map(|notice| {
                                 div()
-                                    .max_w(px(460.))
+                                    .mt_4()
+                                    .max_w(px(512.))
                                     .text_center()
-                                    .text_sm()
+                                    .text_size(px(11.))
                                     .child(notice.clone())
                             })),
                     ),
@@ -891,22 +941,31 @@ impl JournalSession {
             self.stream.scroll_to_reveal_item(ix);
         }
 
+        // The gutter and the history marker only appear when the window has
+        // room for them (the mock gates them behind xl).
+        let show_gutter = window.viewport_size().width > px(1000.);
+        let oldest_label = dates
+            .last()
+            .map(|date| date.format("%B %-d, %Y").to_string());
+
         let active_editor = self.active.as_ref().map(|active| active.editor.clone());
         let day_count = dates.len();
         let shown_days = dates.len().saturating_sub(1);
         let item_this = this.clone();
         let stream_list = list(self.stream.clone(), move |ix, _window, cx| {
             if ix == day_count {
-                return stream_edge();
+                return stream_edge(oldest_label.clone());
             }
             let date = dates[ix];
-            let header = day_header(date, today);
-            let body: AnyElement = if Some(date) == active_date {
+            let is_active = Some(date) == active_date;
+            let body: AnyElement = if is_active {
                 let editor = active_editor
                     .as_ref()
                     .expect("the active day always has an editor");
                 div()
                     .h(editor_height)
+                    .text_size(px(15.2))
+                    .line_height(px(24.7))
                     .child(editor.clone())
                     .into_any_element()
             } else {
@@ -923,14 +982,42 @@ impl JournalSession {
                     div()
                         .font_family(brand::SERIF_FAMILY)
                         .italic()
-                        .text_color(brand::outline())
+                        .text_color(brand::on_surface_variant().opacity(0.4))
                         .child("Add thoughts for this day…")
                         .into_any_element()
                 };
                 clickable_day(item_this.clone(), date, inner)
             };
-            let day = v_flex().w_full().gap_4().pb_8().child(header).child(body);
-            if Some(date) == active_date {
+
+            let content = v_flex()
+                .w_full()
+                .max_w(px(672.))
+                .mx_auto()
+                .relative()
+                .when(show_gutter, |el| {
+                    el.child(day_gutter(date, today)).child(
+                        // The timeline rule running down the content column.
+                        div()
+                            .absolute()
+                            .left(px(-28.))
+                            .top(px(24.))
+                            .bottom(px(24.))
+                            .w(px(1.))
+                            .bg(brand::outline_variant().opacity(0.2)),
+                    )
+                })
+                .child(day_header(date, today, is_active))
+                .child(body);
+
+            let divider = h_flex().my_4().justify_center().child(
+                div()
+                    .w(px(48.))
+                    .h(px(1.))
+                    .bg(brand::outline_variant().opacity(0.3)),
+            );
+
+            let day = v_flex().w_full().pb_6().child(content).child(divider);
+            if is_active {
                 day.into_any_element()
             } else {
                 // The whole day is the click target, header included.
@@ -982,6 +1069,83 @@ impl JournalSession {
                                             .update(cx, |app, cx| app.close_search(window, cx))
                                             .ok();
                                     }),
+                            ),
+                    ),
+            );
+        }
+
+        // The settings panel, opened from the sidebar row or cmd-,.
+        if self.settings_open {
+            let close_this = this.clone();
+            let toggle_this = this.clone();
+            let reveal_root = self.root.clone();
+            main = main.child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .bg(brand::surface_container_low())
+                    .border_b_1()
+                    .border_color(brand::outline_variant().opacity(0.6))
+                    .child(
+                        v_flex()
+                            .gap_3()
+                            .max_w(px(672.))
+                            .mx_auto()
+                            .child(
+                                h_flex()
+                                    .justify_between()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .font_family(brand::SERIF_FAMILY)
+                                            .text_size(px(18.))
+                                            .child("Settings"),
+                                    )
+                                    .child(
+                                        Button::new("settings-close")
+                                            .label("Close")
+                                            .compact()
+                                            .on_click(move |_, _window, cx| {
+                                                close_this
+                                                    .update(cx, |app, cx| app.toggle_settings(cx))
+                                                    .ok();
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                Toggle::new("show-empty-days")
+                                    .label("Show days without entries")
+                                    .checked(show_empty_days)
+                                    .on_click(move |checked, _window, cx| {
+                                        toggle_this
+                                            .update(cx, |app, cx| {
+                                                app.set_show_empty_days(*checked, cx)
+                                            })
+                                            .ok();
+                                    }),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(brand::outline())
+                                            .child(reveal_root.display().to_string()),
+                                    )
+                                    .child(
+                                        Button::new("reveal-journal")
+                                            .label("Reveal in Finder")
+                                            .compact()
+                                            .on_click(move |_, _window, cx| {
+                                                cx.open_url(&format!(
+                                                    "file://{}",
+                                                    reveal_root.display()
+                                                ));
+                                            }),
+                                    ),
                             ),
                     ),
             );
@@ -1098,7 +1262,7 @@ impl JournalSession {
                         .max_w(px(672.))
                         .mx_auto()
                         .h_full()
-                        .child(stream_list.size_full().px_10().pt_6()),
+                        .child(stream_list.size_full().px_8().pt_8()),
                 )
                 .child(
                     Scrollbar::new(&self.stream)
@@ -1111,38 +1275,42 @@ impl JournalSession {
             .size_full()
             .flex()
             .flex_col()
-            .child(self.title_bar(&this))
+            .child(brand_title_bar(
+                self.active
+                    .as_ref()
+                    .is_some_and(|active| active.dirty)
+                    .then(|| {
+                        div()
+                            .text_color(brand::secondary())
+                            .child("•")
+                            .into_any_element()
+                    }),
+                Some(self.search_pill(&this)),
+            ))
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .flex()
                     .flex_row()
-                    .child(self.sidebar(show_empty_days, &this, cx))
+                    .child(self.sidebar(&this, cx))
                     .child(main),
             )
     }
 
-    /// The title bar: the wordmark, and the search pill on the right. The
-    /// pill is a styled control rather than a real input because the title
-    /// bar is a window-drag region; it opens the search row instead.
-    fn title_bar(&self, this: &WeakEntity<DainikiApp>) -> impl IntoElement {
-        let name = self
-            .root
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.root.display().to_string());
-        let dirty = self.active.as_ref().is_some_and(|active| active.dirty);
-
+    /// The title bar's search pill: a styled trigger — the title bar is a
+    /// window-drag region, so a raw input there would fight the drag.
+    fn search_pill(&self, this: &WeakEntity<DainikiApp>) -> AnyElement {
         let search_this = this.clone();
-        let pill = h_flex()
+        h_flex()
             .id("search-pill")
             .gap_2()
             .items_center()
             .justify_between()
-            .w(px(220.))
-            .px_2()
-            .py_1()
+            .w(px(176.))
+            .pl(px(8.))
+            .pr(px(10.))
+            .py(px(4.))
             .rounded_full()
             .bg(brand::surface_container_low())
             .border_1()
@@ -1154,7 +1322,13 @@ impl JournalSession {
                     .ok();
             })
             .child(
+                Icon::new(IconName::Search)
+                    .size(px(14.))
+                    .text_color(brand::on_surface_variant().opacity(0.7)),
+            )
+            .child(
                 div()
+                    .flex_1()
                     .text_size(px(11.))
                     .text_color(brand::on_surface_variant().opacity(0.8))
                     .child(if self.filter.query.trim().is_empty() {
@@ -1166,48 +1340,19 @@ impl JournalSession {
             .child(
                 div()
                     .text_size(px(9.))
+                    .font_family("Menlo")
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded_sm()
+                    .bg(brand::surface_container())
                     .text_color(brand::on_surface_variant().opacity(0.8))
                     .child("⌘F"),
-            );
-
-        TitleBar::new()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .w(px(8.))
-                            .h(px(8.))
-                            .rounded_full()
-                            .bg(brand::primary()),
-                    )
-                    .child(
-                        div()
-                            .font_family(brand::SERIF_FAMILY)
-                            .text_size(px(15.))
-                            .child("Dainiki"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(brand::outline())
-                            .child(name),
-                    )
-                    .when(dirty, |el| {
-                        el.child(div().text_color(brand::secondary()).child("•"))
-                    }),
             )
-            .child(pill)
+            .into_any_element()
     }
 
-    /// The left rail: Timeline, Tags, and the bottom block.
-    fn sidebar(
-        &self,
-        show_empty_days: bool,
-        this: &WeakEntity<DainikiApp>,
-        cx: &App,
-    ) -> AnyElement {
+    /// The left rail: Timeline, Search, Tags, and the bottom block.
+    fn sidebar(&self, this: &WeakEntity<DainikiApp>, cx: &App) -> AnyElement {
         // Tag counts: the index over stored days, plus the open day's tags
         // when they are not already counted for it.
         let active_date = self.active.as_ref().map(|active| active.date);
@@ -1232,14 +1377,16 @@ impl JournalSession {
 
         let timeline_this = this.clone();
         let timeline_active = !self.filter.is_active();
+        let search_this = this.clone();
+        let settings_this = this.clone();
 
         v_flex()
             .w(px(220.))
             .h_full()
             .flex_shrink_0()
-            .bg(brand::surface_container_low())
+            .bg(brand::surface_container_low().opacity(0.7))
             .border_r_1()
-            .border_color(brand::outline_variant().opacity(0.5))
+            .border_color(brand::surface_container_high().opacity(0.5))
             .child(
                 v_flex()
                     .id("sidebar")
@@ -1248,7 +1395,7 @@ impl JournalSession {
                     .overflow_y_scroll()
                     .px_2()
                     .pt_2()
-                    .gap_3()
+                    .gap_1()
                     .child(
                         // Timeline: the whole stream, no filters.
                         h_flex()
@@ -1259,7 +1406,7 @@ impl JournalSession {
                             .rounded_md()
                             .cursor_pointer()
                             .when(timeline_active, |el| {
-                                el.bg(brand::surface_container_high())
+                                el.bg(brand::surface_container_highest())
                                     .font_weight(FontWeight::MEDIUM)
                             })
                             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
@@ -1267,7 +1414,28 @@ impl JournalSession {
                                     .update(cx, |app, cx| app.clear_filter(window, cx))
                                     .ok();
                             })
-                            .child(div().text_sm().child("Timeline"))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(Icon::new(IconName::Rows2).size(px(16.)).text_color(
+                                        if timeline_active {
+                                            brand::primary()
+                                        } else {
+                                            brand::on_surface_variant()
+                                        },
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(if timeline_active {
+                                                brand::on_surface()
+                                            } else {
+                                                brand::on_surface_variant()
+                                            })
+                                            .child("Timeline"),
+                                    ),
+                            )
                             .when(timeline_active, |el| {
                                 el.child(
                                     div()
@@ -1279,13 +1447,49 @@ impl JournalSession {
                             }),
                     )
                     .child(
+                        // Search: opens the search bar (cmd-F).
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                search_this
+                                    .update(cx, |app, cx| {
+                                        app.on_focus_search(&FocusSearch, window, cx)
+                                    })
+                                    .ok();
+                            })
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        Icon::new(IconName::Search)
+                                            .size(px(16.))
+                                            .text_color(brand::on_surface_variant()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(brand::on_surface_variant())
+                                            .child("Search"),
+                                    ),
+                            )
+                            .child(kbd_chip("⌘F")),
+                    )
+                    .child(
                         v_flex()
+                            .mt_2()
                             .gap_1()
                             .child(
                                 div()
                                     .px_2()
                                     .text_size(px(10.))
-                                    .text_color(brand::outline())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(brand::on_surface_variant().opacity(0.8))
                                     .child("TAGS"),
                             )
                             .children(
@@ -1309,26 +1513,53 @@ impl JournalSession {
                 v_flex()
                     .gap_2()
                     .p_2()
+                    .bg(brand::surface_container_low().opacity(0.4))
                     .border_t_1()
-                    .border_color(brand::outline_variant().opacity(0.4))
+                    .border_color(brand::surface_container_high().opacity(0.4))
                     .child(self.calendar_card(active_date, this))
-                    .child(self.settings_menu(show_empty_days, this))
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .px_1()
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                                settings_this
+                                    .update(cx, |app, cx| app.toggle_settings(cx))
+                                    .ok();
+                            })
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        Icon::new(IconName::Settings)
+                                            .size(px(14.))
+                                            .text_color(brand::on_surface_variant()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(brand::on_surface_variant())
+                                            .child("Settings"),
+                                    ),
+                            )
+                            .child(kbd_chip("⌘,")),
+                    )
                     .child(
                         h_flex()
                             .gap_2()
                             .px_1()
                             .items_center()
                             .child(
-                                div()
-                                    .w(px(6.))
-                                    .h(px(6.))
-                                    .rounded_full()
-                                    .bg(brand::primary()),
+                                Icon::new(IconName::LockKeyhole)
+                                    .size(px(12.))
+                                    .text_color(brand::primary()),
                             )
                             .child(
                                 div()
                                     .text_size(px(10.))
-                                    .text_color(brand::outline())
+                                    .text_color(brand::on_surface_variant().opacity(0.6))
                                     .child("Directly editable stream"),
                             ),
                     ),
@@ -1336,45 +1567,52 @@ impl JournalSession {
             .into_any_element()
     }
 
-    /// Journal preferences, opened from the sidebar's bottom block.
-    fn settings_menu(&self, show_empty_days: bool, this: &WeakEntity<DainikiApp>) -> Popover {
-        let root = self.root.clone();
-        let toggle_this = this.clone();
-        let reveal_root = root.clone();
-        Popover::new("settings")
-            .trigger(Button::new("settings-trigger").label("Settings").compact())
-            .content(move |_state, _window, _cx| {
-                let toggle_this = toggle_this.clone();
-                let reveal_root = reveal_root.clone();
-                v_flex()
-                    .w(px(320.))
-                    .gap_3()
-                    .text_sm()
+    /// One tag row: `#name` with its day count; clicking filters the stream.
+    fn tag_row(&self, tag: &str, count: usize, this: &WeakEntity<DainikiApp>) -> AnyElement {
+        let selected = self.filter.tag.as_deref() == Some(tag);
+        let tag_owned = tag.to_string();
+        let this = this.clone();
+        h_flex()
+            .justify_between()
+            .items_center()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .when(selected, |el| el.bg(brand::surface_container_highest()))
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                this.update(cx, |app, cx| app.toggle_tag_filter(&tag_owned, cx))
+                    .ok();
+            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
                     .child(
-                        Toggle::new("show-empty-days")
-                            .label("Show days without entries")
-                            .checked(show_empty_days)
-                            .on_click(move |checked, _window, cx| {
-                                toggle_this
-                                    .update(cx, |app, cx| app.set_show_empty_days(*checked, cx))
-                                    .ok();
-                            }),
+                        div()
+                            .font_family("Menlo")
+                            .text_size(px(12.))
+                            .text_color(brand::secondary().opacity(0.7))
+                            .child("#"),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
-                            .text_color(brand::outline())
-                            .child(root.display().to_string()),
-                    )
-                    .child(
-                        Button::new("reveal-journal")
-                            .label("Reveal in Finder")
-                            .compact()
-                            .on_click(move |_, _window, cx| {
-                                cx.open_url(&format!("file://{}", reveal_root.display()));
-                            }),
-                    )
-            })
+                            .text_size(px(12.))
+                            .text_color(if selected {
+                                brand::on_surface()
+                            } else {
+                                brand::on_surface_variant()
+                            })
+                            .child(tag.to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(brand::on_surface_variant().opacity(0.6))
+                    .child(count.to_string()),
+            )
+            .into_any_element()
     }
 
     /// The sidebar calendar: a month at a glance, entry days dotted, today in
@@ -1507,58 +1745,12 @@ impl JournalSession {
             .when(has_entry, |el| {
                 el.child(
                     div()
-                        .w(px(3.))
-                        .h(px(3.))
+                        .w(px(4.))
+                        .h(px(4.))
                         .rounded_full()
                         .bg(brand::primary()),
                 )
             })
-            .into_any_element()
-    }
-
-    /// One tag row: `#name` with its day count; clicking filters the stream.
-    fn tag_row(&self, tag: &str, count: usize, this: &WeakEntity<DainikiApp>) -> AnyElement {
-        let selected = self.filter.tag.as_deref() == Some(tag);
-        let tag_owned = tag.to_string();
-        let this = this.clone();
-        h_flex()
-            .justify_between()
-            .items_center()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .cursor_pointer()
-            .when(selected, |el| el.bg(brand::surface_container_high()))
-            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                this.update(cx, |app, cx| app.toggle_tag_filter(&tag_owned, cx))
-                    .ok();
-            })
-            .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_color(brand::secondary().opacity(0.75))
-                            .child("#"),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(if selected {
-                                brand::on_surface()
-                            } else {
-                                brand::on_surface_variant()
-                            })
-                            .child(tag.to_string()),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(px(10.))
-                    .text_color(brand::outline())
-                    .child(count.to_string()),
-            )
             .into_any_element()
     }
 
@@ -1597,49 +1789,120 @@ fn read_days(root: &Path, today: NaiveDate) -> BTreeMap<NaiveDate, String> {
     days
 }
 
-/// One stream item's date header, following the landing's showcase: a big
-/// ghosted day number beside a serif heading ("Today, Monday, October 19").
-fn day_header(date: NaiveDate, today: NaiveDate) -> AnyElement {
+/// One stream item's date header, following the landing's showcase: the
+/// pulsing dot and "Today — Thursday, October 15" heading, with a click hint
+/// on days that are not open in the editor.
+fn day_header(date: NaiveDate, today: NaiveDate, is_active: bool) -> AnyElement {
+    let is_today = date == today;
     h_flex()
         .items_center()
-        .gap_4()
+        .justify_between()
+        .mb_2()
         .child(
-            div()
-                .w(px(64.))
-                .text_center()
-                .font_family(brand::SERIF_FAMILY)
-                .text_size(px(44.))
-                .line_height(rems(1.))
-                .text_color(brand::outline_variant())
-                .child(day_number(date)),
+            h_flex()
+                .gap_2()
+                .items_center()
+                .when(is_today, |el| {
+                    el.child(
+                        div()
+                            .w(px(8.))
+                            .h(px(8.))
+                            .rounded_full()
+                            .bg(brand::primary()),
+                    )
+                })
+                .child(
+                    div()
+                        .font_family(brand::SERIF_FAMILY)
+                        .text_size(px(24.))
+                        .line_height(px(32.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(brand::on_surface())
+                        .child(day_heading(date, today)),
+                ),
         )
+        .when(!is_active, |el| {
+            let (icon, label) = if is_today {
+                (IconName::NotebookPen, "Click to write")
+            } else {
+                (IconName::Pencil, "Click to edit")
+            };
+            el.child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Icon::new(icon)
+                            .size(px(13.))
+                            .text_color(brand::on_surface_variant().opacity(0.5)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(brand::on_surface_variant().opacity(0.5))
+                            .child(label),
+                    ),
+            )
+        })
+        .into_any_element()
+}
+
+/// The ghosted day number and its weekday caption, in the gutter left of the
+/// content column as in the showcase.
+fn day_gutter(date: NaiveDate, today: NaiveDate) -> AnyElement {
+    let caption = if date == today {
+        "TODAY".to_string()
+    } else {
+        date.format("%a").to_string().to_uppercase()
+    };
+    div()
+        .absolute()
+        .left(px(-96.))
+        .top(px(4.))
+        .opacity(0.4)
         .child(
-            div()
-                .font_family(brand::SERIF_FAMILY)
-                .text_size(px(22.))
-                .text_color(brand::on_surface())
-                .child(day_heading(date, today)),
+            v_flex()
+                .items_end()
+                .child(
+                    div()
+                        .font_family(brand::SERIF_FAMILY)
+                        .text_size(px(48.))
+                        .line_height(px(48.))
+                        .text_color(brand::outline_variant())
+                        .child(day_number(date)),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(brand::on_surface_variant())
+                        .child(caption),
+                ),
         )
         .into_any_element()
 }
 
 /// The stream's closing item, so even a fresh journal reads intentionally
 /// bottom-out.
-fn stream_edge() -> AnyElement {
+fn stream_edge(oldest: Option<String>) -> AnyElement {
     v_flex()
         .items_center()
-        .gap_2()
+        .gap_1()
         .pt_4()
-        .pb_8()
-        .child(div().text_xs().text_color(brand::outline()).child("· · ·"))
+        .pb_2()
+        .opacity(0.6)
+        .child(
+            Icon::new(IconName::ArrowDown)
+                .size(px(14.))
+                .text_color(brand::on_surface_variant()),
+        )
         .child(
             div()
-                .font_family(brand::SERIF_FAMILY)
-                .italic()
-                .text_color(brand::outline())
-                .child(
-                    "This is the edge of your journal — everything you write adds to the stream.",
-                ),
+                .text_size(px(9.))
+                .text_color(brand::on_surface_variant())
+                .child(match oldest {
+                    Some(oldest) => format!("{oldest} & earlier"),
+                    None => "The edge of your journal".to_string(),
+                }),
         )
         .into_any_element()
 }
@@ -1914,13 +2177,49 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     (next - first).num_days() as u32
 }
 
+/// The small monospace shortcut chip used across the chrome (`⌘F`, `⌘,`).
+fn kbd_chip(label: &'static str) -> AnyElement {
+    div()
+        .text_size(px(9.))
+        .font_family("Menlo")
+        .px(px(6.))
+        .py(px(2.))
+        .rounded_sm()
+        .bg(brand::surface_container())
+        .text_color(brand::on_surface_variant().opacity(0.8))
+        .child(label)
+        .into_any_element()
+}
+
+/// The title bar every screen shares: the logo, the wordmark, and whatever
+/// sits on either side.
+fn brand_title_bar(left_extra: Option<AnyElement>, right: Option<AnyElement>) -> TitleBar {
+    let mut bar = TitleBar::new().child(
+        h_flex()
+            .gap_2()
+            .items_center()
+            .children(brand::logo().map(|logo| img(logo).w(px(24.)).h(px(24.))))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Dainiki"),
+            )
+            .children(left_extra),
+    );
+    if let Some(right) = right {
+        bar = bar.child(right);
+    }
+    bar
+}
+
 /// The ghosted day number beside a day's heading, as in the landing's
 /// showcase: `19`.
 fn day_number(date: NaiveDate) -> String {
     date.format("%-d").to_string()
 }
 
-/// A day's heading, as in the landing's showcase: `Today, Monday, October 19`
+/// A day's heading, as in the landing's showcase: `Today — Monday, October 19`
 /// — with the year only when it is not the current year.
 fn day_heading(date: NaiveDate, today: NaiveDate) -> String {
     let base = date.format("%A, %B %-d").to_string();
@@ -1930,7 +2229,7 @@ fn day_heading(date: NaiveDate, today: NaiveDate) -> String {
         format!("{base}, {}", date.year())
     };
     if date == today {
-        format!("Today, {dated}")
+        format!("Today — {dated}")
     } else {
         dated
     }
@@ -2008,6 +2307,7 @@ impl Render for DainikiApp {
             .on_action(cx.listener(Self::on_toggle_editing))
             .on_action(cx.listener(Self::on_toggle_jump))
             .on_action(cx.listener(Self::on_focus_search))
+            .on_action(cx.listener(Self::on_toggle_settings))
             .on_action(cx.listener(Self::on_previous_day))
             .on_action(cx.listener(Self::on_next_day))
             .child(screen)
@@ -2022,6 +2322,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-e", ToggleEditing, None),
         KeyBinding::new("cmd-t", ToggleJumpToDate, None),
         KeyBinding::new("cmd-f", FocusSearch, None),
+        KeyBinding::new("cmd-,", ToggleSettings, None),
         KeyBinding::new("cmd-shift-[", PreviousDay, None),
         KeyBinding::new("cmd-shift-]", NextDay, None),
     ]);
@@ -2042,14 +2343,16 @@ fn main() {
         tracing::info!(root = %root.display(), "opening journal");
     }
 
-    gpui_kit::application().run(move |cx: &mut App| {
-        gpui_kit::init(cx);
-        brand::load_fonts(cx);
-        brand::apply_component_theme(cx);
-        bind_keys(cx);
-        open_app_window(cx, config, root.clone()).expect("failed to open the Dainiki window");
-        cx.activate(true);
-    });
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::AllAssets)
+        .run(move |cx: &mut App| {
+            gpui_kit::init(cx);
+            brand::load_fonts(cx);
+            brand::apply_component_theme(cx);
+            bind_keys(cx);
+            open_app_window(cx, config, root.clone()).expect("failed to open the Dainiki window");
+            cx.activate(true);
+        });
 }
 
 /// Resolves a folder argument for this session: an existing folder is used
@@ -2208,7 +2511,7 @@ mod tests {
         let last_year = NaiveDate::from_ymd_opt(2025, 12, 31).expect("date");
         assert_eq!(day_number(earlier), "5");
         assert_eq!(day_heading(earlier, today), "Monday, October 5");
-        assert_eq!(day_heading(today, today), "Today, Monday, October 19");
+        assert_eq!(day_heading(today, today), "Today — Monday, October 19");
         assert_eq!(
             day_heading(last_year, today),
             "Wednesday, December 31, 2025"

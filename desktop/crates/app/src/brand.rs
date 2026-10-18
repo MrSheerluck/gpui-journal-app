@@ -28,6 +28,10 @@ pub fn surface_container_high() -> Hsla {
     rgb(0xEDE7E5).into()
 }
 
+pub fn surface_container_highest() -> Hsla {
+    rgb(0xE7E1DF).into()
+}
+
 pub fn on_surface() -> Hsla {
     rgb(0x1D1B1A).into()
 }
@@ -76,6 +80,20 @@ pub const SERIF_FAMILY: &str = "Newsreader";
 
 // -- themes ------------------------------------------------------------------
 
+/// The app mark, decoded once from the bundled PNG.
+pub fn logo() -> Option<std::sync::Arc<RenderImage>> {
+    use std::sync::{Arc, OnceLock};
+
+    static LOGO: OnceLock<Option<Arc<RenderImage>>> = OnceLock::new();
+    LOGO.get_or_init(|| {
+        let bytes = include_bytes!("../assets/logo.png");
+        let decoded = image::load_from_memory(bytes).ok()?;
+        let frame = image::Frame::new(decoded.to_rgba8());
+        Some(Arc::new(RenderImage::new([frame])))
+    })
+    .clone()
+}
+
 /// Registers the bundled brand fonts with the text system. Call once at
 /// startup, before any window renders.
 pub fn load_fonts(cx: &mut App) {
@@ -119,6 +137,10 @@ pub fn editor_theme() -> EditorTheme {
 pub fn apply_component_theme(cx: &mut App) {
     let theme = Theme::global_mut(cx);
     theme.font_family = UI_FAMILY.into();
+    theme.font_size = px(13.);
+    // The landing's radius scale: DEFAULT 2px, lg 4px, xl 8px, full 12px.
+    theme.radius = px(2.);
+    theme.radius_lg = px(8.);
     let colors = &mut theme.colors;
     colors.background = surface();
     colors.foreground = on_surface();

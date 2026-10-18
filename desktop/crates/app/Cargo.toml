@@ -8,6 +8,7 @@ description = "Dainiki desktop app: journal shell around the Markdown editor."
 [dependencies]
 gpui-kit = "=0.7.3"
 dainiki-editor = { path = "../editor" }
+image.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }

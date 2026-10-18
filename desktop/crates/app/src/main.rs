@@ -5,7 +5,10 @@ mod persistence;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use dainiki_editor::{Buffer, EditorEvent, EditorTheme, MarkdownEditor, commands::InlineFormat};
+use dainiki_editor::{
+    Buffer, EditorEvent, EditorTheme, MarkdownEditor,
+    commands::{BlockFormat, InlineFormat},
+};
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::button::{Toggle, ToggleGroup};
 use gpui_kit::component::toolbar::Toolbar;
@@ -116,6 +119,35 @@ impl DainikiApp {
             })
     }
 
+    fn block_toggle(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        format: BlockFormat,
+        cx: &Context<Self>,
+    ) -> Toggle {
+        let active = self.editor.read(cx).block_format_active(format, cx);
+        let editor = self.editor.clone();
+        Toggle::new(id)
+            .label(label)
+            .checked(active)
+            .on_click(move |_checked, _window, cx| {
+                editor.update(cx, |editor, cx| editor.toggle_block_format(format, cx));
+            })
+    }
+
+    fn block_toolbar(&self, cx: &mut Context<Self>) -> ToggleGroup {
+        ToggleGroup::new("block-formats").segmented().children([
+            self.block_toggle("h1", "H1", BlockFormat::Heading(1), cx),
+            self.block_toggle("h2", "H2", BlockFormat::Heading(2), cx),
+            self.block_toggle("h3", "H3", BlockFormat::Heading(3), cx),
+            self.block_toggle("bullet", "•", BlockFormat::Bullet, cx),
+            self.block_toggle("ordered", "1.", BlockFormat::Ordered, cx),
+            self.block_toggle("task", "☐", BlockFormat::Task, cx),
+            self.block_toggle("quote", ">", BlockFormat::Quote, cx),
+        ])
+    }
+
     fn inline_toolbar(&self, cx: &mut Context<Self>) -> ToggleGroup {
         ToggleGroup::new("inline-formats").segmented().children([
             self.inline_toggle("bold", "B", InlineFormat::Bold, cx),
@@ -136,11 +168,11 @@ impl Render for DainikiApp {
             .on_action(cx.listener(Self::on_save))
             .child(TitleBar::new().child(self.window_title()))
             .child(
-                div()
-                    .w_full()
-                    .px_3()
-                    .py_1()
-                    .child(Toolbar::new("editor-toolbar").child(self.inline_toolbar(cx))),
+                div().w_full().px_3().py_1().child(
+                    Toolbar::new("editor-toolbar")
+                        .child(self.inline_toolbar(cx))
+                        .child(self.block_toolbar(cx)),
+                ),
             )
             .child(
                 div()

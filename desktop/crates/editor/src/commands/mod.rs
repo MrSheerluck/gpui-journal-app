@@ -222,6 +222,15 @@ pub fn insert_rule(text: &str, selection: Selection) -> Option<Edit> {
     })
 }
 
+/// The block format of every line the selection touches — the toolbar's
+/// active-state input.
+pub fn selection_block_formats(text: &str, selection: Selection) -> Vec<Option<BlockFormat>> {
+    covered_lines(text, selection)
+        .into_iter()
+        .map(|line| line.block)
+        .collect()
+}
+
 /// The lines a selection touches; a selection ending exactly at a line start
 /// does not include that line.
 fn covered_lines(text: &str, selection: Selection) -> Vec<LineInfo> {

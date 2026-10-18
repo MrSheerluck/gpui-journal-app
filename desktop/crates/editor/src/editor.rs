@@ -728,6 +728,15 @@ impl MarkdownEditor {
         }
     }
 
+    /// Whether any line the selection touches carries the block format:
+    /// the block toolbar's active state.
+    pub fn block_format_active(&self, format: BlockFormat, cx: &App) -> bool {
+        let text = self.content(cx);
+        commands::selection_block_formats(&text, self.selection)
+            .into_iter()
+            .any(|block| block == Some(format))
+    }
+
     /// Toggles a block format across the selected lines. One undo step.
     pub fn toggle_block_format(&mut self, format: BlockFormat, cx: &mut Context<Self>) {
         let text = self.content(cx);
@@ -1445,6 +1454,45 @@ mod interaction_tests {
         cx.simulate_keystrokes("cmd-z cmd-z cmd-z cmd-z");
         cx.update(|_, app| {
             assert_eq!(editor.read(app).content(app), "a", "undo steps are wrong");
+        });
+    }
+
+    #[gpui::test]
+    async fn block_format_active_reflects_the_line(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "one");
+        cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.toggle_block_format(BlockFormat::Bullet, cx)
+            });
+        });
+        cx.update(|_, app| {
+            assert!(
+                editor
+                    .read(app)
+                    .block_format_active(BlockFormat::Bullet, app)
+            );
+            assert!(
+                !editor
+                    .read(app)
+                    .block_format_active(BlockFormat::Heading(1), app)
+            );
+        });
+        cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.toggle_block_format(BlockFormat::Heading(1), cx)
+            });
+        });
+        cx.update(|_, app| {
+            assert!(
+                editor
+                    .read(app)
+                    .block_format_active(BlockFormat::Heading(1), app)
+            );
+            assert!(
+                !editor
+                    .read(app)
+                    .block_format_active(BlockFormat::Bullet, app)
+            );
         });
     }
 

@@ -23,7 +23,7 @@ use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::*;
 
-actions!(dainiki, [Save, TogglePreview, CreateJournal, OpenJournal]);
+actions!(dainiki, [Save, TogglePreview]);
 
 /// Autosave runs this long after the last keystroke.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -32,6 +32,7 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// the welcome screen asks for one.
 struct DainikiApp {
     theme: EditorTheme,
+    config: config::Config,
     screen: Screen,
 }
 
@@ -57,9 +58,10 @@ struct JournalSession {
 }
 
 impl DainikiApp {
-    fn new(theme: EditorTheme) -> Self {
+    fn new(theme: EditorTheme, config: config::Config) -> Self {
         Self {
             theme,
+            config,
             screen: Screen::Welcome { notice: None },
         }
     }
@@ -145,12 +147,7 @@ impl DainikiApp {
 
     // -- welcome actions ----------------------------------------------------
 
-    fn on_create_journal(
-        &mut self,
-        _: &CreateJournal,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn create_journal_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -188,7 +185,7 @@ impl DainikiApp {
         }
     }
 
-    fn on_open_journal(&mut self, _: &OpenJournal, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_journal_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -213,10 +210,53 @@ impl DainikiApp {
 
     /// Best-effort persistence of the chosen journal; a failed config write
     /// only means the choice is asked again next launch.
-    fn remember_journal(&self, root: &Path) {
-        if let Err(error) = config::save_journal_root(root) {
+    fn remember_journal(&mut self, root: &Path) {
+        self.config.journal_root = Some(root.to_path_buf());
+        if let Err(error) = config::save(&self.config) {
             tracing::warn!(root = %root.display(), error = %error, "could not save the journal choice");
         }
+    }
+
+    /// Persists a preferences change (the in-memory value stays authoritative
+    /// for this session even when the write fails).
+    fn set_show_empty_days(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.config.show_empty_days == show {
+            return;
+        }
+        self.config.show_empty_days = show;
+        if let Err(error) = config::save(&self.config) {
+            tracing::warn!(error = %error, "could not save preferences");
+        }
+        cx.notify();
+    }
+
+    /// Journal preferences, available from the toolbar.
+    fn settings_menu(&self, cx: &Context<Self>) -> Popover {
+        let this = cx.weak_entity();
+        let show_empty_days = self.config.show_empty_days;
+        Popover::new("settings")
+            .trigger(Button::new("settings-trigger").label("Settings").compact())
+            .content(move |_state, _window, _cx| {
+                let this = this.clone();
+                v_flex()
+                    .w(px(320.))
+                    .gap_2()
+                    .text_sm()
+                    .child(
+                        Toggle::new("show-empty-days")
+                            .label("Show days without entries")
+                            .checked(show_empty_days)
+                            .on_click(move |checked, _window, cx| {
+                                this.update(cx, |app, cx| app.set_show_empty_days(*checked, cx))
+                                    .ok();
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .child("Empty days appear in the timeline, ready to fill in later."),
+                    )
+            })
     }
 
     // -- journal actions ----------------------------------------------------
@@ -281,7 +321,9 @@ impl DainikiApp {
         cx.notify();
     }
 
-    fn welcome_view(&self, notice: &Option<String>) -> impl IntoElement {
+    fn welcome_view(&self, notice: &Option<String>, cx: &Context<Self>) -> impl IntoElement {
+        let create = cx.weak_entity();
+        let open = cx.weak_entity();
         div()
             .size_full()
             .flex()
@@ -308,15 +350,22 @@ impl DainikiApp {
                                 Button::new("create-journal")
                                     .label("Create new journal")
                                     .primary()
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(Box::new(CreateJournal), cx);
+                                    .on_click(move |_, window, cx| {
+                                        create
+                                            .update(cx, |app, cx| {
+                                                app.create_journal_prompt(window, cx)
+                                            })
+                                            .ok();
                                     }),
                             )
                             .child(
                                 Button::new("open-journal")
                                     .label("Open existing folder")
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(Box::new(OpenJournal), cx);
+                                    .on_click(move |_, window, cx| {
+                                        open.update(cx, |app, cx| {
+                                            app.open_journal_prompt(window, cx)
+                                        })
+                                        .ok();
                                     }),
                             ),
                     )
@@ -328,7 +377,7 @@ impl DainikiApp {
 }
 
 impl JournalSession {
-    fn view(&self, theme: &EditorTheme, cx: &App) -> impl IntoElement {
+    fn view(&self, theme: &EditorTheme, settings: Popover, cx: &App) -> impl IntoElement {
         let content = if self.preview {
             let text = self.editor.read(cx).content(cx);
             div()
@@ -357,6 +406,7 @@ impl JournalSession {
                                 .child(self.block_toolbar(cx)),
                         )
                         .child(self.insert_menu())
+                        .child(settings)
                         .child(self.preview_toggle())
                         .child(self.help_menu()),
                 ),
@@ -633,15 +683,16 @@ fn copy_image(source: &Path, assets: &Path) -> Result<(String, String), String> 
 impl Render for DainikiApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let screen = match &self.screen {
-            Screen::Welcome { notice } => self.welcome_view(notice).into_any_element(),
-            Screen::Journal(session) => session.view(&self.theme, cx).into_any_element(),
+            Screen::Welcome { notice } => self.welcome_view(notice, cx).into_any_element(),
+            Screen::Journal(session) => {
+                let settings = self.settings_menu(cx);
+                session.view(&self.theme, settings, cx).into_any_element()
+            }
         };
         div()
             .size_full()
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_toggle_preview))
-            .on_action(cx.listener(Self::on_create_journal))
-            .on_action(cx.listener(Self::on_open_journal))
             .child(screen)
     }
 }
@@ -654,8 +705,9 @@ fn main() {
 
     // A folder argument overrides the configured journal for this session;
     // it is never persisted.
+    let config = config::load();
     let cli_root = resolve_cli_root(std::env::args_os().nth(1).map(PathBuf::from));
-    let root = cli_root.or_else(|| config::load().journal_root);
+    let root = cli_root.or_else(|| config.journal_root.clone());
     if let Some(root) = &root {
         tracing::info!(root = %root.display(), "opening journal");
     }
@@ -666,7 +718,7 @@ fn main() {
             KeyBinding::new("cmd-s", Save, None),
             KeyBinding::new("cmd-e", TogglePreview, None),
         ]);
-        open_app_window(cx, root.clone()).expect("failed to open the Dainiki window");
+        open_app_window(cx, config, root.clone()).expect("failed to open the Dainiki window");
         cx.activate(true);
     });
 }
@@ -695,7 +747,7 @@ fn resolve_cli_root(arg: Option<PathBuf>) -> Option<PathBuf> {
     None
 }
 
-fn open_app_window(cx: &mut App, root: Option<PathBuf>) -> Result<()> {
+fn open_app_window(cx: &mut App, config: config::Config, root: Option<PathBuf>) -> Result<()> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: point(px(160.0), px(120.0)),
@@ -708,7 +760,7 @@ fn open_app_window(cx: &mut App, root: Option<PathBuf>) -> Result<()> {
     gpui_kit::open_window(options, cx, move |window, cx| {
         let theme = EditorTheme::default();
         cx.new(|cx| {
-            let mut app = DainikiApp::new(theme);
+            let mut app = DainikiApp::new(theme, config);
             if let Some(root) = root {
                 if root.is_dir() {
                     app.enter_journal(root, window, cx);
@@ -735,7 +787,7 @@ mod tests {
     // NOTE: no `use super::*` here. The crate root glob-imports `gpui_kit::*`,
     // which re-exports gpui's `test` proc macro; globbing it in would shadow
     // the builtin `#[test]` inside the generated harness and recurse forever.
-    use super::{DainikiApp, EditorTheme, Screen, journal, resolve_cli_root};
+    use super::{DainikiApp, EditorTheme, Screen, config, journal, resolve_cli_root};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -787,7 +839,9 @@ mod tests {
     #[gpui::test]
     async fn the_app_starts_on_the_welcome_screen(cx: &mut TestAppContext) {
         init(cx);
-        let (app, cx) = cx.add_window_view(|_window, _cx| DainikiApp::new(EditorTheme::default()));
+        let (app, cx) = cx.add_window_view(|_window, _cx| {
+            DainikiApp::new(EditorTheme::default(), config::Config::default())
+        });
         cx.update(|_window, cx| {
             assert!(matches!(
                 app.read(cx).screen,
@@ -808,7 +862,7 @@ mod tests {
         let (app, cx) = cx.add_window_view({
             let dir = dir.clone();
             move |window, cx| {
-                let mut app = DainikiApp::new(EditorTheme::default());
+                let mut app = DainikiApp::new(EditorTheme::default(), config::Config::default());
                 app.enter_journal(dir, window, cx);
                 app
             }
@@ -837,7 +891,7 @@ mod tests {
         let (app, cx) = cx.add_window_view({
             let root = not_a_folder.clone();
             move |window, cx| {
-                let mut app = DainikiApp::new(EditorTheme::default());
+                let mut app = DainikiApp::new(EditorTheme::default(), config::Config::default());
                 app.enter_journal(root, window, cx);
                 app
             }

@@ -8,11 +8,27 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 /// The app's configuration, persisted as typed TOML.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Config {
     /// The journal folder chosen during onboarding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub journal_root: Option<PathBuf>,
+    /// Whether days without an entry appear in the journal timeline.
+    #[serde(default = "default_show_empty_days")]
+    pub show_empty_days: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            journal_root: None,
+            show_empty_days: default_show_empty_days(),
+        }
+    }
+}
+
+fn default_show_empty_days() -> bool {
+    true
 }
 
 /// Path of `config.toml` under the OS config directory, if there is one.
@@ -34,15 +50,8 @@ pub fn load() -> Config {
     }
 }
 
-/// Persists a chosen journal root.
-pub fn save_journal_root(root: &Path) -> io::Result<()> {
-    save(&Config {
-        journal_root: Some(root.to_path_buf()),
-    })
-}
-
 /// Writes the config atomically, creating the config directory as needed.
-fn save(config: &Config) -> io::Result<()> {
+pub fn save(config: &Config) -> io::Result<()> {
     let path = path().ok_or_else(|| io::Error::other("no config directory on this platform"))?;
     save_to(&path, config)
 }
@@ -103,6 +112,17 @@ mod tests {
             config.journal_root.as_deref(),
             Some(PathBuf::from("/home/user/Journal").as_path())
         );
+        assert!(config.show_empty_days, "empty days default to visible");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn show_empty_days_roundtrips() {
+        let dir = scratch_dir();
+        let path = dir.join("config.toml");
+        fs::write(&path, "show_empty_days = false\n").expect("seed");
+        let config = load_from(&path).expect("load");
+        assert!(!config.show_empty_days);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -132,6 +152,7 @@ mod tests {
         let path = dir.join("nested/config.toml");
         let config = Config {
             journal_root: Some(PathBuf::from("/journals/dainiki")),
+            show_empty_days: false,
         };
         save_to(&path, &config).expect("save");
         assert_eq!(load_from(&path).expect("load"), config);

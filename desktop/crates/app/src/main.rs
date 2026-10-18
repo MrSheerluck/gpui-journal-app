@@ -5,8 +5,10 @@ mod persistence;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use dainiki_editor::{Buffer, EditorEvent, EditorTheme, MarkdownEditor};
+use dainiki_editor::{Buffer, EditorEvent, EditorTheme, MarkdownEditor, commands::InlineFormat};
 use gpui_kit::component::TitleBar;
+use gpui_kit::component::button::{Toggle, ToggleGroup};
+use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::*;
 
 actions!(dainiki, [Save]);
@@ -46,6 +48,7 @@ impl DainikiApp {
                 cx.notify();
             }
         });
+        cx.observe(&editor, |_app, _editor, cx| cx.notify());
         Self {
             editor,
             theme,
@@ -95,6 +98,33 @@ impl DainikiApp {
             None => format!("Dainiki{dirty}"),
         }
     }
+
+    fn inline_toggle(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        format: InlineFormat,
+        cx: &Context<Self>,
+    ) -> Toggle {
+        let active = self.editor.read(cx).inline_format_active(format);
+        let editor = self.editor.clone();
+        Toggle::new(id)
+            .label(label)
+            .checked(active)
+            .on_click(move |_checked, _window, cx| {
+                editor.update(cx, |editor, cx| editor.toggle_inline_format(format, cx));
+            })
+    }
+
+    fn inline_toolbar(&self, cx: &mut Context<Self>) -> ToggleGroup {
+        ToggleGroup::new("inline-formats").segmented().children([
+            self.inline_toggle("bold", "B", InlineFormat::Bold, cx),
+            self.inline_toggle("italic", "I", InlineFormat::Italic, cx),
+            self.inline_toggle("strike", "S", InlineFormat::Strike, cx),
+            self.inline_toggle("highlight", "H", InlineFormat::Highlight, cx),
+            self.inline_toggle("code", "`", InlineFormat::Code, cx),
+        ])
+    }
 }
 
 impl Render for DainikiApp {
@@ -105,6 +135,13 @@ impl Render for DainikiApp {
             .flex_col()
             .on_action(cx.listener(Self::on_save))
             .child(TitleBar::new().child(self.window_title()))
+            .child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .child(Toolbar::new("editor-toolbar").child(self.inline_toolbar(cx))),
+            )
             .child(
                 div()
                     .flex_1()

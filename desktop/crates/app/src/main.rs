@@ -1,10 +1,13 @@
 //! Dainiki desktop shell: window chrome, journal persistence and the editor.
 
+mod config;
+mod journal;
 mod persistence;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use chrono::Local;
 use dainiki_editor::{
     Buffer, EditorEvent, EditorTheme, MarkdownEditor,
     commands::{BlockFormat, InlineFormat},
@@ -29,8 +32,8 @@ const WELCOME: &str = "\
 
 Your journal lives here: local-first, offline, and file-first.
 
-Open a file to write into it — `cargo run -p dainiki-desktop -- ~/journal/2026-10-18.md`
-opens (or creates) that day's entry, with autosave and `cmd-S`.
+Open a journal folder — `cargo run -p dainiki-desktop -- ~/journal` —
+and today's entry opens ready to write.
 ";
 
 struct DainikiApp {
@@ -454,7 +457,21 @@ fn main() {
         .try_init()
         .ok();
 
-    let path = std::env::args_os().nth(1).map(PathBuf::from);
+    // A folder argument overrides the configured journal for this session;
+    // it is never persisted.
+    let arg = std::env::args_os().nth(1).map(PathBuf::from);
+    let cli_root = match arg {
+        Some(path) if path.is_dir() => Some(path),
+        Some(path) => {
+            tracing::warn!(path = %path.display(), "argument ignored: pass a journal folder");
+            None
+        }
+        None => None,
+    };
+    let root = cli_root.or_else(|| config::load().journal_root);
+    if let Some(root) = &root {
+        tracing::info!(root = %root.display(), "opening journal");
+    }
 
     gpui_kit::application().run(move |cx: &mut App| {
         gpui_kit::init(cx);
@@ -462,12 +479,12 @@ fn main() {
             KeyBinding::new("cmd-s", Save, None),
             KeyBinding::new("cmd-e", TogglePreview, None),
         ]);
-        open_app_window(cx, path).expect("failed to open the Dainiki window");
+        open_app_window(cx, root.clone()).expect("failed to open the Dainiki window");
         cx.activate(true);
     });
 }
 
-fn open_app_window(cx: &mut App, path: Option<PathBuf>) -> Result<()> {
+fn open_app_window(cx: &mut App, root: Option<PathBuf>) -> Result<()> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: point(px(160.0), px(120.0)),
@@ -477,7 +494,24 @@ fn open_app_window(cx: &mut App, path: Option<PathBuf>) -> Result<()> {
         ..TitleBar::window_options()
     };
 
-    let loaded = match &path {
+    // Opening the journal means opening today's entry, creating it (and its
+    // folders) on first launch of the day.
+    let entry = match &root {
+        Some(root) => {
+            let journal = journal::Journal::new(root);
+            let today = Local::now().date_naive();
+            match journal.ensure_entry(today) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    tracing::error!(root = %root.display(), error = %error, "could not open today's entry");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    let loaded = match &entry {
         Some(path) => match persistence::load(path) {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -489,13 +523,13 @@ fn open_app_window(cx: &mut App, path: Option<PathBuf>) -> Result<()> {
     };
     let last_seen = loaded.clone();
     let content = loaded.unwrap_or_else(|| {
-        if path.is_some() {
+        if entry.is_some() {
             String::new()
         } else {
             WELCOME.to_string()
         }
     });
-    let base_dir = path
+    let base_dir = entry
         .as_ref()
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
 
@@ -509,7 +543,7 @@ fn open_app_window(cx: &mut App, path: Option<PathBuf>) -> Result<()> {
         });
         let focus_handle = editor.read(cx).focus_handle().clone();
         window.focus(&focus_handle, cx);
-        cx.new(|cx| DainikiApp::new(editor, theme, path, last_seen, window, cx))
+        cx.new(|cx| DainikiApp::new(editor, theme, entry, last_seen, window, cx))
     })?;
 
     Ok(())

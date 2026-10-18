@@ -9,7 +9,7 @@ use gpui::{
 };
 
 use crate::{
-    display::{InlineStyle, ProjectedLine, Style as LineStyle},
+    display::{FragmentKind, InlineStyle, ProjectedLine, Style as LineStyle, WidgetKind},
     editor::MarkdownEditor,
     input::scroll::{EditorScrollState, clamp_offset},
     theme::EditorTheme,
@@ -100,13 +100,16 @@ impl Element for EditorElement {
                 let mut content_size: Size<Pixels> = Size::default();
                 for projected in &plan.lines {
                     let scale = match projected.style {
-                        LineStyle::Body => 1.0,
+                        LineStyle::Body | LineStyle::Quote => 1.0,
                         LineStyle::Heading { level } => theme.heading_scale(level),
                     };
                     let font_size = base_font_size * scale;
                     let line_height = base_line_height * scale;
                     let mut style = text_style.clone();
                     style.font_size = font_size.into();
+                    if projected.style == LineStyle::Quote {
+                        style.color = theme.text.opacity(0.65);
+                    }
                     let runs = shape_runs(projected, &style, &theme);
                     let shaped = window.text_system().shape_text(
                         SharedString::new(projected.text.as_str()),
@@ -308,6 +311,21 @@ impl Element for EditorElement {
                             .paint(line_origin, height, align, Some(bounds), window, cx)
                     {
                         tracing::warn!(error = %error, "failed to paint a line");
+                    }
+                    if let Some(projected) = plan.lines.get(ix)
+                        && projected
+                            .fragments
+                            .iter()
+                            .any(|fragment| fragment.kind == FragmentKind::Widget(WidgetKind::Rule))
+                    {
+                        let rule = Bounds {
+                            origin: point(bounds.origin.x, line_origin.y + height / 2.),
+                            size: Size {
+                                width: bounds.size.width,
+                                height: px(1.),
+                            },
+                        };
+                        window.paint_quad(fill(rule, theme.text.opacity(0.25)));
                     }
                     if show_caret
                         && let Some(source) = caret_source

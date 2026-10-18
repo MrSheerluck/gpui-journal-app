@@ -18,6 +18,8 @@ pub enum Style {
     Heading {
         level: u8,
     },
+    /// A blockquote line: dimmed content behind a `▎` bar.
+    Quote,
 }
 
 /// Inline character-level styles carried as display runs.
@@ -54,6 +56,8 @@ pub enum WidgetKind {
     Bullet,
     /// A `[ ]`/`[x]` marker rendered as `☐`/`☑` and toggled by clicking.
     Task { checked: bool },
+    /// A `---` rule rendered as a full-width painted line.
+    Rule,
 }
 
 /// One piece of a projected line. Fragments tile both the source range and
@@ -102,11 +106,15 @@ impl ProjectedLine {
     }
 
     /// The source byte for a display byte within this line. Display positions
-    /// inside collapsed markup resolve to the nearest visible boundary.
+    /// inside collapsed markup or widgets resolve to the next visible
+    /// boundary; positions past the end resolve to the line end.
     pub fn source_for_display(&self, display: usize) -> usize {
         for fragment in &self.fragments {
             if fragment.kind != FragmentKind::Visible {
                 continue;
+            }
+            if display < fragment.display.start {
+                return fragment.source.start;
             }
             if display <= fragment.display.end {
                 let within = (display - fragment.display.start).min(fragment.source.len());
@@ -258,6 +266,31 @@ fn project_line(
             }
             ConstructKind::OrderedMarker => {
                 // Ordered markers render as-is.
+            }
+            ConstructKind::QuoteMarker => {
+                if !line_revealed(&source, selection) {
+                    pieces.push((
+                        reveal_range,
+                        Piece::Glyph {
+                            text: "▎ ".to_string(),
+                            widget: WidgetKind::Bullet,
+                        },
+                    ));
+                    if line_style == Style::Body {
+                        line_style = Style::Quote;
+                    }
+                }
+            }
+            ConstructKind::ThematicBreak => {
+                if !line_revealed(&source, selection) {
+                    pieces.push((
+                        reveal_range,
+                        Piece::Glyph {
+                            text: String::new(),
+                            widget: WidgetKind::Rule,
+                        },
+                    ));
+                }
             }
             ConstructKind::Emphasis
             | ConstructKind::Strong
@@ -638,5 +671,50 @@ mod tests {
         let plan = plan_for(text, Selection::caret(20));
         assert_eq!(plan.lines[0].text, "1. first");
         assert_eq!(plan.lines[1].text, "2. second");
+    }
+
+    #[test]
+    fn quotes_collapse_to_bars_and_dim() {
+        let text = "> quoted line\n\nafter\n";
+        let plan = plan_for(text, Selection::caret(16));
+        assert_eq!(plan.lines[0].text, "▎ quoted line");
+        assert_eq!(plan.lines[0].style, Style::Quote);
+        let (range, widget) = plan.lines[0].widget_at_display(0).expect("bar widget");
+        assert_eq!(range, 0..2);
+        assert_eq!(widget, WidgetKind::Bullet);
+
+        let plan = plan_for(text, Selection::caret(3));
+        assert_eq!(plan.lines[0].text, "> quoted line");
+        assert_eq!(plan.lines[0].style, Style::Body);
+    }
+
+    #[test]
+    fn rules_collapse_to_empty_widgets() {
+        let text = "before\n\n---\n\nafter\n";
+        let plan = plan_for(text, Selection::caret(0));
+        assert_eq!(plan.lines[2].text, "");
+        assert!(
+            plan.lines[2]
+                .fragments
+                .iter()
+                .any(|fragment| { fragment.kind == FragmentKind::Widget(WidgetKind::Rule) })
+        );
+
+        let plan = plan_for(text, Selection::caret(9));
+        assert_eq!(plan.lines[2].text, "---");
+    }
+
+    #[test]
+    fn display_offsets_inside_widgets_map_to_boundaries() {
+        let text = "- [ ] todo\n";
+        let plan = plan_for(text, Selection::caret(20));
+        let line = &plan.lines[0];
+        // Display 0..4 is the bullet, 4..7 the checkbox; the first visible
+        // text starts at display 7.
+        assert_eq!(line.source_for_display(0), 5);
+        assert_eq!(line.source_for_display(6), 5);
+        assert_eq!(line.source_for_display(7), 5);
+        assert_eq!(line.source_for_display(8), 6);
+        assert_eq!(line.source_for_display(99), 10);
     }
 }

@@ -8,6 +8,7 @@ mod config;
 mod journal;
 mod media;
 mod persistence;
+mod video;
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,7 +18,7 @@ use std::time::Duration;
 
 use chrono::{Datelike, Local, NaiveDate};
 use dainiki_editor::{
-    Buffer, EditorEvent, EditorTheme, MarkdownEditor, MediaKind,
+    Buffer, EditorEvent, EditorTheme, MarkdownEditor, MediaKind, MediaPlaybackState,
     commands::{BlockFormat, InlineFormat},
 };
 use gpui_kit::assets::IconName;
@@ -123,6 +124,10 @@ struct JournalSession {
     media: media::Player,
     /// Whether the playback tick loop is running.
     media_ticks: Cell<bool>,
+    /// The open video's frame pump, when one is running.
+    video: Option<video::Pump>,
+    /// Which destination the frame pump belongs to.
+    video_destination: Option<String>,
     _jump_events: Subscription,
     _search_events: Subscription,
 }
@@ -323,6 +328,8 @@ impl DainikiApp {
             pending_reveal: Cell::new(None),
             media: media::Player::platform(),
             media_ticks: Cell::new(false),
+            video: None,
+            video_destination: None,
             _jump_events: jump_events,
             _search_events: search_events,
         }));
@@ -451,6 +458,8 @@ impl DainikiApp {
         if let Some(session) = self.session_mut() {
             session.media.stop();
             session.media_ticks.set(false);
+            session.video = None;
+            session.video_destination = None;
         }
         let text = previous.editor.read(cx).content(cx);
         if let Some(session) = self.session_mut() {
@@ -499,6 +508,7 @@ impl DainikiApp {
         };
         tracing::info!(destination = %destination, kind = ?kind, "media toggled");
         let state = session.media.toggle(&destination, &resolved, kind);
+        let playing = state.playing;
         if let Some(error) = state.error.clone() {
             let label = match session.media.kind() {
                 Some(MediaKind::Video) => "video",
@@ -520,6 +530,103 @@ impl DainikiApp {
         }
         if session.media.playing() {
             self.ensure_media_tick(cx);
+        }
+        if kind == MediaKind::Video {
+            self.sync_video_pump(&destination, &resolved, playing, cx);
+        }
+        cx.notify();
+    }
+
+    /// Keeps the frame pump in step with the player: a fresh pump for a new
+    /// (or finished) video, resume/pause for the running one.
+    fn sync_video_pump(
+        &mut self,
+        destination: &str,
+        resolved: &Path,
+        playing: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut() else {
+            return;
+        };
+        let same_running = session.video.is_some()
+            && session.video_destination.as_deref() == Some(destination)
+            && !session.video.as_ref().is_some_and(|pump| pump.finished());
+        if same_running {
+            if let Some(pump) = &session.video {
+                if playing {
+                    pump.resume();
+                } else {
+                    pump.pause();
+                }
+            }
+            return;
+        }
+        // Different video, or the previous pump ended: replace it.
+        session.video = None;
+        session.video_destination = None;
+        if !playing {
+            return;
+        }
+        match video::Pump::start(resolved) {
+            Ok(pump) => {
+                let frames = pump.frames();
+                session.video = Some(pump);
+                session.video_destination = Some(destination.to_string());
+                let destination = destination.to_string();
+                cx.spawn(async move |this, cx| {
+                    while let Ok(frame) = frames.recv().await {
+                        let keep = this
+                            .update(cx, |app, cx| app.push_video_frame(&destination, frame, cx))
+                            .is_ok();
+                        if !keep {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            Err(error) => {
+                session.status = Some(format!("Could not play the video — {error}"));
+            }
+        }
+    }
+
+    /// One decoded frame (or a decode failure) from the open video.
+    fn push_video_frame(
+        &mut self,
+        destination: &str,
+        frame: Result<video::VideoFrame, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut() else {
+            return;
+        };
+        match frame {
+            Ok(frame) => {
+                let Some(image) = frame.into_render_image() else {
+                    return;
+                };
+                let editor = session.active.as_ref().map(|active| active.editor.clone());
+                if let Some(editor) = editor {
+                    editor.update(cx, |editor, cx| {
+                        editor.set_media_frame(destination, image, cx)
+                    });
+                }
+            }
+            Err(error) => {
+                session.status = Some(format!("Could not play the video — {error}"));
+                let editor = session.active.as_ref().map(|active| active.editor.clone());
+                if let Some(editor) = editor {
+                    let state = MediaPlaybackState {
+                        error: Some(error),
+                        ..MediaPlaybackState::default()
+                    };
+                    editor.update(cx, |editor, cx| {
+                        editor.set_media_state(destination, state, cx)
+                    });
+                }
+            }
         }
         cx.notify();
     }
@@ -3112,6 +3219,115 @@ mod tests {
         let path = journal.entry_path(date);
         fs::create_dir_all(path.parent().unwrap()).expect("dirs");
         fs::write(&path, text).expect("seed");
+    }
+
+    #[gpui::test]
+    async fn toggling_a_missing_medium_surfaces_an_error(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        seed_day(&journal, today, "![](assets/missing.mp3)\n");
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let missing = dir.join("2026/10/assets/missing.mp3");
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| {
+                app.on_media_toggle(
+                    "assets/missing.mp3".into(),
+                    missing.clone(),
+                    super::MediaKind::Audio,
+                    cx,
+                );
+            });
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let session = app.session().expect("an open session");
+            assert!(
+                !session.media.playing(),
+                "a missing file must not report playing"
+            );
+            let status = session.status.clone().unwrap_or_default();
+            assert!(
+                status.contains("Could not play the audio"),
+                "the failure should surface in the banner, got {status:?}"
+            );
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn toggling_a_missing_video_surfaces_an_error(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        seed_day(&journal, today, "![](assets/missing.mp4)\n");
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let missing = dir.join("2026/10/assets/missing.mp4");
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| {
+                app.on_media_toggle(
+                    "assets/missing.mp4".into(),
+                    missing.clone(),
+                    super::MediaKind::Video,
+                    cx,
+                );
+            });
+        });
+        // The decode failure lands from the worker thread: poll for it.
+        let mut status = String::new();
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cx.run_until_parked();
+            status = cx.update(|_window, cx| {
+                app.read(cx)
+                    .session()
+                    .and_then(|session| session.status.clone())
+                    .unwrap_or_default()
+            });
+            if status.contains("Could not play") {
+                break;
+            }
+        }
+        assert!(
+            status.contains("Could not play the video"),
+            "the failure should surface in the banner, got {status:?}"
+        );
+
+        cx.update(|_window, cx| {
+            // The pump is stopped or failed; the session must not claim a live
+            // pump for this destination afterwards.
+            app.update(cx, |app, cx| app.stop_editing(cx));
+            let app = app.read(cx);
+            let session = app.session().expect("an open session");
+            assert!(session.video.is_none(), "closing the day drops the pump");
+        });
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

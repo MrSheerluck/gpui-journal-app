@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::sync::Arc;
 use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
@@ -248,6 +249,7 @@ impl Element for EditorElement {
             plan,
             images,
             media_states,
+            media_frames,
             reveal_pending,
             hover_task,
         ) = {
@@ -261,6 +263,7 @@ impl Element for EditorElement {
                 view.plan(),
                 view.image_metrics(),
                 view.media_states(),
+                view.media_frames(),
                 view.reveal_pending(),
                 view.hover_task(),
             )
@@ -361,6 +364,7 @@ impl Element for EditorElement {
                                 &path,
                                 &images,
                                 media_states.get(&path),
+                                media_frames.get(&path),
                                 bounds,
                                 &theme,
                                 window,
@@ -681,8 +685,9 @@ fn paint_check_mark(task_box: Bounds<Pixels>, color: Hsla, window: &mut Window) 
 }
 
 /// Paints a whole-line media widget: an image at its natural size (clamped),
-/// a video card, an audio row, or a file chip. A loading or failed image
-/// shows a placeholder box labeled with the file name.
+/// a video card (with the latest frame when one has arrived), an audio row,
+/// or a file chip. A loading or failed image shows a placeholder box labeled
+/// with the file name.
 #[allow(clippy::too_many_arguments)]
 fn paint_media_line(
     line: &WrappedLine,
@@ -693,6 +698,7 @@ fn paint_media_line(
     path: &str,
     images: &std::collections::HashMap<String, ImageState>,
     playback: Option<&MediaPlaybackState>,
+    frame: Option<&Arc<gpui::RenderImage>>,
     bounds: Bounds<Pixels>,
     theme: &EditorTheme,
     window: &mut Window,
@@ -784,6 +790,36 @@ fn paint_media_line(
                     .border_widths(1.)
                     .border_color(theme.media_border),
             );
+            // A video frame covers the whole card, cropped to fit. The file
+            // label steps aside once there is a picture.
+            let mut framed = false;
+            if kind == MediaKind::Video
+                && let Some(frame) = frame
+            {
+                let size = frame.size(0);
+                let scale_factor = window.scale_factor();
+                let natural_width = size.width.0 as f32 / scale_factor;
+                let natural_height = size.height.0 as f32 / scale_factor;
+                if natural_width > 0. && natural_height > 0. {
+                    let fit = (card.size.width.as_f32() / natural_width)
+                        .max(card.size.height.as_f32() / natural_height);
+                    let target = gpui::size(px(natural_width * fit), px(natural_height * fit));
+                    let rect = Bounds {
+                        origin: point(
+                            card.origin.x + (card.size.width - target.width) / 2.,
+                            card.origin.y + (card.size.height - target.height) / 2.,
+                        ),
+                        size: target,
+                    };
+                    if let Err(error) =
+                        window.paint_image(rect, card, px(radius).into(), frame.clone(), 0, false)
+                    {
+                        tracing::warn!(error = %error, "failed to paint a video frame");
+                    } else {
+                        framed = true;
+                    }
+                }
+            }
             let button_center = match kind {
                 MediaKind::Video => point(
                     card.origin.x + card.size.width / 2.,
@@ -800,17 +836,19 @@ fn paint_media_line(
                 MediaKind::Video => card.origin.x + px(12.),
                 _ => card.origin.x + px(12.) + button_radius * 2. + px(12.),
             };
-            let label = match playback.and_then(|state| state.error.as_deref()) {
-                Some(error) => format!("{} — {error}", file_name(path)),
-                None => file_name(path).to_string(),
-            };
-            paint_label(
-                &label,
-                point(label_x, card.origin.y + card.size.height - px(22.)),
-                theme,
-                window,
-                cx,
-            );
+            if !framed {
+                let label = match playback.and_then(|state| state.error.as_deref()) {
+                    Some(error) => format!("{} — {error}", file_name(path)),
+                    None => file_name(path).to_string(),
+                };
+                paint_label(
+                    &label,
+                    point(label_x, card.origin.y + card.size.height - px(22.)),
+                    theme,
+                    window,
+                    cx,
+                );
+            }
             // The progress track and its elapsed portion, when known.
             let track_bounds = Bounds {
                 origin: point(

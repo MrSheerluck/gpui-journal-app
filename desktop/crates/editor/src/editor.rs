@@ -83,6 +83,8 @@ pub struct MarkdownEditor {
     images: HashMap<String, ImageState>,
     /// Host-pushed playback state per media destination.
     media_states: HashMap<String, MediaPlaybackState>,
+    /// Host-pushed video frames per media destination (the latest one wins).
+    media_frames: HashMap<String, Arc<RenderImage>>,
     pending_edit: Option<PendingEdit>,
     slash: Option<SlashMenu>,
     /// A slash position the user dismissed with Escape; no menu re-opens
@@ -151,6 +153,7 @@ impl MarkdownEditor {
             base_dir: None,
             images: HashMap::new(),
             media_states: HashMap::new(),
+            media_frames: HashMap::new(),
             pending_edit: None,
             slash: None,
             slash_dismissed: None,
@@ -410,6 +413,7 @@ impl MarkdownEditor {
         self.base_dir = dir;
         self.images.clear();
         self.media_states.clear();
+        self.media_frames.clear();
         self.pending_edit = Some(PendingEdit::Full);
         self.revision += 1;
         cx.notify();
@@ -430,9 +434,25 @@ impl MarkdownEditor {
         }
     }
 
+    /// Pushes the latest decoded video frame for a destination.
+    pub fn set_media_frame(
+        &mut self,
+        destination: &str,
+        frame: Arc<RenderImage>,
+        cx: &mut Context<Self>,
+    ) {
+        self.media_frames.insert(destination.to_string(), frame);
+        cx.notify();
+    }
+
     /// Snapshot of playback states for painting.
     pub(crate) fn media_states(&self) -> HashMap<String, MediaPlaybackState> {
         self.media_states.clone()
+    }
+
+    /// Snapshot of the latest video frames for painting.
+    pub(crate) fn media_frames(&self) -> HashMap<String, Arc<RenderImage>> {
+        self.media_frames.clone()
     }
 
     /// The resolved filesystem path for an image destination.
@@ -1794,6 +1814,25 @@ mod interaction_tests {
                 &[("assets/take.mp3".to_string(), MediaKind::Audio)],
                 "a click on the audio row toggles playback"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn a_video_frame_paints_without_panicking(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "\n![](assets/clip.mp4)\n");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let frame = gpui::RenderImage::new([image::Frame::new(
+            image::RgbaImage::from_raw(2, 2, vec![0x40; 16]).expect("2x2 image"),
+        )]);
+        cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_media_frame("assets/clip.mp4", std::sync::Arc::new(frame), cx)
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
         });
     }
 

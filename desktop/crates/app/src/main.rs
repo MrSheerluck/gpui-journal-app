@@ -38,6 +38,7 @@ struct DainikiApp {
     theme: EditorTheme,
     path: Option<PathBuf>,
     dirty: bool,
+    last_seen: Option<String>,
     save_task: Option<Task<()>>,
     link_input: Entity<InputState>,
     preview: bool,
@@ -50,6 +51,7 @@ impl DainikiApp {
         editor: Entity<MarkdownEditor>,
         theme: EditorTheme,
         path: Option<PathBuf>,
+        last_seen: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -69,6 +71,7 @@ impl DainikiApp {
             theme,
             path,
             dirty: false,
+            last_seen,
             save_task: None,
             link_input,
             preview: false,
@@ -93,12 +96,22 @@ impl DainikiApp {
             return;
         };
         let text = self.editor.read(cx).content(cx);
-        match persistence::write_atomic(&path, &text) {
-            Ok(()) => {
+        match persistence::save(&path, &text, self.last_seen.as_deref()) {
+            persistence::SaveOutcome::Saved => {
                 self.dirty = false;
-                tracing::info!(path = %path.display(), bytes = text.len(), "journal saved");
+                let bytes = text.len();
+                self.last_seen = Some(text);
+                tracing::info!(path = %path.display(), bytes, "journal saved");
             }
-            Err(error) => {
+            persistence::SaveOutcome::ConflictCopy(conflict) => {
+                self.dirty = false;
+                self.last_seen = std::fs::read_to_string(&path).ok();
+                tracing::error!(
+                    path = %conflict.display(),
+                    "the journal changed on disk; preserved this version as a conflict copy"
+                );
+            }
+            persistence::SaveOutcome::Failed(error) => {
                 tracing::error!(path = %path.display(), error = %error, "journal save failed");
             }
         }
@@ -463,16 +476,24 @@ fn open_app_window(cx: &mut App, path: Option<PathBuf>) -> Result<()> {
         ..TitleBar::window_options()
     };
 
-    let content = match &path {
+    let loaded = match &path {
         Some(path) => match persistence::load(path) {
-            Ok(loaded) => loaded.unwrap_or_default(),
+            Ok(loaded) => loaded,
             Err(error) => {
                 tracing::error!(path = %path.display(), error = %error, "failed to read journal");
-                String::new()
+                None
             }
         },
-        None => WELCOME.to_string(),
+        None => None,
     };
+    let last_seen = loaded.clone();
+    let content = loaded.unwrap_or_else(|| {
+        if path.is_some() {
+            String::new()
+        } else {
+            WELCOME.to_string()
+        }
+    });
     let base_dir = path
         .as_ref()
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
@@ -487,7 +508,7 @@ fn open_app_window(cx: &mut App, path: Option<PathBuf>) -> Result<()> {
         });
         let focus_handle = editor.read(cx).focus_handle().clone();
         window.focus(&focus_handle, cx);
-        cx.new(|cx| DainikiApp::new(editor, theme, path, window, cx))
+        cx.new(|cx| DainikiApp::new(editor, theme, path, last_seen, window, cx))
     })?;
 
     Ok(())

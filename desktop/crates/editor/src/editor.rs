@@ -1592,6 +1592,53 @@ mod interaction_tests {
     }
 
     #[gpui::test]
+    async fn crlf_documents_edit_cleanly(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "line one\r\nline two\r\n");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_keystrokes("cmd-1");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "# line one\r\nline two\r\n");
+        });
+        cx.simulate_keystrokes("cmd-z");
+        cx.simulate_input("X");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "Xline one\r\nline two\r\n");
+        });
+    }
+
+    #[gpui::test]
+    async fn empty_documents_accept_every_basic_operation(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "");
+        cx.simulate_input("hi");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("there");
+        cx.simulate_keystrokes("left left backspace");
+        cx.update(|_, app| {
+            // "there" minus the 'e' before 'r'.
+            assert_eq!(editor.read(app).content(app), "hi\nthre");
+            assert_eq!(editor.read(app).selection().head(), 5);
+        });
+        cx.simulate_keystrokes("cmd-z cmd-z cmd-z cmd-z");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "");
+        });
+    }
+
+    #[gpui::test]
+    async fn copy_yields_markdown_source_even_with_collapsed_markup(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "a **bold** and `code` tail");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_keystrokes("cmd-a cmd-c");
+        let text = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(text.as_deref(), Some("a **bold** and `code` tail"));
+        let _ = editor;
+    }
+
+    #[gpui::test]
     async fn backspace_and_undo_work(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx, "abc");
         cx.simulate_keystrokes("right right right backspace");

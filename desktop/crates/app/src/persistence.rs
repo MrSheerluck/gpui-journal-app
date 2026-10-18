@@ -14,6 +14,48 @@ pub fn load(path: &Path) -> io::Result<Option<String>> {
     }
 }
 
+/// What a save attempt did.
+#[derive(Debug)]
+pub enum SaveOutcome {
+    Saved,
+    /// The file changed on disk since we last saw it; our content was
+    /// preserved in a conflict copy instead of overwriting.
+    ConflictCopy(std::path::PathBuf),
+    Failed(io::Error),
+}
+
+/// Saves `text` to `path`, first checking whether another writer changed the
+/// file since `last_seen`. On conflict our text goes to a `.conflict-<unix>`
+/// sibling and the main file is left untouched.
+pub fn save(path: &Path, text: &str, last_seen: Option<&str>) -> SaveOutcome {
+    if let Some(last_seen) = last_seen {
+        match fs::read_to_string(path) {
+            Ok(disk) if disk != last_seen => {
+                let file_name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "journal".to_string());
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or_default();
+                let conflict = path.with_file_name(format!("{file_name}.conflict-{stamp}"));
+                return match write_atomic(&conflict, text) {
+                    Ok(()) => SaveOutcome::ConflictCopy(conflict),
+                    Err(error) => SaveOutcome::Failed(error),
+                };
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return SaveOutcome::Failed(error),
+        }
+    }
+    match write_atomic(path, text) {
+        Ok(()) => SaveOutcome::Saved,
+        Err(error) => SaveOutcome::Failed(error),
+    }
+}
+
 /// Writes `text` to a temporary file in the same directory, flushes it, and
 /// renames it into place, so a crash can never leave a half-written journal
 /// file behind.
@@ -37,7 +79,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{load, write_atomic};
+    use super::{SaveOutcome, load, save, write_atomic};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -78,6 +120,40 @@ mod tests {
         write_atomic(&path, "first").expect("write");
         write_atomic(&path, "second").expect("overwrite");
         assert_eq!(load(&path).unwrap().as_deref(), Some("second"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_without_conflict_writes_in_place() {
+        let dir = scratch_dir();
+        let path = dir.join("entry.md");
+        write_atomic(&path, "old").expect("seed");
+        match save(&path, "new", Some("old")) {
+            SaveOutcome::Saved => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(load(&path).unwrap().as_deref(), Some("new"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn external_change_produces_a_conflict_copy() {
+        let dir = scratch_dir();
+        let path = dir.join("entry.md");
+        write_atomic(&path, "from the app").expect("seed");
+        // Another editor changed the file.
+        write_atomic(&path, "from elsewhere").expect("external");
+
+        match save(&path, "from the app, edited", Some("from the app")) {
+            SaveOutcome::ConflictCopy(conflict) => {
+                assert_eq!(
+                    load(&conflict).unwrap().as_deref(),
+                    Some("from the app, edited")
+                );
+            }
+            other => panic!("expected conflict copy, got {other:?}"),
+        }
+        assert_eq!(load(&path).unwrap().as_deref(), Some("from elsewhere"));
         fs::remove_dir_all(&dir).ok();
     }
 }

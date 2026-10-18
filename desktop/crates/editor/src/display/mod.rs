@@ -43,6 +43,17 @@ pub enum FragmentKind {
     Visible,
     /// Markup the live preview hides while collapsed; zero width in display.
     Hidden,
+    /// A rendered stand-in for markup: bullet glyph, task checkbox.
+    Widget(WidgetKind),
+}
+
+/// Widgets that replace source markup while collapsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WidgetKind {
+    /// A `-`/`*`/`+` marker rendered as `•`.
+    Bullet,
+    /// A `[ ]`/`[x]` marker rendered as `☐`/`☑` and toggled by clicking.
+    Task { checked: bool },
 }
 
 /// One piece of a projected line. Fragments tile both the source range and
@@ -72,7 +83,7 @@ pub struct ProjectedLine {
 
 impl ProjectedLine {
     /// The display byte for a source byte within this line. Offsets inside
-    /// hidden markup collapse to the hidden fragment's display boundary.
+    /// hidden markup or a widget collapse to its display boundary.
     pub fn display_for_source(&self, source: usize) -> usize {
         for fragment in &self.fragments {
             if source < fragment.source.start {
@@ -80,7 +91,7 @@ impl ProjectedLine {
             }
             if source <= fragment.source.end {
                 return match fragment.kind {
-                    FragmentKind::Hidden => fragment.display.start,
+                    FragmentKind::Hidden | FragmentKind::Widget(_) => fragment.display.start,
                     FragmentKind::Visible => {
                         fragment.display.start + (source - fragment.source.start)
                     }
@@ -91,10 +102,10 @@ impl ProjectedLine {
     }
 
     /// The source byte for a display byte within this line. Display positions
-    /// inside collapsed text resolve to the nearest visible boundary.
+    /// inside collapsed markup resolve to the nearest visible boundary.
     pub fn source_for_display(&self, display: usize) -> usize {
         for fragment in &self.fragments {
-            if fragment.kind == FragmentKind::Hidden {
+            if fragment.kind != FragmentKind::Visible {
                 continue;
             }
             if display <= fragment.display.end {
@@ -103,6 +114,19 @@ impl ProjectedLine {
             }
         }
         self.source.end
+    }
+
+    /// The widget under a display byte, if any: its source range and kind.
+    pub fn widget_at_display(&self, display: usize) -> Option<(Range<usize>, WidgetKind)> {
+        for fragment in &self.fragments {
+            if let FragmentKind::Widget(kind) = fragment.kind
+                && fragment.display.start <= display
+                && display < fragment.display.end
+            {
+                return Some((fragment.source.clone(), kind));
+            }
+        }
+        None
     }
 }
 
@@ -173,15 +197,15 @@ fn project_line(
     index: &MarkdownIndex,
     selection: Selection,
 ) -> ProjectedLine {
-    let mut hidden: Vec<Range<usize>> = Vec::new();
+    let mut pieces: Vec<(Range<usize>, Piece)> = Vec::new();
     let mut pending_runs: Vec<(Range<usize>, InlineStyle)> = Vec::new();
     let mut line_style = Style::Body;
 
     for construct in index.constructs_in(source.clone()) {
+        let reveal_range =
+            construct.range.start.max(source.start)..construct.range.end.min(source.end);
         match construct.kind {
             ConstructKind::Heading { level } => {
-                let reveal_range =
-                    construct.range.start.max(source.start)..construct.range.end.min(source.end);
                 if line_revealed(&reveal_range, selection) {
                     continue;
                 }
@@ -193,7 +217,7 @@ fn project_line(
                     .unwrap_or(source.end)
                     .min(source.end);
                 if source.start < content_start {
-                    hidden.push(source.start..content_start);
+                    pieces.push((source.start..content_start, Piece::Hide));
                 }
                 if let Some(content) = construct.inner.first() {
                     let visible_end = content.end.min(source.end);
@@ -205,10 +229,35 @@ fn project_line(
                         let start = trailing.start.max(visible_end).max(source.start);
                         let end = trailing.end.min(source.end);
                         if start < end {
-                            hidden.push(start..end);
+                            pieces.push((start..end, Piece::Hide));
                         }
                     }
                 }
+            }
+            ConstructKind::ListMarker => {
+                if !line_revealed(&source, selection) {
+                    pieces.push((
+                        reveal_range,
+                        Piece::Glyph {
+                            text: "• ".to_string(),
+                            widget: WidgetKind::Bullet,
+                        },
+                    ));
+                }
+            }
+            ConstructKind::TaskMarker { checked } => {
+                if !line_revealed(&source, selection) {
+                    pieces.push((
+                        reveal_range,
+                        Piece::Glyph {
+                            text: if checked { "☑".into() } else { "☐".into() },
+                            widget: WidgetKind::Task { checked },
+                        },
+                    ));
+                }
+            }
+            ConstructKind::OrderedMarker => {
+                // Ordered markers render as-is.
             }
             ConstructKind::Emphasis
             | ConstructKind::Strong
@@ -220,7 +269,7 @@ fn project_line(
                         let start = marker.start.max(source.start);
                         let end = marker.end.min(source.end);
                         if start < end {
-                            hidden.push(start..end);
+                            pieces.push((start..end, Piece::Hide));
                         }
                     }
                 }
@@ -238,7 +287,7 @@ fn project_line(
         }
     }
 
-    let (visible_text, fragments) = build_fragments(text, &source, hidden);
+    let (visible_text, fragments) = build_fragments(text, &source, pieces);
     let runs = map_runs(&fragments, pending_runs);
 
     ProjectedLine {
@@ -248,6 +297,13 @@ fn project_line(
         runs,
         style: line_style,
     }
+}
+
+/// What a source piece becomes in the display: nothing (hidden) or a widget
+/// glyph standing in for markup (bullet, checkbox).
+enum Piece {
+    Hide,
+    Glyph { text: String, widget: WidgetKind },
 }
 
 fn inline_style(kind: &ConstructKind) -> InlineStyle {
@@ -261,31 +317,39 @@ fn inline_style(kind: &ConstructKind) -> InlineStyle {
     }
 }
 
-/// Splits a line into visible and hidden fragments around the hidden ranges.
+/// Splits a line into visible and hidden fragments around the hidden ranges
+/// and widgets, in source order.
 fn build_fragments(
     text: &str,
     source: &Range<usize>,
-    hidden: Vec<Range<usize>>,
+    pieces: Vec<(Range<usize>, Piece)>,
 ) -> (String, Vec<Fragment>) {
-    let mut ranges: Vec<Range<usize>> = hidden
+    let mut pieces: Vec<(Range<usize>, Piece)> = pieces
         .into_iter()
-        .map(|range| range.start.max(source.start)..range.end.min(source.end))
-        .filter(|range| range.start < range.end)
+        .map(|(range, piece)| {
+            (
+                range.start.max(source.start)..range.end.min(source.end),
+                piece,
+            )
+        })
+        .filter(|(range, _)| range.start < range.end)
         .collect();
-    ranges.sort_by_key(|range| range.start);
-    let mut merged: Vec<Range<usize>> = Vec::new();
-    for range in ranges {
-        match merged.last_mut() {
-            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
-            _ => merged.push(range),
+    pieces.sort_by_key(|(range, _)| range.start);
+    let mut merged: Vec<(Range<usize>, Piece)> = Vec::new();
+    for (range, piece) in pieces {
+        if let Some((last, _)) = merged.last()
+            && range.start < last.end
+        {
+            continue; // overlapping markup: keep the first piece
         }
+        merged.push((range, piece));
     }
 
     let mut output = String::new();
     let mut fragments = Vec::new();
     let mut display = 0;
     let mut cursor = source.start;
-    for range in merged {
+    for (range, piece) in merged {
         if cursor < range.start {
             output.push_str(&text[cursor..range.start]);
             fragments.push(Fragment {
@@ -295,11 +359,27 @@ fn build_fragments(
             });
             display += range.start - cursor;
         }
-        fragments.push(Fragment {
-            source: range.clone(),
-            display: display..display,
-            kind: FragmentKind::Hidden,
-        });
+        match piece {
+            Piece::Hide => {
+                fragments.push(Fragment {
+                    source: range.clone(),
+                    display: display..display,
+                    kind: FragmentKind::Hidden,
+                });
+            }
+            Piece::Glyph {
+                text: glyph,
+                widget,
+            } => {
+                output.push_str(&glyph);
+                fragments.push(Fragment {
+                    source: range.clone(),
+                    display: display..display + glyph.len(),
+                    kind: FragmentKind::Widget(widget),
+                });
+                display += glyph.len();
+            }
+        }
         cursor = range.end;
     }
     if cursor < source.end {
@@ -340,7 +420,7 @@ fn map_runs(fragments: &[Fragment], pending: Vec<(Range<usize>, InlineStyle)>) -
 
 #[cfg(test)]
 mod tests {
-    use super::{DisplayPlan, FragmentKind, InlineStyle, Style, revealed};
+    use super::{DisplayPlan, FragmentKind, InlineStyle, Style, WidgetKind, revealed};
     use crate::buffer::Buffer;
     use crate::input::Selection;
     use crate::markdown::MarkdownIndex;
@@ -521,5 +601,42 @@ mod tests {
                 (11..16, InlineStyle::Strong),
             ]
         );
+    }
+
+    #[test]
+    fn list_markers_collapse_to_bullets() {
+        let text = "- item\n* another\n";
+        let plan = plan_for(text, Selection::caret(17));
+        assert_eq!(plan.lines[0].text, "• item");
+        assert_eq!(plan.lines[1].text, "• another");
+        let (range, widget) = plan.lines[0].widget_at_display(0).expect("bullet widget");
+        assert_eq!(range, 0..2);
+        assert_eq!(widget, WidgetKind::Bullet);
+
+        // Caret on the line reveals the source markers.
+        let plan = plan_for(text, Selection::caret(3));
+        assert_eq!(plan.lines[0].text, "- item");
+    }
+
+    #[test]
+    fn task_markers_collapse_to_checkboxes() {
+        let text = "- [ ] todo\n- [x] done\n";
+        let plan = plan_for(text, Selection::caret(23));
+        assert_eq!(plan.lines[0].text, "• ☐ todo");
+        assert_eq!(plan.lines[1].text, "• ☑ done");
+        let (range, widget) = plan.lines[1].widget_at_display(4).expect("task widget");
+        assert_eq!(range, 13..16);
+        assert_eq!(widget, WidgetKind::Task { checked: true });
+
+        let plan = plan_for(text, Selection::caret(2));
+        assert_eq!(plan.lines[0].text, "- [ ] todo");
+    }
+
+    #[test]
+    fn ordered_markers_render_as_source() {
+        let text = "1. first\n2. second\n";
+        let plan = plan_for(text, Selection::caret(20));
+        assert_eq!(plan.lines[0].text, "1. first");
+        assert_eq!(plan.lines[1].text, "2. second");
     }
 }

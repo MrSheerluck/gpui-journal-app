@@ -25,6 +25,8 @@ pub enum ConstructKind {
     Strong,
     /// `~~text~~`
     Strikethrough,
+    /// `==text==` — Obsidian-style highlight, not part of the grammar.
+    Highlight,
     /// `` `code` `` — the code span including its backtick delimiters.
     CodeSpan,
     /// `[text](url)` — inner carries [text, destination].
@@ -100,6 +102,11 @@ impl MarkdownIndex {
         constructs.sort_by_key(|construct| (construct.range.start, construct.range.end));
         self.block_tree = Some(tree);
         self.constructs = constructs;
+        let mut highlights = Vec::new();
+        scan_highlights(text, &self.constructs, &mut highlights);
+        self.constructs.extend(highlights);
+        self.constructs
+            .sort_by_key(|construct| (construct.range.start, construct.range.end));
     }
 
     pub fn constructs(&self) -> &[Construct] {
@@ -278,6 +285,65 @@ impl MarkdownIndex {
 /// Shifts a slice-relative byte range into document coordinates.
 fn shift(range: Range<usize>, offset: usize) -> Range<usize> {
     range.start + offset..range.end + offset
+}
+
+/// Finds `==text==` pairs the Markdown grammar does not know about, outside
+/// code spans and fences. Pairs are matched left-to-right per line; empty
+/// content is not a highlight.
+fn scan_highlights(text: &str, existing: &[Construct], out: &mut Vec<Construct>) {
+    let code_spans: Vec<&Construct> = existing
+        .iter()
+        .filter(|construct| {
+            matches!(
+                construct.kind,
+                ConstructKind::CodeSpan | ConstructKind::Fence
+            )
+        })
+        .collect();
+    let inside_code = |offset: usize| {
+        code_spans
+            .iter()
+            .any(|construct| construct.range.start <= offset && offset < construct.range.end)
+    };
+
+    let mut line_start = 0;
+    loop {
+        let line_end = text[line_start..]
+            .find('\n')
+            .map(|offset| line_start + offset)
+            .unwrap_or(text.len());
+        let line = &text[line_start..line_end];
+        let mut open: Option<usize> = None;
+        let mut cursor = 0;
+        while let Some(found) = line[cursor..].find("==") {
+            let position = cursor + found;
+            cursor = position + 2;
+            if inside_code(line_start + position) {
+                continue;
+            }
+            match open {
+                None => open = Some(position),
+                Some(start) => {
+                    open = None;
+                    if position > start + 2 && !inside_code(line_start + position) {
+                        out.push(Construct {
+                            kind: ConstructKind::Highlight,
+                            range: line_start + start..line_start + position + 2,
+                            markers: vec![
+                                line_start + start..line_start + start + 2,
+                                line_start + position..line_start + position + 2,
+                            ],
+                            inner: vec![line_start + start + 2..line_start + position],
+                        });
+                    }
+                }
+            }
+        }
+        if line_end == text.len() {
+            break;
+        }
+        line_start = line_end + 1;
+    }
 }
 
 /// Merges adjacent or overlapping marker ranges (e.g. two one-byte `*` runs
@@ -473,6 +539,40 @@ mod tests {
             .collect();
         assert_eq!(heading, vec![0..6]);
         assert_eq!(index.constructs_in(210..250).count(), 0);
+    }
+
+    #[test]
+    fn highlights_are_scanned_outside_code() {
+        let text = "a ==hot== b and `==not==` and ==x==\n";
+        let index = index_of(text);
+        let highlights: Vec<_> = index
+            .constructs()
+            .iter()
+            .filter(|c| c.kind == ConstructKind::Highlight)
+            .map(|c| c.range.clone())
+            .collect();
+        assert_eq!(highlights, vec![2..9, 30..35]);
+        let first = find(&index, |c| c.kind == ConstructKind::Highlight);
+        assert_eq!(first.markers, vec![2..4, 7..9]);
+        assert_eq!(first.inner, vec![4..7]);
+        assert_eq!(&text[4..7], "hot");
+    }
+
+    #[test]
+    fn highlight_edges_do_not_match() {
+        let text = "==== \nempty ==\n==ok==\n";
+        let index = index_of(text);
+        let highlights: Vec<_> = index
+            .constructs()
+            .iter()
+            .filter(|c| c.kind == ConstructKind::Highlight)
+            .map(|c| c.range.clone())
+            .collect();
+        assert_eq!(
+            highlights,
+            vec![15..21],
+            "wrong pairs matched: {highlights:?}"
+        );
     }
 
     #[test]

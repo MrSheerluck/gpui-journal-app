@@ -91,6 +91,10 @@ impl MarkdownEditor {
         self.caret_visible
     }
 
+    pub(crate) fn marked_range(&self) -> Option<Range<usize>> {
+        self.marked_range.clone()
+    }
+
     pub fn scroll_by(&mut self, delta: Pixels, cx: &mut Context<Self>) {
         if self.scroll.scroll_by(delta) {
             cx.notify();

@@ -1,9 +1,9 @@
 use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
-    App, AvailableSpace, Bounds, DefiniteLength, Element, ElementId, Entity, GlobalElementId, Hsla,
-    InspectorElementId, IntoElement, LayoutId, Length, Pixels, Point, SharedString, Size, Style,
-    Window, WrappedLine, fill, point, px,
+    App, AvailableSpace, Bounds, DefiniteLength, Element, ElementId, ElementInputHandler, Entity,
+    GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Length, Pixels, Point,
+    SharedString, Size, Style, Window, WrappedLine, fill, point, px,
 };
 
 use crate::{
@@ -187,15 +187,21 @@ impl Element for EditorElement {
             0.0
         };
 
-        let (theme, selection_state, caret_visible, focus_handle) = {
+        let (theme, selection_state, caret_visible, focus_handle, marked_range) = {
             let view = self.view.read(cx);
             (
                 view.theme().clone(),
                 view.selection(),
                 view.caret_visible(),
                 view.focus_handle().clone(),
+                view.marked_range(),
             )
         };
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(bounds, self.view.clone()),
+            cx,
+        );
         let show_selection = !selection_state.is_caret();
         let selection = (selection_state.start(), selection_state.end());
         let show_caret = caret_visible && !show_selection && focus_handle.is_focused(window);
@@ -205,7 +211,7 @@ impl Element for EditorElement {
         } else {
             None
         };
-        let line_ranges: Vec<(usize, usize)> = if show_selection {
+        let line_ranges: Vec<(usize, usize)> = if show_selection || marked_range.is_some() {
             let buffer = self.buffer.read(cx);
             (0..buffer.len_lines())
                 .map(|ix| (buffer.line_start_byte(ix), buffer.line_end_byte(ix)))
@@ -221,15 +227,28 @@ impl Element for EditorElement {
                 let line_bottom = line_origin.y + height;
                 if line_bottom > bounds.origin.y && line_origin.y < viewport_bottom {
                     if let Some(&line_range) = line_ranges.get(ix) {
-                        paint_selection(
-                            line,
-                            line_origin,
-                            inner.line_height,
-                            line_range,
-                            selection,
-                            theme.selection,
-                            window,
-                        );
+                        if show_selection {
+                            paint_selection(
+                                line,
+                                line_origin,
+                                inner.line_height,
+                                line_range,
+                                selection,
+                                theme.selection,
+                                window,
+                            );
+                        }
+                        if let Some(marked) = &marked_range {
+                            paint_marked(
+                                line,
+                                line_origin,
+                                inner.line_height,
+                                line_range,
+                                (marked.start, marked.end),
+                                theme.text,
+                                window,
+                            );
+                        }
                     }
                     if let Err(error) = line.paint(
                         line_origin,
@@ -292,39 +311,14 @@ fn paint_selection(
     color: Hsla,
     window: &mut Window,
 ) {
+    for quad in range_quads(line, origin, line_height, line_range, selection) {
+        window.paint_quad(fill(quad, color));
+    }
+
     let (line_start, line_end) = line_range;
-    if selection.0 > line_end {
-        return;
-    }
-    let content_len = line_end - line_start;
-    let clip_start = selection.0.saturating_sub(line_start).min(content_len);
-    let clip_end = selection.1.saturating_sub(line_start).min(content_len);
-
-    let starts = segment_starts(line);
-    let unwrapped = &line.unwrapped_layout;
-    if clip_start < clip_end {
-        for (segment, pair) in starts.windows(2).enumerate() {
-            let start = clip_start.max(pair[0]);
-            let end = clip_end.min(pair[1]);
-            if start >= end {
-                continue;
-            }
-            let base = unwrapped.x_for_index(pair[0]);
-            let x0 = unwrapped.x_for_index(start) - base;
-            let x1 = unwrapped.x_for_index(end) - base;
-            let quad = Bounds {
-                origin: point(origin.x + x0, origin.y + line_height * segment as f32),
-                size: Size {
-                    width: x1 - x0,
-                    height: line_height,
-                },
-            };
-            window.paint_quad(fill(quad, color));
-        }
-    }
-
-    if selection.1 > line_end
-        && let Some(position) = line.position_for_index(content_len, line_height)
+    if selection.0 <= line_end
+        && selection.1 > line_end
+        && let Some(position) = line.position_for_index(line_end - line_start, line_height)
     {
         let sliver = Bounds {
             origin: point(origin.x + position.x, origin.y + position.y),
@@ -335,6 +329,71 @@ fn paint_selection(
         };
         window.paint_quad(fill(sliver, color));
     }
+}
+
+/// Paints the IME composition underline over a marked range: a short bar at
+/// the bottom of the line box for every wrapped segment the range covers.
+fn paint_marked(
+    line: &WrappedLine,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    line_range: (usize, usize),
+    marked: (usize, usize),
+    color: Hsla,
+    window: &mut Window,
+) {
+    for quad in range_quads(line, origin, line_height, line_range, marked) {
+        let underline = Bounds {
+            origin: point(quad.origin.x, quad.origin.y + line_height - px(2.)),
+            size: Size {
+                width: quad.size.width,
+                height: px(2.),
+            },
+        };
+        window.paint_quad(fill(underline, color));
+    }
+}
+
+/// Highlight rectangles for `range` (global bytes) within one line, one per
+/// wrapped segment the range covers.
+fn range_quads(
+    line: &WrappedLine,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    line_range: (usize, usize),
+    range: (usize, usize),
+) -> Vec<Bounds<Pixels>> {
+    let (line_start, line_end) = line_range;
+    if range.0 > line_end {
+        return Vec::new();
+    }
+    let content_len = line_end - line_start;
+    let clip_start = range.0.saturating_sub(line_start).min(content_len);
+    let clip_end = range.1.saturating_sub(line_start).min(content_len);
+
+    let mut quads = Vec::new();
+    if clip_start < clip_end {
+        let starts = segment_starts(line);
+        let unwrapped = &line.unwrapped_layout;
+        for (segment, pair) in starts.windows(2).enumerate() {
+            let start = clip_start.max(pair[0]);
+            let end = clip_end.min(pair[1]);
+            if start >= end {
+                continue;
+            }
+            let base = unwrapped.x_for_index(pair[0]);
+            let x0 = unwrapped.x_for_index(start) - base;
+            let x1 = unwrapped.x_for_index(end) - base;
+            quads.push(Bounds {
+                origin: point(origin.x + x0, origin.y + line_height * segment as f32),
+                size: Size {
+                    width: x1 - x0,
+                    height: line_height,
+                },
+            });
+        }
+    }
+    quads
 }
 
 /// Paints the caret bar for one line at a byte offset within its text.

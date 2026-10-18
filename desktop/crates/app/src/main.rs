@@ -29,7 +29,7 @@ use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::*;
 
-actions!(dainiki, [Save, TogglePreview]);
+actions!(dainiki, [Save, ToggleEditing]);
 
 /// Autosave runs this long after the last keystroke.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -50,22 +50,27 @@ enum Screen {
     Journal(Box<JournalSession>),
 }
 
-/// An open journal: today's entry in the editor, past days for the stream,
-/// autosave and chrome state.
+/// An open journal: the stream of days, with at most one day open for editing.
 struct JournalSession {
-    path: PathBuf,
-    /// Past days with real content — an empty day is no entry. Today is not
-    /// here; the live editor owns it.
+    root: PathBuf,
+    /// The day the editor is editing; `None` = reading the stream.
+    active: Option<ActiveDay>,
+    /// Every day with content except the active one, rendered read-only.
     days: BTreeMap<NaiveDate, String>,
-    editor: Entity<MarkdownEditor>,
-    dirty: bool,
-    last_seen: Option<String>,
-    save_task: Option<Task<()>>,
-    link_input: Entity<InputState>,
-    preview: bool,
     /// The stream's scroll offset; the app owns it so navigation can move it
     /// (and tests can watch it).
     stream_scroll: ScrollHandle,
+}
+
+/// The day currently open in the editor, with its autosave state.
+struct ActiveDay {
+    date: NaiveDate,
+    path: PathBuf,
+    editor: Entity<MarkdownEditor>,
+    link_input: Entity<InputState>,
+    dirty: bool,
+    last_seen: Option<String>,
+    save_task: Option<Task<()>>,
     _editor_events: Subscription,
     _editor_observer: Subscription,
 }
@@ -76,6 +81,13 @@ impl DainikiApp {
             theme,
             config,
             screen: Screen::Welcome { notice: None },
+        }
+    }
+
+    fn session(&self) -> Option<&JournalSession> {
+        match &self.screen {
+            Screen::Journal(session) => Some(session),
+            Screen::Welcome { .. } => None,
         }
     }
 
@@ -105,8 +117,8 @@ impl DainikiApp {
         }
     }
 
-    /// Makes sure today's entry exists, loads it, builds the editor, and
-    /// swaps the screen to the journal.
+    /// Opens the journal with today's entry in the editor and the past days
+    /// loaded for the stream, and swaps the screen to it.
     fn open_session(
         &mut self,
         root: &Path,
@@ -115,10 +127,6 @@ impl DainikiApp {
     ) -> io::Result<()> {
         let journal = journal::Journal::new(root);
         let today = Local::now().date_naive();
-        let path = journal.ensure_entry(today)?;
-        let loaded = persistence::load(&path)?;
-        let content = loaded.clone().unwrap_or_default();
-        let base_dir = path.parent().map(Path::to_path_buf);
 
         // Read the past days for the stream. Days with an empty file are no
         // entry and stay out. (Reading happens once at open; a background
@@ -140,6 +148,34 @@ impl DainikiApp {
             }
         }
 
+        let active = self.open_day(root, today, window, cx)?;
+        tracing::info!(root = %root.display(), path = %active.path.display(), "journal opened");
+        self.screen = Screen::Journal(Box::new(JournalSession {
+            root: root.to_path_buf(),
+            active: Some(active),
+            days,
+            stream_scroll: ScrollHandle::new(),
+        }));
+        cx.notify();
+        Ok(())
+    }
+
+    /// Builds the editing state for one day: ensures the entry exists, loads
+    /// it, builds a fresh editor (undo never crosses days) with the caret at
+    /// the end, and focuses it.
+    fn open_day(
+        &self,
+        root: &Path,
+        date: NaiveDate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> io::Result<ActiveDay> {
+        let journal = journal::Journal::new(root);
+        let path = journal.ensure_entry(date)?;
+        let loaded = persistence::load(&path)?;
+        let content = loaded.clone().unwrap_or_default();
+        let base_dir = path.parent().map(Path::to_path_buf);
+
         let theme = self.theme.clone();
         let buffer = cx.new(|_| Buffer::from_text(&content));
         let editor = cx.new(|cx| {
@@ -147,13 +183,17 @@ impl DainikiApp {
             editor.set_base_dir(base_dir, cx);
             editor
         });
+        editor.update(cx, |editor, cx| editor.place_caret_at_end(cx));
         let link_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("URL to link — select the text first")
         });
         let events = cx.subscribe(&editor, |app, _editor, event, cx| {
             if matches!(event, EditorEvent::Edited) {
-                if let Some(session) = app.session_mut() {
-                    session.dirty = true;
+                if let Some(active) = app
+                    .session_mut()
+                    .and_then(|session| session.active.as_mut())
+                {
+                    active.dirty = true;
                 }
                 app.schedule_save(cx);
                 cx.notify();
@@ -162,22 +202,129 @@ impl DainikiApp {
         let observer = cx.observe(&editor, |_app, _editor, cx| cx.notify());
 
         window.focus(&editor.read(cx).focus_handle().clone(), cx);
-        tracing::info!(root = %root.display(), path = %path.display(), "journal opened");
-        self.screen = Screen::Journal(Box::new(JournalSession {
+        Ok(ActiveDay {
+            date,
             path,
-            days,
             editor,
+            link_input,
             dirty: false,
             last_seen: loaded,
             save_task: None,
-            link_input,
-            preview: false,
-            stream_scroll: ScrollHandle::new(),
             _editor_events: events,
             _editor_observer: observer,
-        }));
+        })
+    }
+
+    // -- editing ----------------------------------------------------------
+
+    /// Opens `date` for editing, flushing and stashing the day being left.
+    fn activate_day(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .session()
+            .and_then(|session| session.active.as_ref())
+            .is_some_and(|active| active.date == date)
+        {
+            return;
+        }
+        self.stop_editing(cx);
+        let Some(root) = self.session().map(|session| session.root.clone()) else {
+            return;
+        };
+        match self.open_day(&root, date, window, cx) {
+            Ok(active) => {
+                if let Some(session) = self.session_mut() {
+                    session.days.remove(&date);
+                    session.active = Some(active);
+                }
+                cx.notify();
+            }
+            Err(error) => {
+                tracing::error!(date = %date, error = %error, "could not open the day");
+            }
+        }
+    }
+
+    /// Flushes the active day's save, stashes its text with the other days,
+    /// and drops the editor — back to reading the stream.
+    fn stop_editing(&mut self, cx: &mut Context<Self>) {
+        self.save_active(cx);
+        let Some(previous) = self.session_mut().and_then(|session| session.active.take()) else {
+            return;
+        };
+        let text = previous.editor.read(cx).content(cx);
+        if let Some(session) = self.session_mut() {
+            if text.trim().is_empty() {
+                session.days.remove(&previous.date);
+            } else {
+                session.days.insert(previous.date, text);
+            }
+        }
         cx.notify();
-        Ok(())
+    }
+
+    fn on_toggle_editing(
+        &mut self,
+        _: &ToggleEditing,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editing = self
+            .session()
+            .is_some_and(|session| session.active.is_some());
+        if editing {
+            self.stop_editing(cx);
+        } else {
+            self.activate_day(Local::now().date_naive(), window, cx);
+        }
+    }
+
+    /// Restarts the debounce window; the previous pending save is dropped.
+    fn schedule_save(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self
+            .session_mut()
+            .and_then(|session| session.active.as_mut())
+        else {
+            return;
+        };
+        active.save_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SAVE_DEBOUNCE).await;
+            this.update(cx, |app, cx| app.save_active(cx)).ok();
+        }));
+    }
+
+    fn save_active(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self
+            .session_mut()
+            .and_then(|session| session.active.as_mut())
+        else {
+            return;
+        };
+        let path = active.path.clone();
+        let text = active.editor.read(cx).content(cx);
+        match persistence::save(&path, &text, active.last_seen.as_deref()) {
+            persistence::SaveOutcome::Saved => {
+                active.dirty = false;
+                let bytes = text.len();
+                active.last_seen = Some(text);
+                tracing::info!(path = %path.display(), bytes, "journal saved");
+            }
+            persistence::SaveOutcome::ConflictCopy(conflict) => {
+                active.dirty = false;
+                active.last_seen = std::fs::read_to_string(&path).ok();
+                tracing::error!(
+                    path = %conflict.display(),
+                    "the journal changed on disk; preserved this version as a conflict copy"
+                );
+            }
+            persistence::SaveOutcome::Failed(error) => {
+                tracing::error!(path = %path.display(), error = %error, "journal save failed");
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
+        self.save_active(cx);
     }
 
     // -- welcome actions ----------------------------------------------------
@@ -250,68 +397,6 @@ impl DainikiApp {
         if let Err(error) = config::save(&self.config) {
             tracing::warn!(root = %root.display(), error = %error, "could not save the journal choice");
         }
-    }
-
-    // -- journal actions ----------------------------------------------------
-
-    /// Restarts the debounce window; the previous pending save is dropped.
-    fn schedule_save(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = self.session_mut() else {
-            return;
-        };
-        session.save_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(SAVE_DEBOUNCE).await;
-            this.update(cx, |app, cx| app.save_now(cx)).ok();
-        }));
-    }
-
-    fn save_now(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = self.session_mut() else {
-            return;
-        };
-        let path = session.path.clone();
-        let text = session.editor.read(cx).content(cx);
-        match persistence::save(&path, &text, session.last_seen.as_deref()) {
-            persistence::SaveOutcome::Saved => {
-                session.dirty = false;
-                let bytes = text.len();
-                session.last_seen = Some(text);
-                tracing::info!(path = %path.display(), bytes, "journal saved");
-            }
-            persistence::SaveOutcome::ConflictCopy(conflict) => {
-                session.dirty = false;
-                session.last_seen = std::fs::read_to_string(&path).ok();
-                tracing::error!(
-                    path = %conflict.display(),
-                    "the journal changed on disk; preserved this version as a conflict copy"
-                );
-            }
-            persistence::SaveOutcome::Failed(error) => {
-                tracing::error!(path = %path.display(), error = %error, "journal save failed");
-            }
-        }
-        cx.notify();
-    }
-
-    fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
-        self.save_now(cx);
-    }
-
-    fn on_toggle_preview(
-        &mut self,
-        _: &TogglePreview,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self.session_mut() else {
-            return;
-        };
-        session.preview = !session.preview;
-        if !session.preview {
-            let focus = session.editor.read(cx).focus_handle().clone();
-            window.focus(&focus, cx);
-        }
-        cx.notify();
     }
 
     fn welcome_view(&self, notice: &Option<String>, cx: &Context<Self>) -> impl IntoElement {
@@ -433,15 +518,20 @@ impl JournalSession {
         theme: &EditorTheme,
         show_empty_days: bool,
         window: &Window,
+        this: WeakEntity<DainikiApp>,
         cx: &App,
     ) -> impl IntoElement {
         let today = Local::now().date_naive();
-        let existing: BTreeSet<NaiveDate> = self.days.keys().copied().collect();
+        let mut existing: BTreeSet<NaiveDate> = self.days.keys().copied().collect();
+        if let Some(active) = &self.active {
+            // The active day is edited, not rendered from the map, but it
+            // still counts as a day that exists.
+            existing.insert(active.date);
+        }
         let dates = journal::stream_dates(&existing, today, show_empty_days);
 
         // The live day gets a capped editing surface inside the stream, so
-        // history is always visible below it; the nested-scroll handoff to a
-        // focused day is the G3 concern.
+        // history is always visible below it.
         let editor_height = px((window.viewport_size().height.as_f32() * 0.55).clamp(320., 440.));
 
         let mut stream = v_flex().gap_8();
@@ -479,25 +569,24 @@ impl JournalSession {
                         .bg(brand::outline_variant().opacity(0.55)),
                 );
 
-            let body: AnyElement = if is_today {
-                if self.preview {
-                    let text = self.editor.read(cx).content(cx);
-                    div().child(markdown(text)).into_any_element()
-                } else {
-                    div()
-                        .h(editor_height)
-                        .child(self.editor.clone())
-                        .into_any_element()
+            let body: AnyElement = match &self.active {
+                Some(active) if active.date == date => div()
+                    .h(editor_height)
+                    .child(active.editor.clone())
+                    .into_any_element(),
+                _ => {
+                    let inner = if let Some(text) = self.days.get(&date) {
+                        div().child(markdown(text.clone())).into_any_element()
+                    } else {
+                        div()
+                            .font_family(brand::SERIF_FAMILY)
+                            .italic()
+                            .text_color(brand::outline())
+                            .child("Nothing written this day — click to write it.")
+                            .into_any_element()
+                    };
+                    clickable_day(this.clone(), date, inner)
                 }
-            } else if let Some(text) = self.days.get(&date) {
-                div().child(markdown(text.clone())).into_any_element()
-            } else {
-                div()
-                    .font_family(brand::SERIF_FAMILY)
-                    .italic()
-                    .text_color(brand::outline())
-                    .child("Nothing written this day.")
-                    .into_any_element()
             };
             stream = stream.child(v_flex().gap_4().child(header).child(body));
         }
@@ -519,12 +608,16 @@ impl JournalSession {
                 ),
         );
 
-        div()
+        let mut column = div()
             .size_full()
             .flex()
             .flex_col()
-            .child(TitleBar::new().child(self.window_title()))
-            .child(
+            .child(TitleBar::new().child(self.window_title()));
+
+        // The toolbar belongs to editing: it appears only while a day is
+        // open in the editor.
+        if let Some(active) = &self.active {
+            column = column.child(
                 div()
                     .w_full()
                     .px_3()
@@ -538,51 +631,81 @@ impl JournalSession {
                             .items_center()
                             .child(
                                 Toolbar::new("editor-toolbar")
-                                    .child(self.inline_toolbar(cx))
-                                    .child(self.block_toolbar(cx)),
+                                    .child(active.inline_toolbar(cx))
+                                    .child(active.block_toolbar(cx)),
                             )
-                            .child(self.insert_menu())
-                            .child(self.preview_toggle())
-                            .child(self.help_menu()),
+                            .child(active.insert_menu())
+                            .child(finish_toggle(this.clone()))
+                            .child(active.help_menu()),
                     ),
-            )
-            .child(
-                div().flex_1().min_h_0().bg(theme.background).child(
-                    div()
-                        .id("timeline")
-                        .relative()
-                        .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.stream_scroll)
-                        .scrollbar(&self.stream_scroll, ScrollbarAxis::Vertical)
-                        .child(
-                            v_flex()
-                                .w_full()
-                                .max_w(px(760.))
-                                .mx_auto()
-                                .px_10()
-                                .py_6()
-                                .child(stream),
-                        ),
-                ),
-            )
+            );
+        }
+
+        column.child(
+            div().flex_1().min_h_0().bg(theme.background).child(
+                div()
+                    .id("timeline")
+                    .relative()
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.stream_scroll)
+                    .scrollbar(&self.stream_scroll, ScrollbarAxis::Vertical)
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .max_w(px(760.))
+                            .mx_auto()
+                            .px_10()
+                            .py_6()
+                            .child(stream),
+                    ),
+            ),
+        )
     }
 
     fn window_title(&self) -> String {
-        let dirty = if self.dirty { " •" } else { "" };
-        format!("Dainiki — {}{dirty}", self.path.display())
+        match &self.active {
+            Some(active) => {
+                let dirty = if active.dirty { " •" } else { "" };
+                format!("Dainiki — {}{dirty}", active.path.display())
+            }
+            None => {
+                let name = self
+                    .root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| self.root.display().to_string());
+                format!("Dainiki — {name}")
+            }
+        }
     }
+}
 
-    fn preview_toggle(&self) -> Toggle {
-        Toggle::new("preview")
-            .label("Read")
-            .tooltip("Reading view — ⌘E")
-            .checked(self.preview)
-            .on_click(move |_checked, window, cx| {
-                window.dispatch_action(Box::new(TogglePreview), cx);
-            })
-    }
+/// Wraps a rendered day so a click opens it for editing.
+fn clickable_day(this: WeakEntity<DainikiApp>, date: NaiveDate, body: AnyElement) -> AnyElement {
+    div()
+        .id(ElementId::Name(format!("day-{date}").into()))
+        .cursor_text()
+        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+            this.update(cx, |app, cx| app.activate_day(date, window, cx))
+                .ok();
+        })
+        .child(body)
+        .into_any_element()
+}
 
+/// Leaves editing and returns to the stream.
+fn finish_toggle(this: WeakEntity<DainikiApp>) -> Toggle {
+    Toggle::new("finish-editing")
+        .label("Done")
+        .tooltip("Finish editing — ⌘E")
+        .checked(false)
+        .on_click(move |_checked, _window, cx| {
+            this.update(cx, |app, cx| app.stop_editing(cx)).ok();
+        })
+}
+
+impl ActiveDay {
     fn inline_toggle(
         &self,
         id: &'static str,
@@ -676,7 +799,7 @@ impl JournalSession {
             ("Word step", "⌥← / ⌥→"),
             ("Line / Document jumps", "⌘← / ⌘↑"),
             ("Save", "⌘S"),
-            ("New line / Tab", "⏎ / ⇥"),
+            ("Finish editing", "⌘E"),
             ("Reveal markup", "click into a construct"),
         ];
         Popover::new("shortcut-help")
@@ -833,16 +956,17 @@ fn copy_image(source: &Path, assets: &Path) -> Result<(String, String), String> 
 
 impl Render for DainikiApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.weak_entity();
         let screen = match &self.screen {
             Screen::Welcome { notice } => self.welcome_view(notice, cx).into_any_element(),
             Screen::Journal(session) => session
-                .view(&self.theme, self.config.show_empty_days, window, cx)
+                .view(&self.theme, self.config.show_empty_days, window, this, cx)
                 .into_any_element(),
         };
         div()
             .size_full()
             .on_action(cx.listener(Self::on_save))
-            .on_action(cx.listener(Self::on_toggle_preview))
+            .on_action(cx.listener(Self::on_toggle_editing))
             .child(screen)
     }
 }
@@ -867,7 +991,7 @@ fn main() {
         brand::apply_component_theme(cx);
         cx.bind_keys([
             KeyBinding::new("cmd-s", Save, None),
-            KeyBinding::new("cmd-e", TogglePreview, None),
+            KeyBinding::new("cmd-e", ToggleEditing, None),
         ]);
         open_app_window(cx, config, root.clone()).expect("failed to open the Dainiki window");
         cx.activate(true);
@@ -959,6 +1083,13 @@ mod tests {
         dir
     }
 
+    /// Writes a past day's entry into the journal.
+    fn seed_day(journal: &journal::Journal, date: NaiveDate, text: &str) {
+        let path = journal.entry_path(date);
+        fs::create_dir_all(path.parent().unwrap()).expect("dirs");
+        fs::write(&path, text).expect("seed");
+    }
+
     #[test]
     fn no_argument_resolves_to_nothing() {
         assert_eq!(resolve_cli_root(None), None);
@@ -989,6 +1120,12 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn day_labels_name_the_day() {
+        let earlier = NaiveDate::from_ymd_opt(2026, 10, 5).expect("date");
+        assert_eq!(day_label(earlier), "Monday, 5 October 2026");
+    }
+
     #[gpui::test]
     async fn the_app_starts_on_the_welcome_screen(cx: &mut TestAppContext) {
         init(cx);
@@ -1004,10 +1141,110 @@ mod tests {
         });
     }
 
-    #[test]
-    fn day_labels_name_the_day() {
-        let earlier = NaiveDate::from_ymd_opt(2026, 10, 5).expect("date");
-        assert_eq!(day_label(earlier), "Monday, 5 October 2026");
+    #[gpui::test]
+    async fn entering_a_journal_creates_and_loads_todays_entry(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let path = journal.ensure_entry(today).expect("ensure");
+        fs::write(&path, "# written earlier today\n").expect("seed");
+
+        // A past day with content joins the stream; an empty past day is not
+        // an entry.
+        let yesterday = today.pred_opt().expect("yesterday");
+        let blank_day = yesterday.pred_opt().expect("earlier");
+        seed_day(&journal, yesterday, "# yesterday's words\n");
+        seed_day(&journal, blank_day, "   \n");
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            let active = session.active.as_ref().expect("today is open for editing");
+            assert_eq!(active.date, today);
+            assert_eq!(active.path, path);
+            assert_eq!(
+                active.editor.read(cx).content(cx),
+                "# written earlier today\n"
+            );
+            assert_eq!(session.days.len(), 1, "only the day with content streams");
+            assert_eq!(
+                session.days.get(&yesterday).map(String::as_str),
+                Some("# yesterday's words\n")
+            );
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn activating_a_day_swaps_the_live_editor(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let yesterday = today.pred_opt().expect("yesterday");
+        seed_day(&journal, yesterday, "# yesterday's words\n");
+        let today_path = journal.entry_path(today);
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+
+        // Open yesterday for editing.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.activate_day(yesterday, window, cx));
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            let active = session.active.as_ref().expect("editing yesterday");
+            assert_eq!(active.date, yesterday);
+            assert_eq!(active.editor.read(cx).content(cx), "# yesterday's words\n");
+            assert!(
+                !session.days.contains_key(&yesterday),
+                "the active day is not also rendered"
+            );
+            assert!(today_path.is_file(), "leaving today flushed it to disk");
+        });
+
+        // Finish editing: everything renders read-only again.
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| app.stop_editing(cx));
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert!(session.active.is_none(), "editing finished");
+            assert_eq!(
+                session.days.get(&yesterday).map(String::as_str),
+                Some("# yesterday's words\n")
+            );
+        });
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[gpui::test]
@@ -1019,13 +1256,7 @@ mod tests {
         let mut date = today;
         for _ in 0..12 {
             let day = date.pred_opt().expect("previous day");
-            let path = journal.entry_path(day);
-            fs::create_dir_all(path.parent().unwrap()).expect("dirs");
-            fs::write(
-                &path,
-                format!("# {day}\n\nSome words written for this day.\n"),
-            )
-            .expect("seed");
+            seed_day(&journal, day, "# day\n\nSome words written for this day.\n");
             date = day;
         }
 
@@ -1060,53 +1291,6 @@ mod tests {
                 session.stream_scroll.offset().y != px(0.),
                 "the stream did not scroll: {:?}",
                 session.stream_scroll.offset()
-            );
-        });
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[gpui::test]
-    async fn entering_a_journal_creates_and_loads_todays_entry(cx: &mut TestAppContext) {
-        init(cx);
-        let dir = scratch_dir();
-        let journal = journal::Journal::new(&dir);
-        let today = Local::now().date_naive();
-        let path = journal.ensure_entry(today).expect("ensure");
-        fs::write(&path, "# written earlier today\n").expect("seed");
-
-        // A past day with content joins the stream; an empty past day is not
-        // an entry.
-        let yesterday = today.pred_opt().expect("yesterday");
-        let blank_day = yesterday.pred_opt().expect("earlier");
-        for (date, text) in [(yesterday, "# yesterday's words\n"), (blank_day, "   \n")] {
-            let day_path = journal.entry_path(date);
-            fs::create_dir_all(day_path.parent().unwrap()).expect("dirs");
-            fs::write(&day_path, text).expect("seed");
-        }
-
-        let (app, cx) = cx.add_window_view({
-            let dir = dir.clone();
-            move |window, cx| {
-                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
-                app.enter_journal(dir, window, cx);
-                app
-            }
-        });
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-            let app = app.read(cx);
-            let Screen::Journal(session) = &app.screen else {
-                panic!("expected an open journal session");
-            };
-            assert_eq!(session.path, path);
-            assert_eq!(
-                session.editor.read(cx).content(cx),
-                "# written earlier today\n"
-            );
-            assert_eq!(session.days.len(), 1, "only the day with content streams");
-            assert_eq!(
-                session.days.get(&yesterday).map(String::as_str),
-                Some("# yesterday's words\n")
             );
         });
         fs::remove_dir_all(&dir).ok();

@@ -196,15 +196,21 @@ impl Render for Workbench {
             .flex_col()
             .child(self.toolbar(cx))
             .child(
-                div().flex_1().w_full().flex().justify_center().child(
-                    div()
-                        .w_full()
-                        .max_w(px(720.0))
-                        .h_full()
-                        .px_6()
-                        .py_6()
-                        .child(self.editor.clone()),
-                ),
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(720.0))
+                            .h_full()
+                            .px_6()
+                            .py_6()
+                            .child(self.editor.clone()),
+                    ),
             )
     }
 }

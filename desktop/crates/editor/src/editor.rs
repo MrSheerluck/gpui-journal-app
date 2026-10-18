@@ -1931,6 +1931,61 @@ mod interaction_tests {
         });
     }
 
+    /// The harness mounts a fixed-height toolbar above the editor inside a
+    /// flex column. If the middle row cannot shrink (CSS-style `min-height:
+    /// auto`), the editor measures itself to its content and every scroll is
+    /// clamped away. This mounts that exact structure.
+    #[gpui::test]
+    async fn a_toolbar_above_the_editor_keeps_it_scrollable(cx: &mut TestAppContext) {
+        struct Harness {
+            editor: Entity<MarkdownEditor>,
+        }
+        impl Render for Harness {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(div().h(px(40.)).w_full().child("toolbar"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .w_full()
+                            .flex()
+                            .child(div().w_full().h_full().child(self.editor.clone())),
+                    )
+            }
+        }
+
+        let text = "line\n".repeat(120);
+        let buffer = cx.new(|_| Buffer::from_text(&text));
+        let theme = EditorTheme::default();
+        let editor = cx.new(|cx| MarkdownEditor::new(buffer, theme, cx));
+        let editor_for_view = editor.clone();
+        let (_harness, cx) = cx.add_window_view(move |window, cx| {
+            let focus_handle = editor_for_view.read(cx).focus_handle().clone();
+            window.focus(&focus_handle, cx);
+            Harness {
+                editor: editor_for_view,
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_, app| {
+            let max_offset = editor.read(app).scroll.max_offset();
+            assert!(
+                max_offset > px(0.),
+                "the editor measured itself to its content and lost its scroll range"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn backspace_and_undo_work(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx, "abc");

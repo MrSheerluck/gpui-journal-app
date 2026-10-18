@@ -114,7 +114,12 @@ pub fn grapheme_right(text: &str, local: usize) -> usize {
 /// Advances over one class of graphemes starting at `(ix, local)`; returns the
 /// first position holding the opposite class. Word-class scanning stops at a
 /// line end (words do not span line breaks); non-word scanning crosses lines.
-fn scan_forward(buffer: &Buffer, mut ix: usize, mut local: usize, want_word: bool) -> (usize, usize) {
+fn scan_forward(
+    buffer: &Buffer,
+    mut ix: usize,
+    mut local: usize,
+    want_word: bool,
+) -> (usize, usize) {
     loop {
         let text = buffer.line_text(ix);
         while local < text.len() {
@@ -133,7 +138,7 @@ fn scan_forward(buffer: &Buffer, mut ix: usize, mut local: usize, want_word: boo
 }
 
 fn prev_grapheme(text: &str, local: usize) -> (usize, &str) {
-    match text[..local].grapheme_indices(true).last() {
+    match text[..local].grapheme_indices(true).next_back() {
         Some((start, grapheme)) => (start, grapheme),
         None => (0, ""),
     }

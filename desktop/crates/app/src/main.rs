@@ -27,6 +27,7 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants, Toggle, ToggleGroup};
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
+use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarAxis};
@@ -199,6 +200,8 @@ impl DainikiApp {
             return;
         }
         self.config.theme = preference;
+        // Tests exercise this path; never write the real user config from them.
+        #[cfg(not(test))]
         if let Err(error) = config::save(&self.config) {
             tracing::warn!(error = %error, "could not save preferences");
         }
@@ -856,6 +859,9 @@ impl DainikiApp {
                 .close_button(false)
                 .w(px(560.))
                 .margin_top(px(96.))
+                // Instant placement: a palette should feel like it appears in
+                // place, not slides into it.
+                .entrance(DialogEntrance::Fade)
                 .content(move |content, _window, _cx| {
                     // A `Fn` content builder: clone what each callback takes.
                     let confirm_this = confirm_this.clone();
@@ -907,24 +913,22 @@ impl DainikiApp {
         let this = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _window, cx| {
             let this = this.clone();
-            let (show_empty_days, theme_preference) = this
+            let theme_preference = this
                 .upgrade()
-                .map(|app| {
-                    let app = app.read(cx);
-                    (app.config.show_empty_days, app.config.theme)
-                })
-                .unwrap_or((true, config::ThemePreference::System));
+                .map(|app| app.read(cx).config.theme)
+                .unwrap_or(config::ThemePreference::System);
 
-            let toggle_this = this.clone();
             let picker_this = this.clone();
             let reveal_root = root.clone();
 
             dialog
                 .title("Settings")
-                .w(px(520.))
+                .w(px(440.))
+                // A fade keeps the surface at its final bounds from the first
+                // frame, so clicks land where the picker is drawn.
+                .entrance(DialogEntrance::Fade)
                 .content(move |content, _window, _cx| {
                     // A `Fn` content builder: clone what each callback takes.
-                    let toggle_this = toggle_this.clone();
                     let picker_this = picker_this.clone();
                     let reveal_root = reveal_root.clone();
                     content.child(
@@ -934,27 +938,12 @@ impl DainikiApp {
                                 h_flex()
                                     .justify_between()
                                     .items_center()
-                                    .child(
-                                        div().text_size(px(12.)).child("Show days without entries"),
-                                    )
-                                    .child(
-                                        Toggle::new("show-empty-days")
-                                            .checked(show_empty_days)
-                                            .on_click(move |checked, _window, cx| {
-                                                toggle_this
-                                                    .update(cx, |app, cx| {
-                                                        app.set_show_empty_days(*checked, cx)
-                                                    })
-                                                    .ok();
-                                            }),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .items_center()
                                     .child(div().text_size(px(12.)).child("Theme"))
-                                    .child(theme_picker(picker_this.clone(), theme_preference)),
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "theme-pref".to_string())
+                                            .child(theme_picker(picker_this, theme_preference)),
+                                    ),
                             )
                             .child(
                                 v_flex()
@@ -1260,20 +1249,6 @@ impl DainikiApp {
         if let Err(error) = config::save(&self.config) {
             tracing::warn!(root = %root.display(), error = %error, "could not save the journal choice");
         }
-    }
-
-    /// Persists a preferences change (the in-memory value stays authoritative
-    /// for this session even when the write fails). Note: never call this from
-    /// tests — it writes the real user config.
-    fn set_show_empty_days(&mut self, show: bool, cx: &mut Context<Self>) {
-        if self.config.show_empty_days == show {
-            return;
-        }
-        self.config.show_empty_days = show;
-        if let Err(error) = config::save(&self.config) {
-            tracing::warn!(error = %error, "could not save preferences");
-        }
-        cx.notify();
     }
 
     fn welcome_view(&self, notice: &Option<String>, cx: &Context<Self>) -> impl IntoElement {
@@ -3207,29 +3182,32 @@ fn resolve_mode(preference: config::ThemePreference, appearance: WindowAppearanc
     }
 }
 
-/// The System/Light/Dark picker. The group callback owns the change: the
-/// component replaces per-toggle callbacks inside a group.
+/// The System/Light/Dark picker. The group callback owns the change (the
+/// component replaces per-toggle callbacks inside a group) and decodes the
+/// *flipped* index: a segmented group toggles one item without clearing the
+/// others, so `next` can hold two truths at once.
 fn theme_picker(this: WeakEntity<DainikiApp>, current: config::ThemePreference) -> ToggleGroup {
     use config::ThemePreference as Pref;
+    let known = [
+        current == Pref::System,
+        current == Pref::Light,
+        current == Pref::Dark,
+    ];
     ToggleGroup::new("theme-pref")
         .segmented()
         .child(
             Toggle::new("theme-system")
                 .label("System")
-                .checked(current == Pref::System),
+                .checked(known[0]),
         )
-        .child(
-            Toggle::new("theme-light")
-                .label("Light")
-                .checked(current == Pref::Light),
-        )
-        .child(
-            Toggle::new("theme-dark")
-                .label("Dark")
-                .checked(current == Pref::Dark),
-        )
+        .child(Toggle::new("theme-light").label("Light").checked(known[1]))
+        .child(Toggle::new("theme-dark").label("Dark").checked(known[2]))
         .on_click(move |next: &Vec<bool>, window, cx| {
-            let Some(index) = next.iter().position(|checked| *checked) else {
+            let Some(index) = next
+                .iter()
+                .zip(&known)
+                .position(|(now, before)| now != before)
+            else {
                 return;
             };
             let preference = [Pref::System, Pref::Light, Pref::Dark][index];
@@ -4200,6 +4178,93 @@ mod tests {
                 window.has_active_dialog(cx),
                 "the settings row opens the modal"
             );
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn the_settings_picker_switches_the_theme(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        seed_day(&journal, today, "# hello\n");
+
+        let (app, mut cx) = add_rooted_app(cx, &dir);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_settings(window, cx));
+        });
+        cx.run_until_parked();
+        // Let the dialog's entrance animation settle so the geometry below
+        // is its resting position.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(600));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // The Dark segment sits at the right end of the picker; System at the
+        // left. Clicks on the ends stay clear of the segment boundaries, and
+        // the bounds are re-read per click: switching themes re-lays the modal
+        // out.
+        let click_end = |cx: &mut VisualTestContext, from_right: bool| {
+            let picker = cx
+                .debug_bounds("theme-pref")
+                .expect("the theme picker renders in the modal");
+            let x = if from_right {
+                picker.origin.x + picker.size.width - px(12.)
+            } else {
+                picker.origin.x + px(12.)
+            };
+            cx.simulate_click(
+                point(x, picker.origin.y + picker.size.height / 2.),
+                gpui::Modifiers::default(),
+            );
+        };
+
+        let previous = cx.update(|_window, cx| app.read(cx).config.theme);
+
+        click_end(&mut cx, true);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let app = app.read(cx);
+            assert_eq!(
+                app.config.theme,
+                config::ThemePreference::Dark,
+                "clicking Dark must choose the dark theme"
+            );
+            assert_eq!(
+                brand::mode(),
+                brand::Mode::Dark,
+                "the palette must follow the preference"
+            );
+        });
+
+        // Clicking the other end switches again, and the modal stays open.
+        click_end(&mut cx, false);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert!(
+                window.has_active_dialog(cx),
+                "the modal survives the theme switch"
+            );
+            let app = app.read(cx);
+            assert_eq!(
+                app.config.theme,
+                config::ThemePreference::System,
+                "clicking System must choose the system theme"
+            );
+        });
+
+        // Leave the process-global palette as the tests found it.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.set_theme_preference(previous, window, cx));
         });
         fs::remove_dir_all(&dir).ok();
     }

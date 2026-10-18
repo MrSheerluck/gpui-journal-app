@@ -2,16 +2,20 @@
 
 mod persistence;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use dainiki_editor::{
     Buffer, EditorEvent, EditorTheme, MarkdownEditor,
     commands::{BlockFormat, InlineFormat},
 };
+use gpui_kit::component::Disableable;
 use gpui_kit::component::TitleBar;
-use gpui_kit::component::button::{Toggle, ToggleGroup};
+use gpui_kit::component::button::{Button, Toggle, ToggleGroup};
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::toolbar::Toolbar;
+use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::*;
 
 actions!(dainiki, [Save]);
@@ -34,7 +38,9 @@ struct DainikiApp {
     path: Option<PathBuf>,
     dirty: bool,
     save_task: Option<Task<()>>,
+    link_input: Entity<InputState>,
     _editor_events: Subscription,
+    _editor_observer: Subscription,
 }
 
 impl DainikiApp {
@@ -42,8 +48,12 @@ impl DainikiApp {
         editor: Entity<MarkdownEditor>,
         theme: EditorTheme,
         path: Option<PathBuf>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let link_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("URL to link — select the text first")
+        });
         let events = cx.subscribe(&editor, |app, _editor, event, cx| {
             if matches!(event, EditorEvent::Edited) {
                 app.dirty = true;
@@ -51,14 +61,16 @@ impl DainikiApp {
                 cx.notify();
             }
         });
-        cx.observe(&editor, |_app, _editor, cx| cx.notify());
+        let observer = cx.observe(&editor, |_app, _editor, cx| cx.notify());
         Self {
             editor,
             theme,
             path,
             dirty: false,
             save_task: None,
+            link_input,
             _editor_events: events,
+            _editor_observer: observer,
         }
     }
 
@@ -157,6 +169,142 @@ impl DainikiApp {
             self.inline_toggle("code", "`", InlineFormat::Code, cx),
         ])
     }
+
+    fn insert_menu(&self) -> Popover {
+        let editor = self.editor.clone();
+        let link_input = self.link_input.clone();
+        let document_dir = self
+            .path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+
+        let link_editor = editor.clone();
+        let link_state = link_input.clone();
+        let fence_editor = editor.clone();
+        let rule_editor = editor.clone();
+        let image_editor = editor.clone();
+        let image_dir = document_dir.clone();
+
+        Popover::new("insert-menu")
+            .trigger(Button::new("insert-trigger").label("Insert").compact())
+            .content(move |_state, _window, _cx| {
+                let link = Button::new("insert-link")
+                    .label("Link")
+                    .compact()
+                    .on_click({
+                        let editor = link_editor.clone();
+                        let input = link_state.clone();
+                        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            let url = input.read(cx).value().to_string();
+                            let url = url.trim().to_string();
+                            if url.is_empty() {
+                                return;
+                            }
+                            editor.update(cx, |editor, cx| editor.insert_link(&url, cx));
+                            input.update(cx, |input, cx| input.set_value("", window, cx));
+                        }
+                    });
+                let image = Button::new("insert-image")
+                    .label("Image…")
+                    .compact()
+                    .disabled(image_dir.is_none())
+                    .on_click({
+                        let editor = image_editor.clone();
+                        let directory = image_dir.clone();
+                        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            let Some(directory) = directory.clone() else {
+                                return;
+                            };
+                            let prompt = cx.prompt_for_paths(PathPromptOptions {
+                                files: true,
+                                directories: false,
+                                multiple: false,
+                                prompt: Some("Choose an image".into()),
+                            });
+                            let editor = editor.clone();
+                            window
+                                .spawn(cx, async move |cx| {
+                                    let Ok(Ok(Some(paths))) = prompt.await else {
+                                        return;
+                                    };
+                                    let Some(source) = paths.into_iter().next() else {
+                                        return;
+                                    };
+                                    let assets = directory.join("assets");
+                                    let copied = cx
+                                        .background_executor()
+                                        .spawn(async move { copy_image(&source, &assets) })
+                                        .await;
+                                    let Ok((alt, relative)) = copied else {
+                                        return;
+                                    };
+                                    editor.update(cx, |editor, cx| {
+                                        editor.insert_image(&alt, &relative, cx)
+                                    });
+                                })
+                                .detach();
+                        }
+                    });
+                let fence = Button::new("insert-fence")
+                    .label("Code fence")
+                    .compact()
+                    .on_click({
+                        let editor = fence_editor.clone();
+                        move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                            editor.update(cx, |editor, cx| editor.insert_code_fence(cx));
+                        }
+                    });
+                let rule = Button::new("insert-rule")
+                    .label("Horizontal rule")
+                    .compact()
+                    .on_click({
+                        let editor = rule_editor.clone();
+                        move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                            editor.update(cx, |editor, cx| editor.insert_rule(cx));
+                        }
+                    });
+
+                v_flex()
+                    .w(px(300.))
+                    .gap_2()
+                    .child(Input::new(&link_state))
+                    .child(h_flex().gap_2().child(link).child(image))
+                    .child(h_flex().gap_2().child(fence).child(rule))
+            })
+    }
+}
+
+/// Copies an image into the journal's `assets/` folder under a fresh name,
+/// returning `(alt text, relative markdown path)`.
+fn copy_image(source: &Path, assets: &Path) -> Result<(String, String), String> {
+    std::fs::create_dir_all(assets).map_err(|error| error.to_string())?;
+    let stem = source
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "image".to_string());
+    let extension = source
+        .extension()
+        .map(|extension| extension.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut counter = 0usize;
+    let name = loop {
+        let name = if counter == 0 {
+            source
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "image".to_string())
+        } else if extension.is_empty() {
+            format!("{stem}-{counter}")
+        } else {
+            format!("{stem}-{counter}.{extension}")
+        };
+        if !assets.join(&name).exists() {
+            break name;
+        }
+        counter += 1;
+    };
+    std::fs::copy(source, assets.join(&name)).map_err(|error| error.to_string())?;
+    Ok((stem, format!("assets/{name}")))
 }
 
 impl Render for DainikiApp {
@@ -169,9 +317,15 @@ impl Render for DainikiApp {
             .child(TitleBar::new().child(self.window_title()))
             .child(
                 div().w_full().px_3().py_1().child(
-                    Toolbar::new("editor-toolbar")
-                        .child(self.inline_toolbar(cx))
-                        .child(self.block_toolbar(cx)),
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Toolbar::new("editor-toolbar")
+                                .child(self.inline_toolbar(cx))
+                                .child(self.block_toolbar(cx)),
+                        )
+                        .child(self.insert_menu()),
                 ),
             )
             .child(
@@ -236,7 +390,7 @@ fn open_app_window(cx: &mut App, path: Option<PathBuf>) -> Result<()> {
         });
         let focus_handle = editor.read(cx).focus_handle().clone();
         window.focus(&focus_handle, cx);
-        cx.new(|cx| DainikiApp::new(editor, theme, path, cx))
+        cx.new(|cx| DainikiApp::new(editor, theme, path, window, cx))
     })?;
 
     Ok(())

@@ -14,7 +14,7 @@ use crate::{
         Fragment, FragmentKind, InlineStyle, MediaKind, ProjectedLine, Style as LineStyle,
         WidgetKind,
     },
-    editor::{ImageState, MarkdownEditor},
+    editor::{ImageState, MarkdownEditor, MediaPlaybackState},
     input::scroll::{EditorScrollState, clamp_offset},
     theme::EditorTheme,
 };
@@ -247,6 +247,7 @@ impl Element for EditorElement {
             marked_range,
             plan,
             images,
+            media_states,
             reveal_pending,
             hover_task,
         ) = {
@@ -259,6 +260,7 @@ impl Element for EditorElement {
                 view.marked_range(),
                 view.plan(),
                 view.image_metrics(),
+                view.media_states(),
                 view.reveal_pending(),
                 view.hover_task(),
             )
@@ -358,6 +360,7 @@ impl Element for EditorElement {
                                 kind,
                                 &path,
                                 &images,
+                                media_states.get(&path),
                                 bounds,
                                 &theme,
                                 window,
@@ -689,6 +692,7 @@ fn paint_media_line(
     kind: MediaKind,
     path: &str,
     images: &std::collections::HashMap<String, ImageState>,
+    playback: Option<&MediaPlaybackState>,
     bounds: Bounds<Pixels>,
     theme: &EditorTheme,
     window: &mut Window,
@@ -790,27 +794,42 @@ fn paint_media_line(
                     card.origin.y + card.size.height / 2.,
                 ),
             };
-            paint_media_button(button_center, button_radius, false, theme, window);
+            let playing = playback.is_some_and(|state| state.playing);
+            paint_media_button(button_center, button_radius, playing, theme, window);
             let label_x = match kind {
                 MediaKind::Video => card.origin.x + px(12.),
                 _ => card.origin.x + px(12.) + button_radius * 2. + px(12.),
             };
+            let label = match playback.and_then(|state| state.error.as_deref()) {
+                Some(error) => format!("{} — {error}", file_name(path)),
+                None => file_name(path).to_string(),
+            };
             paint_label(
-                file_name(path),
+                &label,
                 point(label_x, card.origin.y + card.size.height - px(22.)),
                 theme,
                 window,
                 cx,
             );
-            // The progress track; the filled part arrives with playback state.
-            let track = Bounds {
+            // The progress track and its elapsed portion, when known.
+            let track_bounds = Bounds {
                 origin: point(
                     card.origin.x + px(12.),
                     card.origin.y + card.size.height - px(10.),
                 ),
                 size: gpui::size((card.size.width - px(24.)).max(px(0.)), px(2.)),
             };
-            window.paint_quad(fill(track, theme.media_track).corner_radii(1.));
+            window.paint_quad(fill(track_bounds, theme.media_track).corner_radii(1.));
+            if let Some(state) = playback
+                && let Some(duration) = state.duration_ms.filter(|duration| *duration > 0)
+            {
+                let fraction = (state.position_ms as f32 / duration as f32).clamp(0., 1.);
+                let elapsed = Bounds {
+                    origin: track_bounds.origin,
+                    size: gpui::size(track_bounds.size.width * fraction, track_bounds.size.height),
+                };
+                window.paint_quad(fill(elapsed, theme.media_progress).corner_radii(1.));
+            }
         }
         MediaKind::File => {
             let label = format!("▢ {}", file_name(path));

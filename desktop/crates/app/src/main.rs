@@ -6,6 +6,7 @@
 mod brand;
 mod config;
 mod journal;
+mod media;
 mod persistence;
 
 use std::cell::Cell;
@@ -16,7 +17,7 @@ use std::time::Duration;
 
 use chrono::{Datelike, Local, NaiveDate};
 use dainiki_editor::{
-    Buffer, EditorEvent, EditorTheme, MarkdownEditor,
+    Buffer, EditorEvent, EditorTheme, MarkdownEditor, MediaKind,
     commands::{BlockFormat, InlineFormat},
 };
 use gpui_kit::assets::IconName;
@@ -49,6 +50,9 @@ actions!(
 
 /// Autosave runs this long after the last keystroke.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// While something plays, the player's state is pushed this often.
+const MEDIA_TICK: Duration = Duration::from_millis(100);
 
 /// The app shell. A chosen folder turns into a [`JournalSession`]; until then
 /// the welcome screen asks for one.
@@ -115,6 +119,10 @@ struct JournalSession {
     pending_submit: Cell<bool>,
     /// A date the next rendered frame should reveal in the stream.
     pending_reveal: Cell<Option<NaiveDate>>,
+    /// The open day's media player.
+    media: media::Player,
+    /// Whether the playback tick loop is running.
+    media_ticks: Cell<bool>,
     _jump_events: Subscription,
     _search_events: Subscription,
 }
@@ -313,6 +321,8 @@ impl DainikiApp {
             calendar_month: (today.year(), today.month()),
             pending_submit: Cell::new(false),
             pending_reveal: Cell::new(None),
+            media: media::Player::platform(),
+            media_ticks: Cell::new(false),
             _jump_events: jump_events,
             _search_events: search_events,
         }));
@@ -368,8 +378,8 @@ impl DainikiApp {
         let link_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("URL to link — select the text first")
         });
-        let events = cx.subscribe(&editor, |app, _editor, event, cx| {
-            if matches!(event, EditorEvent::Edited) {
+        let events = cx.subscribe(&editor, |app, _editor, event, cx| match event {
+            EditorEvent::Edited => {
                 if let Some(active) = app
                     .session_mut()
                     .and_then(|session| session.active.as_mut())
@@ -379,6 +389,11 @@ impl DainikiApp {
                 app.schedule_save(cx);
                 cx.notify();
             }
+            EditorEvent::MediaToggle {
+                destination,
+                resolved,
+                kind,
+            } => app.on_media_toggle(destination.clone(), resolved.clone(), *kind, cx),
         });
         let observer = cx.observe(&editor, |_app, _editor, cx| cx.notify());
 
@@ -426,12 +441,17 @@ impl DainikiApp {
     }
 
     /// Flushes the active day's save, stashes its text with the other days,
-    /// and drops the editor — back to reading the stream.
+    /// and drops the editor — back to reading the stream. Media playback
+    /// belongs to the open day: it stops here too.
     fn stop_editing(&mut self, cx: &mut Context<Self>) {
         self.save_active(cx);
         let Some(previous) = self.session_mut().and_then(|session| session.active.take()) else {
             return;
         };
+        if let Some(session) = self.session_mut() {
+            session.media.stop();
+            session.media_ticks.set(false);
+        }
         let text = previous.editor.read(cx).content(cx);
         if let Some(session) = self.session_mut() {
             if text.trim().is_empty() {
@@ -461,6 +481,94 @@ impl DainikiApp {
                 self.activate_day(today, window, cx);
             }
         }
+    }
+
+    // -- media ------------------------------------------------------------
+
+    /// The editor asked for playback: toggle the medium, push the state
+    /// back, and keep a tick running while it plays.
+    fn on_media_toggle(
+        &mut self,
+        destination: String,
+        resolved: PathBuf,
+        kind: MediaKind,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut() else {
+            return;
+        };
+        tracing::info!(destination = %destination, kind = ?kind, "media toggled");
+        let state = session.media.toggle(&destination, &resolved, kind);
+        if let Some(error) = state.error.clone() {
+            let label = match session.media.kind() {
+                Some(MediaKind::Video) => "video",
+                _ => "audio",
+            };
+            session.status = Some(format!(
+                "Could not play the {label} {} — {error}",
+                resolved
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| resolved.display().to_string()),
+            ));
+        }
+        let editor = session.active.as_ref().map(|active| active.editor.clone());
+        if let Some(editor) = editor {
+            editor.update(cx, |editor, cx| {
+                editor.set_media_state(&destination, state, cx)
+            });
+        }
+        if session.media.playing() {
+            self.ensure_media_tick(cx);
+        }
+        cx.notify();
+    }
+
+    /// Starts the playback tick unless it is already running.
+    fn ensure_media_tick(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.session_mut() else {
+            return;
+        };
+        if session.media_ticks.replace(true) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(MEDIA_TICK).await;
+                let keep_going = this
+                    .update(cx, |app, cx| app.media_tick(cx))
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// One playback tick: pushes the player's state to the open editor.
+    /// Returns whether the loop should keep running (a pause ends it; the
+    /// widget keeps its position without repainting).
+    fn media_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.session_mut() else {
+            return false;
+        };
+        let Some((destination, state)) = session.media.state() else {
+            session.media_ticks.set(false);
+            return false;
+        };
+        let keep_going = session.media.playing();
+        let editor = session.active.as_ref().map(|active| active.editor.clone());
+        if let Some(editor) = editor {
+            editor.update(cx, |editor, cx| {
+                editor.set_media_state(&destination, state, cx)
+            });
+        }
+        if !keep_going {
+            session.media_ticks.set(false);
+        }
+        cx.notify();
+        keep_going
     }
 
     /// Restarts the debounce window; the previous pending save is dropped.

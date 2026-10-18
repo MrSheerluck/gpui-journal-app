@@ -31,9 +31,30 @@ const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(16);
 pub enum EditorEvent {
     /// The buffer text changed: typing, deletion, paste, or undo/redo.
     Edited,
+    /// A media widget was activated: the host should start playback and push
+    /// state back through [`MarkdownEditor::set_media_state`].
+    MediaToggle {
+        /// The destination as written in the document (`assets/take.mp3`).
+        destination: String,
+        /// The same destination resolved against the entry's folder.
+        resolved: PathBuf,
+        kind: MediaKind,
+    },
 }
 
 impl EventEmitter<EditorEvent> for MarkdownEditor {}
+
+/// Playback state the host pushes back for one media destination.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MediaPlaybackState {
+    pub playing: bool,
+    /// Elapsed playback time.
+    pub position_ms: u64,
+    /// Total length, when the host knows it.
+    pub duration_ms: Option<u64>,
+    /// A playback failure to show on the widget.
+    pub error: Option<String>,
+}
 
 pub struct MarkdownEditor {
     buffer: Entity<Buffer>,
@@ -60,6 +81,8 @@ pub struct MarkdownEditor {
     autoscroll_active: bool,
     base_dir: Option<PathBuf>,
     images: HashMap<String, ImageState>,
+    /// Host-pushed playback state per media destination.
+    media_states: HashMap<String, MediaPlaybackState>,
     pending_edit: Option<PendingEdit>,
     slash: Option<SlashMenu>,
     /// A slash position the user dismissed with Escape; no menu re-opens
@@ -127,6 +150,7 @@ impl MarkdownEditor {
             autoscroll_active: false,
             base_dir: None,
             images: HashMap::new(),
+            media_states: HashMap::new(),
             pending_edit: None,
             slash: None,
             slash_dismissed: None,
@@ -385,9 +409,30 @@ impl MarkdownEditor {
     pub fn set_base_dir(&mut self, dir: Option<PathBuf>, cx: &mut Context<Self>) {
         self.base_dir = dir;
         self.images.clear();
+        self.media_states.clear();
         self.pending_edit = Some(PendingEdit::Full);
         self.revision += 1;
         cx.notify();
+    }
+
+    /// Pushes playback state for one media destination so the widget can show
+    /// it. Hosts call this on every meaningful change and while playing.
+    pub fn set_media_state(
+        &mut self,
+        destination: &str,
+        state: MediaPlaybackState,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self.media_states.get(destination) != Some(&state);
+        if changed {
+            self.media_states.insert(destination.to_string(), state);
+            cx.notify();
+        }
+    }
+
+    /// Snapshot of playback states for painting.
+    pub(crate) fn media_states(&self) -> HashMap<String, MediaPlaybackState> {
+        self.media_states.clone()
     }
 
     /// The resolved filesystem path for an image destination.
@@ -514,6 +559,20 @@ impl MarkdownEditor {
             && let Some((marker, WidgetKind::Task { checked })) = hit.widget
         {
             self.toggle_task(marker, checked, cx);
+            return;
+        }
+        // A plain click on an audio or video widget asks the host to play it.
+        if event.click_count == 1
+            && !event.modifiers.platform
+            && let Some((_, WidgetKind::Media { kind, path })) = &hit.widget
+            && matches!(kind, MediaKind::Audio | MediaKind::Video)
+        {
+            let resolved = self.resolved_asset_path(path);
+            cx.emit(EditorEvent::MediaToggle {
+                destination: path.clone(),
+                resolved,
+                kind: *kind,
+            });
             return;
         }
         if event.modifiers.platform && !event.modifiers.shift {
@@ -1697,6 +1756,43 @@ mod interaction_tests {
             assert!(
                 editor.read(app).hover_task().is_none(),
                 "hover should clear away from the checkbox"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn clicking_an_audio_widget_asks_the_host_to_play(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let (editor, cx) = setup(cx, "\n![](assets/take.mp3)\n");
+        let toggles: Rc<RefCell<Vec<(String, MediaKind)>>> = Rc::default();
+        let sink = toggles.clone();
+        // The subscription must outlive the update call: dropping it
+        // unsubscribes.
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&editor, move |_, event: &EditorEvent, _| {
+                if let EditorEvent::MediaToggle {
+                    destination, kind, ..
+                } = event
+                {
+                    sink.borrow_mut().push((destination.clone(), *kind));
+                }
+            })
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let y = cx.update(|_, app| {
+            let editor = editor.read(app);
+            editor.layout.line_top(1).expect("second line top") + px(10.)
+        });
+        cx.simulate_click(point(px(80.), y), gpui::Modifiers::default());
+        cx.update(|_, _| {
+            assert_eq!(
+                toggles.borrow().as_slice(),
+                &[("assets/take.mp3".to_string(), MediaKind::Audio)],
+                "a click on the audio row toggles playback"
             );
         });
     }

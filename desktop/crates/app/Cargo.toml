@@ -22,3 +22,11 @@ trash = "=5.2.9"
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 gpui_platform.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-av-foundation = "0.3"
+objc2-avf-audio = { version = "0.3", features = ["AVAudioPlayer"] }
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-foundation = "0.3"

@@ -24,6 +24,14 @@ impl EditorScrollState {
         changed
     }
 
+    /// Moves the offset to an absolute position, clamped to the layout.
+    pub fn set_offset(&self, offset: Pixels) -> bool {
+        let next = clamp_offset(offset, self.max_offset());
+        let changed = next != self.offset.get();
+        self.offset.set(next);
+        changed
+    }
+
     pub(crate) fn clamp_to_layout(&self) {
         self.offset
             .set(clamp_offset(self.offset.get(), self.max_offset()));

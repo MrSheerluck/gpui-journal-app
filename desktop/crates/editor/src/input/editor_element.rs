@@ -1,9 +1,10 @@
 use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
-    App, AvailableSpace, Bounds, DefiniteLength, Element, ElementId, ElementInputHandler, Entity,
-    GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Length, Pixels, Point,
-    SharedString, Size, Style, Window, WrappedLine, fill, point, px,
+    App, AvailableSpace, Bounds, DefiniteLength, DispatchPhase, Element, ElementId,
+    ElementInputHandler, Entity, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId,
+    Length, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, Style, Window,
+    WrappedLine, fill, point, px,
 };
 
 use crate::{
@@ -202,15 +203,53 @@ impl Element for EditorElement {
             ElementInputHandler::new(bounds, self.view.clone()),
             cx,
         );
-        let show_selection = !selection_state.is_caret();
-        let selection = (selection_state.start(), selection_state.end());
-        let show_caret = caret_visible && !show_selection && focus_handle.is_focused(window);
-        let caret = if show_caret {
+        let drag_view = self.view.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+            if phase == DispatchPhase::Bubble {
+                drag_view.update(cx, |editor, cx| editor.on_drag_move(event.position, cx));
+            }
+        });
+        let up_view = self.view.clone();
+        window.on_mouse_event(move |_event: &MouseUpEvent, phase, _window, cx| {
+            if phase == DispatchPhase::Bubble {
+                up_view.update(cx, |editor, cx| editor.end_drag(cx));
+            }
+        });
+
+        // Reveal the caret before painting: while focused with a collapsed
+        // caret, keep it inside the viewport with one line of margin.
+        let caret_position = if focus_handle.is_focused(window) && selection_state.is_caret() {
             let buffer = self.buffer.read(cx);
             Some(buffer.offset_to_line(selection_state.head()))
         } else {
             None
         };
+        if let Some((line_ix, local)) = caret_position
+            && line_ix < inner.lines.len()
+        {
+            let line_height = inner.line_height;
+            let mut caret_top = Pixels::ZERO;
+            for line in &inner.lines[..line_ix] {
+                caret_top += line.size(inner.line_height).height;
+            }
+            if let Some(segment) = inner.lines[line_ix].position_for_index(local, inner.line_height)
+            {
+                caret_top += segment.y;
+            }
+            let target = reveal_offset(
+                caret_top,
+                line_height,
+                bounds.size.height,
+                self.scroll.offset(),
+                line_height,
+            );
+            self.scroll.set_offset(target);
+        }
+
+        let show_selection = !selection_state.is_caret();
+        let selection = (selection_state.start(), selection_state.end());
+        let show_caret = caret_visible && !show_selection && focus_handle.is_focused(window);
+        let caret = if show_caret { caret_position } else { None };
         let line_ranges: Vec<(usize, usize)> = if show_selection || marked_range.is_some() {
             let buffer = self.buffer.read(cx);
             (0..buffer.len_lines())
@@ -432,6 +471,25 @@ fn segment_starts(line: &WrappedLine) -> Vec<usize> {
     starts
 }
 
+/// The scroll offset that keeps a caret of `caret_height` at content position
+/// `caret_top` visible within the viewport, holding `margin` on both edges.
+/// Returns `current` when the caret is already comfortably visible.
+fn reveal_offset(
+    caret_top: Pixels,
+    caret_height: Pixels,
+    viewport_height: Pixels,
+    current: Pixels,
+    margin: Pixels,
+) -> Pixels {
+    if caret_top - current < margin {
+        caret_top - margin
+    } else if caret_top + caret_height - current > viewport_height - margin {
+        caret_top + caret_height + margin - viewport_height
+    } else {
+        current
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct EditorLayout(Rc<RefCell<Option<EditorLayoutInner>>>);
 
@@ -489,6 +547,44 @@ impl EditorLayout {
             top += height;
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reveal_offset;
+    use gpui::px;
+
+    #[test]
+    fn reveal_keeps_visible_carets_in_place() {
+        assert_eq!(
+            reveal_offset(px(300.), px(20.), px(600.), px(100.), px(20.)),
+            px(100.)
+        );
+        assert_eq!(
+            reveal_offset(px(120.), px(20.), px(600.), px(100.), px(20.)),
+            px(100.)
+        );
+        assert_eq!(
+            reveal_offset(px(560.), px(20.), px(600.), px(100.), px(20.)),
+            px(100.)
+        );
+    }
+
+    #[test]
+    fn reveal_pulls_carets_past_the_margins() {
+        assert_eq!(
+            reveal_offset(px(110.), px(20.), px(600.), px(100.), px(20.)),
+            px(90.)
+        );
+        assert_eq!(
+            reveal_offset(px(700.), px(20.), px(600.), px(100.), px(20.)),
+            px(140.)
+        );
+        assert_eq!(
+            reveal_offset(px(10.), px(20.), px(600.), px(0.), px(20.)),
+            px(-10.)
+        );
     }
 }
 

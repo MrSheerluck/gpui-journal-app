@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use gpui::{
     Bounds, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollWheelEvent,
-    UTF16Selection, Window, div, point, prelude::*, px, size,
+    MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollWheelEvent, UTF16Selection, Window,
+    div, point, prelude::*, px, size,
 };
 
 use crate::{
@@ -19,6 +19,7 @@ use crate::{
 };
 
 const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(16);
 
 pub struct MarkdownEditor {
     buffer: Entity<Buffer>,
@@ -32,6 +33,9 @@ pub struct MarkdownEditor {
     caret_visible: bool,
     blink_epoch: u64,
     focused: bool,
+    dragging: bool,
+    drag_position: Point<Pixels>,
+    autoscroll_active: bool,
 }
 
 impl MarkdownEditor {
@@ -48,6 +52,9 @@ impl MarkdownEditor {
             caret_visible: true,
             blink_epoch: 0,
             focused: false,
+            dragging: false,
+            drag_position: Point::default(),
+            autoscroll_active: false,
         };
         this.spawn_blink(cx);
         this
@@ -126,6 +133,8 @@ impl MarkdownEditor {
         window.focus(&self.focus_handle, cx);
         self.restart_blink();
         self.history.break_run();
+        self.dragging = true;
+        self.drag_position = event.position;
         let Some(offset) = self.offset_for_point(event.position, cx) else {
             return;
         };
@@ -158,22 +167,95 @@ impl MarkdownEditor {
         cx.notify();
     }
 
-    fn on_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if event.pressed_button != Some(MouseButton::Left) {
+    pub(crate) fn on_drag_move(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.dragging {
             return;
         }
-        let Some(offset) = self.offset_for_point(event.position, cx) else {
-            return;
-        };
-        self.selection.move_head(offset);
-        self.history.break_run();
+        self.drag_position = position;
+        if let Some(offset) = self.offset_for_point(position, cx) {
+            self.selection.move_head(offset);
+        }
+        if self.over_edge() {
+            self.autoscroll_tick(cx);
+            self.ensure_autoscroll(cx);
+        }
         self.restart_blink();
         cx.notify();
+    }
+
+    pub(crate) fn end_drag(&mut self, _cx: &mut Context<Self>) {
+        self.dragging = false;
+    }
+
+    fn over_edge(&self) -> bool {
+        let Some(bounds) = self.layout.bounds() else {
+            return false;
+        };
+        let margin = self.layout.line_height().unwrap_or(px(20.));
+        autoscroll_step(
+            self.drag_position.y,
+            bounds.origin.y,
+            bounds.origin.y + bounds.size.height,
+            margin,
+        )
+        .is_some()
+    }
+
+    /// Scrolls one step toward the pointer while it is past the viewport edge
+    /// during a drag; returns whether more scrolling is expected.
+    fn autoscroll_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.dragging {
+            return false;
+        }
+        let Some(bounds) = self.layout.bounds() else {
+            return false;
+        };
+        let margin = self.layout.line_height().unwrap_or(px(20.));
+        let Some(step) = autoscroll_step(
+            self.drag_position.y,
+            bounds.origin.y,
+            bounds.origin.y + bounds.size.height,
+            margin,
+        ) else {
+            return false;
+        };
+        if !self.scroll.scroll_by(step) {
+            return false;
+        }
+        if let Some(offset) = self.offset_for_point(self.drag_position, cx) {
+            self.selection.move_head(offset);
+        }
+        self.restart_blink();
+        cx.notify();
+        true
+    }
+
+    /// Keeps one autoscroll task alive while the pointer rests past an edge:
+    /// the task ticks every frame-ish interval and ends itself when there is
+    /// no more to scroll or the drag is over.
+    fn ensure_autoscroll(&mut self, cx: &mut Context<Self>) {
+        if self.autoscroll_active {
+            return;
+        }
+        self.autoscroll_active = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTOSCROLL_INTERVAL).await;
+                let running = this
+                    .update(cx, |editor, cx| {
+                        let running = editor.autoscroll_tick(cx);
+                        if !running {
+                            editor.autoscroll_active = false;
+                        }
+                        running
+                    })
+                    .unwrap_or(false);
+                if !running {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Hit-tests a window position to a byte offset: the shaped line containing
@@ -447,6 +529,23 @@ fn snap_index(index: Result<usize, usize>) -> usize {
     }
 }
 
+/// One autoscroll step toward a pointer past the top or bottom edge of the
+/// viewport; `None` while the pointer is inside the margins.
+fn autoscroll_step(
+    pointer_y: Pixels,
+    top: Pixels,
+    bottom: Pixels,
+    margin: Pixels,
+) -> Option<Pixels> {
+    if pointer_y < top + margin {
+        Some(-margin)
+    } else if pointer_y > bottom - margin {
+        Some(margin)
+    } else {
+        None
+    }
+}
+
 /// Converts a UTF-16 offset inside `text` to a byte offset. An offset inside a
 /// surrogate pair rounds down to the character's start.
 fn utf16_to_byte_in(text: &str, utf16_offset: usize) -> usize {
@@ -675,7 +774,6 @@ impl Render for MarkdownEditor {
             .text_color(self.theme.text)
             .track_focus(&self.focus_handle)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .child(EditorElement::new(
@@ -689,9 +787,10 @@ impl Render for MarkdownEditor {
 
 #[cfg(test)]
 mod tests {
-    use super::{deletion_range, utf16_to_byte_in};
+    use super::{autoscroll_step, deletion_range, utf16_to_byte_in};
     use crate::buffer::Buffer;
     use crate::input::Selection;
+    use gpui::px;
 
     #[test]
     fn utf16_offsets_inside_text_round_down() {
@@ -778,6 +877,26 @@ mod tests {
         assert_eq!(
             deletion_range(&buffer, selection, false, true, true),
             Some(6..11)
+        );
+    }
+
+    #[test]
+    fn autoscroll_steps_toward_pointer_past_edges() {
+        let (top, bottom, margin) = (px(100.), px(700.), px(20.));
+        assert_eq!(autoscroll_step(px(400.), top, bottom, margin), None);
+        assert_eq!(autoscroll_step(px(120.), top, bottom, margin), None);
+        assert_eq!(autoscroll_step(px(680.), top, bottom, margin), None);
+        assert_eq!(
+            autoscroll_step(px(110.), top, bottom, margin),
+            Some(px(-20.))
+        );
+        assert_eq!(
+            autoscroll_step(px(95.), top, bottom, margin),
+            Some(px(-20.))
+        );
+        assert_eq!(
+            autoscroll_step(px(690.), top, bottom, margin),
+            Some(px(20.))
         );
     }
 

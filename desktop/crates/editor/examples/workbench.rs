@@ -40,7 +40,11 @@ markers. Headings collapse to real sizes once the caret leaves their line.
 Scroll to the end to confirm the indicator reaches the bottom and the last line
 stays fully visible above it:
 
-    cargo run -p dainiki-editor --example workbench -- ~/journal/2026-10-17.md
+```rust
+fn main() {
+    build_a_journal();
+}
+```
 
 One more paragraph so the sample reliably overflows a 640 pt window. Editing is
 still caret-and-keyboard only: deletion, undo and mouse selection arrive in

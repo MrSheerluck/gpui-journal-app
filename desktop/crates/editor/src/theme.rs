@@ -9,6 +9,8 @@ pub struct EditorTheme {
     pub selection: Hsla,
     /// Background chip behind inline code.
     pub code_background: Hsla,
+    /// Background across fenced code block content lines.
+    pub code_block_background: Hsla,
     /// Background behind `==highlight==`.
     pub highlight_background: Hsla,
     /// Family used for inline code and fenced code.
@@ -26,6 +28,7 @@ impl Default for EditorTheme {
             caret: rgb(0x2F6FEB).into(),
             selection: rgba(0x2F6FEB33).into(),
             code_background: rgba(0x0000000F).into(),
+            code_block_background: rgba(0x00000012).into(),
             highlight_background: rgba(0xFFD54A80).into(),
             mono_font_family: SharedString::new_static("Menlo"),
             heading_scales: [1.6, 1.35, 1.15],

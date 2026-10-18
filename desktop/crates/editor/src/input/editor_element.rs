@@ -100,15 +100,22 @@ impl Element for EditorElement {
                 let mut content_size: Size<Pixels> = Size::default();
                 for projected in &plan.lines {
                     let scale = match projected.style {
-                        LineStyle::Body | LineStyle::Quote => 1.0,
+                        LineStyle::Body | LineStyle::Quote | LineStyle::Code { .. } => 1.0,
                         LineStyle::Heading { level } => theme.heading_scale(level),
                     };
                     let font_size = base_font_size * scale;
                     let line_height = base_line_height * scale;
                     let mut style = text_style.clone();
                     style.font_size = font_size.into();
-                    if projected.style == LineStyle::Quote {
-                        style.color = theme.text.opacity(0.65);
+                    match projected.style {
+                        LineStyle::Quote => style.color = theme.text.opacity(0.65),
+                        LineStyle::Code { marker } => {
+                            style.font_family = theme.mono_font_family.clone();
+                            if marker {
+                                style.color = theme.text.opacity(0.35);
+                            }
+                        }
+                        _ => {}
                     }
                     let runs = shape_runs(projected, &style, &theme);
                     let shaped = window.text_system().shape_text(
@@ -279,6 +286,16 @@ impl Element for EditorElement {
                 let line_bottom = line_origin.y + height;
                 if line_bottom > bounds.origin.y && line_origin.y < viewport_bottom {
                     if let Some(projected) = plan.lines.get(ix) {
+                        if matches!(projected.style, LineStyle::Code { marker: false }) {
+                            let block = Bounds {
+                                origin: line_origin,
+                                size: Size {
+                                    width: bounds.size.width,
+                                    height,
+                                },
+                            };
+                            window.paint_quad(fill(block, theme.code_block_background));
+                        }
                         if show_selection {
                             paint_selection(
                                 &laid.wrapped,

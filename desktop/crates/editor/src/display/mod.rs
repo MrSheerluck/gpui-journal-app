@@ -20,6 +20,10 @@ pub enum Style {
     },
     /// A blockquote line: dimmed content behind a `▎` bar.
     Quote,
+    /// A line inside a fenced code block; markers are the ``` lines.
+    Code {
+        marker: bool,
+    },
 }
 
 /// Inline character-level styles carried as display runs.
@@ -290,6 +294,19 @@ fn project_line(
                             widget: WidgetKind::Rule,
                         },
                     ));
+                }
+            }
+            ConstructKind::Fence => {
+                let is_marker_line = construct
+                    .markers
+                    .iter()
+                    .any(|marker| marker.start < source.end && source.start < marker.end);
+                if is_marker_line {
+                    if !line_revealed(&source, selection) {
+                        line_style = Style::Code { marker: true };
+                    }
+                } else if line_style == Style::Body {
+                    line_style = Style::Code { marker: false };
                 }
             }
             ConstructKind::Emphasis
@@ -716,5 +733,21 @@ mod tests {
         assert_eq!(line.source_for_display(7), 5);
         assert_eq!(line.source_for_display(8), 6);
         assert_eq!(line.source_for_display(99), 10);
+    }
+
+    #[test]
+    fn fences_style_markers_and_content_lines() {
+        let text = "before\n\n```rust\nfn main() {}\n```\n\nafter\n";
+        let plan = plan_for(text, Selection::caret(0));
+        assert_eq!(plan.lines[2].style, Style::Code { marker: true });
+        assert_eq!(plan.lines[3].style, Style::Code { marker: false });
+        assert_eq!(plan.lines[4].style, Style::Code { marker: true });
+        assert_eq!(plan.lines[6].style, Style::Body);
+
+        // Per-line reveal: the marker line under the caret shows source.
+        let marker_line_start = text.find("```rust").unwrap();
+        let plan = plan_for(text, Selection::caret(marker_line_start + 2));
+        assert_eq!(plan.lines[2].style, Style::Body);
+        assert_eq!(plan.lines[4].style, Style::Code { marker: true });
     }
 }

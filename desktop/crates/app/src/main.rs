@@ -92,6 +92,11 @@ struct JournalSession {
     search_open: bool,
     /// The settings panel's open state.
     settings_open: bool,
+    /// The session's "today", captured at open; a timer rolls it over past
+    /// midnight.
+    today: NaiveDate,
+    /// Set by the rollover timer; processed in render (which has a window).
+    pending_rollover: Cell<bool>,
     /// A day whose delete is awaiting confirmation.
     pending_delete: Option<NaiveDate>,
     /// A message shown in the status banner (save or trash failures).
@@ -203,6 +208,7 @@ impl DainikiApp {
         let active = self.open_day(root, today, window, cx)?;
 
         let watcher = start_watcher(root, cx);
+        start_rollover_timer(cx);
         let jump_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("YYYY-MM-DD, or “today”"));
         let jump_events = cx.subscribe(&jump_input, |app, _input, event: &InputEvent, cx| {
@@ -238,6 +244,8 @@ impl DainikiApp {
             search_input,
             search_open: false,
             settings_open: false,
+            today,
+            pending_rollover: Cell::new(false),
             pending_delete: None,
             status: None,
             _watcher: watcher,
@@ -388,7 +396,10 @@ impl DainikiApp {
         if editing {
             self.stop_editing(cx);
         } else {
-            self.activate_day(Local::now().date_naive(), window, cx);
+            let today = self.session().map(|session| session.today);
+            if let Some(today) = today {
+                self.activate_day(today, window, cx);
+            }
         }
     }
 
@@ -484,7 +495,7 @@ impl DainikiApp {
     /// Opens `date` for editing and reveals it in the stream. The future is
     /// clamped to today — the stream never shows days that have not happened.
     fn jump_to(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
-        let today = Local::now().date_naive();
+        let today = self.session().map_or(date, |session| session.today);
         let date = date.min(today);
         self.activate_day(date, window, cx);
         if let Some(session) = self.session_mut() {
@@ -636,6 +647,29 @@ impl DainikiApp {
         if let Some(session) = self.session_mut() {
             session.status = None;
         }
+        cx.notify();
+    }
+
+    // -- midnight rollover --------------------------------------------------
+
+    /// The session's "today" is captured at open; a timer asks for a rollover
+    /// when the wall clock passes midnight. Whatever was open belongs to the
+    /// old date and is flushed first; the new day then opens.
+    fn roll_over_if_needed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Local::now().date_naive();
+        let Some(session) = self.session() else {
+            return;
+        };
+        if now <= session.today {
+            return;
+        }
+        tracing::info!(from = %session.today, to = %now, "rolling the journal over midnight");
+        self.stop_editing(cx);
+        if let Some(session) = self.session_mut() {
+            session.today = now;
+            session.pending_reveal.set(Some(now));
+        }
+        self.activate_day(now, window, cx);
         cx.notify();
     }
 
@@ -1013,7 +1047,7 @@ impl JournalSession {
         this: WeakEntity<DainikiApp>,
         cx: &App,
     ) -> impl IntoElement {
-        let today = Local::now().date_naive();
+        let today = self.today;
         let mut existing: BTreeSet<NaiveDate> = self.days.keys().copied().collect();
         if let Some(active) = &self.active {
             // The active day is edited, not rendered from the map, but it
@@ -1469,7 +1503,11 @@ impl JournalSession {
                                 move |_, window, cx| {
                                     today_this
                                         .update(cx, |app, cx| {
-                                            app.jump_to(Local::now().date_naive(), window, cx)
+                                            if let Some(today) =
+                                                app.session().map(|session| session.today)
+                                            {
+                                                app.jump_to(today, window, cx);
+                                            }
                                         })
                                         .ok();
                                 },
@@ -1519,7 +1557,11 @@ impl JournalSession {
                                     .on_click(move |_, window, cx| {
                                         today_this
                                             .update(cx, |app, cx| {
-                                                app.jump_to(Local::now().date_naive(), window, cx)
+                                                if let Some(today) =
+                                                    app.session().map(|session| session.today)
+                                                {
+                                                    app.jump_to(today, window, cx);
+                                                }
                                             })
                                             .ok();
                                     }),
@@ -1905,7 +1947,7 @@ impl JournalSession {
             .map(|first| first.format("%B %Y").to_string())
             .unwrap_or_default();
         let grid = month_grid(year, month);
-        let today = Local::now().date_naive();
+        let today = self.today;
         let mut with_entries: BTreeSet<NaiveDate> = self.days.keys().copied().collect();
         if let Some(date) = active_date {
             with_entries.insert(date);
@@ -2512,6 +2554,39 @@ fn start_watcher(
     None
 }
 
+/// Wakes the app every half minute so a session that crosses midnight rolls
+/// over to the new day instead of writing to yesterday's file. The check
+/// itself runs in render, where a window exists to open the new day with.
+#[cfg(not(test))]
+fn start_rollover_timer(cx: &mut Context<DainikiApp>) {
+    cx.spawn(async move |this, cx| {
+        loop {
+            cx.background_executor()
+                .timer(Duration::from_secs(30))
+                .await;
+            let alive = this
+                .update(cx, |app, cx| {
+                    if let Some(session) = app.session()
+                        && Local::now().date_naive() > session.today
+                    {
+                        session.pending_rollover.set(true);
+                        cx.notify();
+                    }
+                })
+                .is_ok();
+            if !alive {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
+/// Tests drive `roll_over_if_needed` directly; a looping timer task would
+/// keep the deterministic scheduler from ever parking.
+#[cfg(test)]
+fn start_rollover_timer(_cx: &mut Context<DainikiApp>) {}
+
 /// The title bar every screen shares: the logo, the wordmark, and whatever
 /// sits on either side.
 fn brand_title_bar(left_extra: Option<AnyElement>, right: Option<AnyElement>) -> TitleBar {
@@ -2622,6 +2697,13 @@ impl Render for DainikiApp {
             .and_then(|session| session.pending_reload.take())
         {
             self.reload_active_day(date, window, cx);
+        }
+        // The rollover timer asks for a new day past midnight.
+        if self
+            .session()
+            .is_some_and(|session| session.pending_rollover.take())
+        {
+            self.roll_over_if_needed(window, cx);
         }
         let this = cx.weak_entity();
         let screen = match &self.screen {
@@ -3378,6 +3460,71 @@ mod tests {
             assert!(!session.search_open);
             assert!(!session.filter.is_active());
             assert_eq!(session.stream.item_count(), 4);
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn midnight_rollover_opens_the_new_day(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let yesterday = today.pred_opt().expect("yesterday");
+        let yesterday_path = journal.entry_path(yesterday);
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // Pretend the session started yesterday: the open day is yesterday,
+        // and someone typed into it.
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| {
+                if let Some(session) = app.session_mut() {
+                    session.today = yesterday;
+                }
+                cx.notify();
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.jump_to(yesterday, window, cx));
+            let _ = window.draw(cx);
+        });
+        cx.simulate_input("old words typed before midnight");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.roll_over_if_needed(window, cx));
+            let _ = window.draw(cx);
+        });
+
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert_eq!(session.today, today, "the session moved to the new day");
+            let active = session.active.as_ref().expect("the new day is open");
+            assert_eq!(active.date, today);
+            let flushed = fs::read_to_string(&yesterday_path).expect("yesterday flushed");
+            assert!(
+                flushed.contains("old words typed before midnight"),
+                "the old day was flushed before the rollover: {flushed:?}"
+            );
         });
         fs::remove_dir_all(&dir).ok();
     }

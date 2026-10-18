@@ -31,6 +31,9 @@ markers. Headings collapse to real sizes once the caret leaves their line.
 
 - Unicode shaping works too: héllo - 日本語 - emoji 🎉
 - This second item exists mainly to make the list rhythm visible.
+- [ ] Click this checkbox: it toggles without moving the caret, and one undo
+      restores it.
+- [x] This one starts checked.
 
 > A quote line, rendered as plain text for now.
 

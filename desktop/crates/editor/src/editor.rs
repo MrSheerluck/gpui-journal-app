@@ -10,7 +10,7 @@ use gpui::{
 
 use crate::{
     buffer::Buffer,
-    display::DisplayPlan,
+    display::{DisplayPlan, WidgetKind},
     input::{
         EditorElement, EditorLayout, EditorScrollState, Selection,
         history::{Edit, History, MergeKind},
@@ -180,14 +180,20 @@ impl MarkdownEditor {
         self.history.break_run();
         self.dragging = true;
         self.drag_position = event.position;
-        let Some(offset) = self.offset_for_point(event.position, cx) else {
+        let Some(hit) = self.hit_test(event.position, cx) else {
             return;
         };
+        if event.click_count == 1
+            && let Some((marker, WidgetKind::Task { checked })) = hit.widget
+        {
+            self.toggle_task(marker, checked, cx);
+            return;
+        }
         match event.click_count {
             2 => {
                 let run = {
                     let buffer = self.buffer.read(cx);
-                    movement::run_at(buffer, offset)
+                    movement::run_at(buffer, hit.offset)
                 };
                 self.selection = Selection::new(run.start, run.end);
             }
@@ -195,20 +201,44 @@ impl MarkdownEditor {
                 let (start, end) = {
                     let buffer = self.buffer.read(cx);
                     (
-                        movement::line_start(buffer, offset),
-                        movement::line_end(buffer, offset),
+                        movement::line_start(buffer, hit.offset),
+                        movement::line_end(buffer, hit.offset),
                     )
                 };
                 self.selection = Selection::new(start, end);
             }
             _ => {
                 if event.modifiers.shift {
-                    self.selection.move_head(offset);
+                    self.selection.move_head(hit.offset);
                 } else {
-                    self.selection.collapse(offset);
+                    self.selection.collapse(hit.offset);
                 }
             }
         }
+        cx.notify();
+    }
+
+    /// Toggles a task checkbox in place: one undo step, caret untouched.
+    fn toggle_task(&mut self, marker: Range<usize>, checked: bool, cx: &mut Context<Self>) {
+        let text = if checked { "[ ]" } else { "[x]" };
+        let selection_before = self.selection;
+        let removed = self
+            .buffer
+            .update(cx, |buffer, _| buffer.replace(marker.clone(), text));
+        self.history.record(
+            Edit {
+                range: marker,
+                removed,
+                inserted: text.to_string(),
+                selection_before,
+                selection_after: selection_before,
+                kind: MergeKind::None,
+            },
+            MergeKind::None,
+        );
+        self.revision += 1;
+        self.restart_blink();
+        cx.emit(EditorEvent::Edited);
         cx.notify();
     }
 
@@ -303,24 +333,44 @@ impl MarkdownEditor {
         .detach();
     }
 
-    /// Hit-tests a window position to a byte offset: the shaped line containing
-    /// the y coordinate, then the grapheme boundary closest to x, mapped from
-    /// display space back to source.
-    fn offset_for_point(&self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<usize> {
+    /// The byte offset a window position hits, plus the widget under the
+    /// pointer when the click landed on one.
+    fn hit_test(&self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<PointHit> {
         let bounds = self.layout.bounds()?;
         let content_y = position.y - bounds.origin.y + self.scroll.offset();
         if content_y < Pixels::ZERO {
-            return Some(0);
+            return Some(PointHit {
+                offset: 0,
+                widget: None,
+            });
         }
         let Some((line_ix, within_line)) = self.layout.line_at_y(content_y) else {
-            return Some(self.buffer.read(cx).len_bytes());
+            return Some(PointHit {
+                offset: self.buffer.read(cx).len_bytes(),
+                widget: None,
+            });
         };
         let projected = self.plan.lines.get(line_ix)?;
         let x = position.x - bounds.origin.x;
         let display = self.layout.with_line(line_ix, |line, height| {
             snap_index(line.closest_index_for_position(point(x, within_line), height))
         })?;
-        Some(projected.source.start + projected.source_for_display(display))
+        let widget = projected.widget_at_display(display).or_else(|| {
+            display
+                .checked_sub(1)
+                .and_then(|d| projected.widget_at_display(d))
+        });
+        Some(PointHit {
+            offset: projected.source.start + projected.source_for_display(display),
+            widget,
+        })
+    }
+
+    /// Hit-tests a window position to a byte offset: the shaped line containing
+    /// the y coordinate, then the grapheme boundary closest to x, mapped from
+    /// display space back to source.
+    fn offset_for_point(&self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<usize> {
+        self.hit_test(position, cx).map(|hit| hit.offset)
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -595,6 +645,13 @@ fn autoscroll_step(
     } else {
         None
     }
+}
+
+/// A hit-test result: the source offset for the caret and, when the click
+/// landed on a widget, the widget's source range and kind.
+struct PointHit {
+    offset: usize,
+    widget: Option<(Range<usize>, WidgetKind)>,
 }
 
 /// Converts a UTF-16 offset inside `text` to a byte offset. An offset inside a

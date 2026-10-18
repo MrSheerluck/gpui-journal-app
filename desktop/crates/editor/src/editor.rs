@@ -187,6 +187,17 @@ impl MarkdownEditor {
         buffer.slice(0..buffer.len_bytes())
     }
 
+    /// Collapses the caret to the end of the entry. Hosts call this when they
+    /// swap the buffer to a day the user just opened, so typing continues
+    /// where the entry left off. The next render reveals the caret.
+    pub fn place_caret_at_end(&mut self, cx: &mut Context<Self>) {
+        let end = self.buffer.read(cx).len_bytes();
+        self.selection = Selection::caret(end);
+        self.history.break_run();
+        self.restart_blink();
+        cx.notify();
+    }
+
     /// The current display projection (cheap `Rc` clone).
     pub(crate) fn plan(&self) -> Rc<DisplayPlan> {
         self.plan.clone()

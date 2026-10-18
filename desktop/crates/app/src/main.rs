@@ -23,7 +23,7 @@ use gpui_kit::component::button::{Button, ButtonVariants, Toggle, ToggleGroup};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::scroll::{ScrollableElement, ScrollbarAxis};
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::text::markdown;
 use gpui_kit::component::toolbar::Toolbar;
@@ -64,6 +64,9 @@ struct JournalSession {
     save_task: Option<Task<()>>,
     link_input: Entity<InputState>,
     preview: bool,
+    /// The stream's scroll offset; the app owns it so navigation can move it
+    /// (and tests can watch it).
+    stream_scroll: ScrollHandle,
     _editor_events: Subscription,
     _editor_observer: Subscription,
 }
@@ -170,6 +173,7 @@ impl DainikiApp {
             save_task: None,
             link_input,
             preview: false,
+            stream_scroll: ScrollHandle::new(),
             _editor_events: events,
             _editor_observer: observer,
         }));
@@ -473,9 +477,12 @@ impl JournalSession {
             .child(
                 div().flex_1().min_h_0().bg(theme.background).child(
                     div()
-                        .size_full()
-                        .overflow_y_scrollbar()
                         .id("timeline")
+                        .relative()
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.stream_scroll)
+                        .scrollbar(&self.stream_scroll, ScrollbarAxis::Vertical)
                         .child(
                             v_flex()
                                 .w_full()
@@ -867,7 +874,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use chrono::{Local, NaiveDate};
-    use gpui::TestAppContext;
+    use gpui::{ScrollDelta, ScrollWheelEvent, TestAppContext, point, px};
 
     // NOTE: no `use super::*` here. The crate root glob-imports `gpui_kit::*`,
     // which re-exports gpui's `test` proc macro; globbing it in would shadow
@@ -942,6 +949,61 @@ mod tests {
         let earlier = NaiveDate::from_ymd_opt(2026, 10, 5).expect("date");
         assert_eq!(day_label(earlier, today), "Monday, 5 October 2026");
         assert_eq!(day_label(today, today), "Today · Monday, 19 October 2026");
+    }
+
+    #[gpui::test]
+    async fn the_stream_scrolls_through_history(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let mut date = today;
+        for _ in 0..12 {
+            let day = date.pred_opt().expect("previous day");
+            let path = journal.entry_path(day);
+            fs::create_dir_all(path.parent().unwrap()).expect("dirs");
+            fs::write(
+                &path,
+                format!("# {day}\n\nSome words written for this day.\n"),
+            )
+            .expect("seed");
+            date = day;
+        }
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(EditorTheme::default(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // A wheel over today's (short) editor must chain through to the
+        // stream instead of being swallowed.
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(400.), px(300.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-240.))),
+            ..Default::default()
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert!(
+                session.stream_scroll.offset().y != px(0.),
+                "the stream did not scroll: {:?}",
+                session.stream_scroll.offset()
+            );
+        });
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[gpui::test]

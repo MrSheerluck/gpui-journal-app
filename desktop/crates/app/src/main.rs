@@ -86,7 +86,7 @@ struct JournalSession {
     /// Tags over the non-active days; the active day's tags merge in per
     /// render, so the sidebar follows the open editor.
     tags: BTreeMap<String, BTreeSet<NaiveDate>>,
-    /// What the stream is narrowed to (a tag, a search query, or both).
+    /// What the stream is narrowed to (a tag).
     filter: Filter,
     /// The virtualized stream: one item per visible-range day, plus the edge.
     stream: ListState,
@@ -131,7 +131,7 @@ struct JournalSession {
     _jump_events: Subscription,
 }
 
-/// What the stream is narrowed to: a tag, a search query, or both.
+/// What the stream is narrowed to: a tag.
 #[derive(Default, Clone, Debug, PartialEq)]
 struct Filter {
     tag: Option<String>,
@@ -2099,7 +2099,7 @@ impl JournalSession {
                             }),
                     )
                     .child(
-                        // Search: opens the search bar (cmd-F).
+                        // Search: opens the search palette (cmd-F).
                         h_flex()
                             .justify_between()
                             .items_center()

@@ -1,0 +1,14 @@
+[package]
+name = "dainiki-desktop"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "Dainiki desktop app: journal shell around the Markdown editor."
+
+[dependencies]
+gpui-kit = "=0.7.3"
+dainiki-editor = { path = "../editor" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]

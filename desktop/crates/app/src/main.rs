@@ -22,7 +22,7 @@ use dainiki_editor::{
 use gpui_kit::component::Disableable;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::button::{Button, ButtonVariants, Toggle, ToggleGroup};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarAxis};
 use gpui_kit::component::text::markdown;
@@ -30,7 +30,10 @@ use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::*;
 
-actions!(dainiki, [Save, ToggleEditing]);
+actions!(
+    dainiki,
+    [Save, ToggleEditing, ToggleJumpToDate, PreviousDay, NextDay]
+);
 
 /// Autosave runs this long after the last keystroke.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -63,6 +66,16 @@ struct JournalSession {
     /// Which day the stream last rendered as the live editor, so a day that
     /// swapped between editor and render (a different height) is remeasured.
     active_rendered: Cell<Option<NaiveDate>>,
+    /// The date-jump panel: input, open state, and the last parse error.
+    jump_input: Entity<InputState>,
+    jump_open: bool,
+    jump_error: Option<String>,
+    /// Set by the jump input's Enter event; processed in render, which has a
+    /// window to activate a day with.
+    pending_submit: Cell<bool>,
+    /// A date the next rendered frame should reveal in the stream.
+    pending_reveal: Cell<Option<NaiveDate>>,
+    _jump_events: Subscription,
 }
 
 /// The day currently open in the editor, with its autosave state.
@@ -132,6 +145,16 @@ impl DainikiApp {
     ) -> io::Result<()> {
         let today = Local::now().date_naive();
         let active = self.open_day(root, today, window, cx)?;
+        let jump_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("YYYY-MM-DD, or “today”"));
+        let jump_events = cx.subscribe(&jump_input, |app, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                if let Some(session) = app.session_mut() {
+                    session.pending_submit.set(true);
+                }
+                cx.notify();
+            }
+        });
         tracing::info!(root = %root.display(), path = %active.path.display(), "journal opened");
         self.screen = Screen::Journal(Box::new(JournalSession {
             root: root.to_path_buf(),
@@ -139,6 +162,12 @@ impl DainikiApp {
             days: BTreeMap::new(),
             stream: ListState::new(0, ListAlignment::Top, px(600.)),
             active_rendered: Cell::new(None),
+            jump_input,
+            jump_open: false,
+            jump_error: None,
+            pending_submit: Cell::new(false),
+            pending_reveal: Cell::new(None),
+            _jump_events: jump_events,
         }));
         cx.notify();
 
@@ -329,6 +358,93 @@ impl DainikiApp {
 
     fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
         self.save_active(cx);
+    }
+
+    // -- date navigation ----------------------------------------------------
+
+    fn on_toggle_jump(
+        &mut self,
+        _: &ToggleJumpToDate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut() else {
+            return;
+        };
+        session.jump_open = !session.jump_open;
+        session.jump_error = None;
+        if session.jump_open {
+            let focus = session.jump_input.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+    }
+
+    /// Reads the jump input, and either opens the day or shows a parse error.
+    fn jump_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(raw) = self
+            .session()
+            .map(|session| session.jump_input.read(cx).value().to_string())
+        else {
+            return;
+        };
+        let today = Local::now().date_naive();
+        match parse_jump_date(&raw, today) {
+            Some(date) => self.jump_to(date, window, cx),
+            None => {
+                if let Some(session) = self.session_mut() {
+                    session.jump_error = Some("Try 2026-10-05, or “today”.".to_string());
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// Opens `date` for editing and reveals it in the stream. The future is
+    /// clamped to today — the stream never shows days that have not happened.
+    fn jump_to(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
+        let today = Local::now().date_naive();
+        let date = date.min(today);
+        self.activate_day(date, window, cx);
+        if let Some(session) = self.session_mut() {
+            session.jump_open = false;
+            session.jump_error = None;
+            session.pending_reveal.set(Some(date));
+            session
+                .jump_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        cx.notify();
+    }
+
+    fn close_jump(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut() {
+            session.jump_open = false;
+            session.jump_error = None;
+        }
+        cx.notify();
+    }
+
+    fn on_previous_day(&mut self, _: &PreviousDay, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(date) = self
+            .session()
+            .and_then(|session| session.active.as_ref())
+            .and_then(|active| active.date.pred_opt())
+        else {
+            return;
+        };
+        self.jump_to(date, window, cx);
+    }
+
+    fn on_next_day(&mut self, _: &NextDay, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(date) = self
+            .session()
+            .and_then(|session| session.active.as_ref())
+            .and_then(|active| active.date.succ_opt())
+        else {
+            return;
+        };
+        self.jump_to(date, window, cx);
     }
 
     // -- welcome actions ----------------------------------------------------
@@ -556,6 +672,14 @@ impl JournalSession {
             self.active_rendered.set(active_date);
         }
 
+        // A jump asked for this day to be revealed; do it on the frame that
+        // knows where it sits in the stream.
+        if let Some(date) = self.pending_reveal.take()
+            && let Some(ix) = dates.iter().position(|day| *day == date)
+        {
+            self.stream.scroll_to_reveal_item(ix);
+        }
+
         let active_editor = self.active.as_ref().map(|active| active.editor.clone());
         let day_count = dates.len();
         let item_this = this.clone();
@@ -608,9 +732,69 @@ impl JournalSession {
             .flex_col()
             .child(TitleBar::new().child(self.window_title()));
 
+        // The date-jump panel: available in reading mode too, so a day is
+        // always one keystroke away.
+        if self.jump_open {
+            let jump_this = this.clone();
+            let today_this = this.clone();
+            let close_this = this.clone();
+            column = column.child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .bg(brand::surface_container_low())
+                    .border_b_1()
+                    .border_color(brand::outline_variant().opacity(0.6))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .max_w(px(760.))
+                            .mx_auto()
+                            .child(
+                                div()
+                                    .font_family(brand::SERIF_FAMILY)
+                                    .text_color(brand::on_surface_variant())
+                                    .child("Jump to"),
+                            )
+                            .child(div().w(px(200.)).child(Input::new(&self.jump_input)))
+                            .child(Button::new("jump-go").label("Go").compact().on_click(
+                                move |_, window, cx| {
+                                    jump_this
+                                        .update(cx, |app, cx| app.jump_from_input(window, cx))
+                                        .ok();
+                                },
+                            ))
+                            .child(Button::new("jump-today").label("Today").compact().on_click(
+                                move |_, window, cx| {
+                                    today_this
+                                        .update(cx, |app, cx| {
+                                            app.jump_to(Local::now().date_naive(), window, cx)
+                                        })
+                                        .ok();
+                                },
+                            ))
+                            .child(div().flex_1())
+                            .children(self.jump_error.as_ref().map(|error| {
+                                div()
+                                    .text_xs()
+                                    .text_color(brand::on_surface_variant())
+                                    .child(error.clone())
+                            }))
+                            .child(Button::new("jump-close").label("Close").compact().on_click(
+                                move |_, _window, cx| {
+                                    close_this.update(cx, |app, cx| app.close_jump(cx)).ok();
+                                },
+                            )),
+                    ),
+            );
+        }
+
         // The toolbar belongs to editing: it appears only while a day is
         // open in the editor.
         if let Some(active) = &self.active {
+            let today_this = this.clone();
             column = column.child(
                 div()
                     .w_full()
@@ -629,6 +813,18 @@ impl JournalSession {
                                     .child(active.block_toolbar(cx)),
                             )
                             .child(active.insert_menu())
+                            .child(
+                                Button::new("today-button")
+                                    .label("Today")
+                                    .compact()
+                                    .on_click(move |_, window, cx| {
+                                        today_this
+                                            .update(cx, |app, cx| {
+                                                app.jump_to(Local::now().date_naive(), window, cx)
+                                            })
+                                            .ok();
+                                    }),
+                            )
                             .child(finish_toggle(this.clone()))
                             .child(active.help_menu()),
                     ),
@@ -863,7 +1059,7 @@ impl ActiveDay {
     }
 
     fn help_menu(&self) -> Popover {
-        const SHORTCUTS: [(&str, &str); 15] = [
+        const SHORTCUTS: [(&str, &str); 17] = [
             ("Command menu", "type /"),
             ("Bold / Italic", "⌘B / ⌘I"),
             ("Strikethrough / Highlight", "⌘⇧X / ⌘⇧H"),
@@ -878,6 +1074,8 @@ impl ActiveDay {
             ("Line / Document jumps", "⌘← / ⌘↑"),
             ("Save", "⌘S"),
             ("Finish editing", "⌘E"),
+            ("Jump to a date", "⌘T"),
+            ("Previous / next day", "⌘⇧[ / ⌘⇧]"),
             ("Reveal markup", "click into a construct"),
         ];
         Popover::new("shortcut-help")
@@ -999,6 +1197,19 @@ fn day_label(date: NaiveDate) -> String {
     date.format("%A, %-d %B %Y").to_string()
 }
 
+/// Parses what the date-jump panel accepts: `YYYY-MM-DD` (slashes too) and
+/// the words `today`, `yesterday`, `tomorrow`.
+fn parse_jump_date(input: &str, today: NaiveDate) -> Option<NaiveDate> {
+    let text = input.trim().to_lowercase();
+    match text.as_str() {
+        "today" => return Some(today),
+        "yesterday" => return today.pred_opt(),
+        "tomorrow" => return today.succ_opt(),
+        _ => {}
+    }
+    NaiveDate::parse_from_str(&text.replace('/', "-"), "%Y-%m-%d").ok()
+}
+
 /// Copies an image into the journal's `assets/` folder under a fresh name,
 /// returning `(alt text, relative markdown path)`.
 fn copy_image(source: &Path, assets: &Path) -> Result<(String, String), String> {
@@ -1034,6 +1245,17 @@ fn copy_image(source: &Path, assets: &Path) -> Result<(String, String), String> 
 
 impl Render for DainikiApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The jump input's Enter event lands here, where a window exists to
+        // open the day with.
+        if self
+            .session()
+            .is_some_and(|session| session.pending_submit.get())
+        {
+            if let Some(session) = self.session_mut() {
+                session.pending_submit.set(false);
+            }
+            self.jump_from_input(window, cx);
+        }
         let this = cx.weak_entity();
         let screen = match &self.screen {
             Screen::Welcome { notice } => self.welcome_view(notice, cx).into_any_element(),
@@ -1045,8 +1267,23 @@ impl Render for DainikiApp {
             .size_full()
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_toggle_editing))
+            .on_action(cx.listener(Self::on_toggle_jump))
+            .on_action(cx.listener(Self::on_previous_day))
+            .on_action(cx.listener(Self::on_next_day))
             .child(screen)
     }
+}
+
+/// The app's key bindings; also registered by tests so they exercise the
+/// real keymap.
+fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-s", Save, None),
+        KeyBinding::new("cmd-e", ToggleEditing, None),
+        KeyBinding::new("cmd-t", ToggleJumpToDate, None),
+        KeyBinding::new("cmd-shift-[", PreviousDay, None),
+        KeyBinding::new("cmd-shift-]", NextDay, None),
+    ]);
 }
 
 fn main() {
@@ -1067,10 +1304,7 @@ fn main() {
     gpui_kit::application().run(move |cx: &mut App| {
         gpui_kit::init(cx);
         brand::apply_component_theme(cx);
-        cx.bind_keys([
-            KeyBinding::new("cmd-s", Save, None),
-            KeyBinding::new("cmd-e", ToggleEditing, None),
-        ]);
+        bind_keys(cx);
         open_app_window(cx, config, root.clone()).expect("failed to open the Dainiki window");
         cx.activate(true);
     });
@@ -1140,15 +1374,18 @@ mod tests {
     // NOTE: no `use super::*` here. The crate root glob-imports `gpui_kit::*`,
     // which re-exports gpui's `test` proc macro; globbing it in would shadow
     // the builtin `#[test]` inside the generated harness and recurse forever.
-    use super::{DainikiApp, Screen, brand, config, day_label, journal, resolve_cli_root};
+    use super::{
+        DainikiApp, Screen, brand, config, day_label, journal, parse_jump_date, resolve_cli_root,
+    };
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     /// The component library needs its theme global before any view renders;
-    /// production also applies the brand palette.
+    /// production also applies the brand palette and key bindings.
     fn init(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         cx.update(brand::apply_component_theme);
+        cx.update(super::bind_keys);
     }
 
     fn scratch_dir() -> PathBuf {
@@ -1202,6 +1439,149 @@ mod tests {
     fn day_labels_name_the_day() {
         let earlier = NaiveDate::from_ymd_opt(2026, 10, 5).expect("date");
         assert_eq!(day_label(earlier), "Monday, 5 October 2026");
+    }
+
+    #[test]
+    fn jump_input_parses_dates_and_words() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 19).expect("date");
+        assert_eq!(
+            parse_jump_date("2026-10-05", today),
+            Some(NaiveDate::from_ymd_opt(2026, 10, 5).unwrap())
+        );
+        assert_eq!(
+            parse_jump_date("  2026/10/05 ", today),
+            Some(NaiveDate::from_ymd_opt(2026, 10, 5).unwrap())
+        );
+        assert_eq!(parse_jump_date("today", today), Some(today));
+        assert_eq!(
+            parse_jump_date("Yesterday", today),
+            Some(NaiveDate::from_ymd_opt(2026, 10, 18).unwrap())
+        );
+        assert_eq!(
+            parse_jump_date("tomorrow", today),
+            Some(NaiveDate::from_ymd_opt(2026, 10, 20).unwrap())
+        );
+        assert_eq!(parse_jump_date("", today), None);
+        assert_eq!(parse_jump_date("someday", today), None);
+        assert_eq!(parse_jump_date("2026-13-01", today), None);
+    }
+
+    #[gpui::test]
+    async fn jumping_to_an_old_day_reveals_it_in_the_stream(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let mut oldest = today;
+        for _ in 0..30 {
+            oldest = oldest.pred_opt().expect("previous day");
+            seed_day(&journal, oldest, "# day\n\nA line written that day.\n");
+        }
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // Jump to the oldest day: it opens and the stream scrolls to it.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.jump_to(oldest, window, cx));
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            let active = session.active.as_ref().expect("the day opened");
+            assert_eq!(active.date, oldest);
+            assert_eq!(
+                active.editor.read(cx).content(cx),
+                "# day\n\nA line written that day.\n"
+            );
+            let top = session.stream.logical_scroll_top();
+            assert!(
+                top.item_ix > 0,
+                "the stream should have scrolled to the jumped day: {top:?}"
+            );
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn previous_day_shortcut_moves_the_editor(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let yesterday = today.pred_opt().expect("yesterday");
+        let before_yesterday = yesterday.pred_opt().expect("the day before");
+        seed_day(&journal, yesterday, "# yesterday's words\n");
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // cmd-T opens the jump panel and focuses its input; typing a day and
+        // pressing Enter opens it.
+        cx.simulate_keystrokes("cmd-t");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert!(session.jump_open, "cmd-T did not open the jump panel");
+        });
+        cx.simulate_input("yesterday");
+        cx.simulate_keystrokes("enter");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert!(!session.jump_open, "the jump panel closes after a jump");
+            let active = session.active.as_ref().expect("a day is open");
+            assert_eq!(active.date, yesterday);
+            assert_eq!(active.editor.read(cx).content(cx), "# yesterday's words\n");
+        });
+
+        // The editor holds focus; the day-step shortcut must still reach the
+        // app (the editor consumes every arrow-key variant, so day steps use
+        // bracket keys).
+        cx.simulate_keystrokes("cmd-shift-[");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            let active = session.active.as_ref().expect("a day is open");
+            assert_eq!(active.date, before_yesterday);
+        });
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[gpui::test]

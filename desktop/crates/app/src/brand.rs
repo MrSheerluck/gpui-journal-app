@@ -326,6 +326,13 @@ pub fn apply_component_theme(cx: &mut App) {
     colors.button_foreground = palette.on_surface;
     colors.button_hover = palette.surface_container_high;
     colors.button_active = palette.surface_container_high;
+    // Window chrome: the title bar, status bar and border follow the palette
+    // so a dark window does not sit under a light bar.
+    colors.title_bar = palette.surface_container_low;
+    colors.title_bar_border = palette.outline_variant;
+    colors.status_bar = palette.surface_container_low;
+    colors.status_bar_border = palette.outline_variant;
+    colors.window_border = palette.outline_variant;
     theme.tokens.background = palette.surface.into();
 }
 

@@ -33,6 +33,16 @@ pub struct EditorTheme {
     pub checkbox_check: Hsla,
     /// The `---` rule line.
     pub rule: Hsla,
+    /// Surface of media cards and rows.
+    pub media_background: Hsla,
+    /// The border around media cards and rows.
+    pub media_border: Hsla,
+    /// Media control glyphs (play/pause, labels).
+    pub media_control: Hsla,
+    /// The unfilled part of a media progress track.
+    pub media_track: Hsla,
+    /// The filled part of a media progress track.
+    pub media_progress: Hsla,
     /// Hover tooltip behind link URLs.
     pub tooltip_background: Hsla,
     pub tooltip_text: Hsla,
@@ -65,6 +75,11 @@ impl Default for EditorTheme {
             checkbox_checked_background: rgb(0x2F6FEB).into(),
             checkbox_check: rgb(0xFFFFFF).into(),
             rule: rgba(0x00000040).into(),
+            media_background: rgba(0x00000008).into(),
+            media_border: rgba(0x00000014).into(),
+            media_control: rgba(0x1F2328E6).into(),
+            media_track: rgba(0x0000001A).into(),
+            media_progress: rgb(0x2F6FEB).into(),
             tooltip_background: rgba(0x1F2328F2).into(),
             tooltip_text: rgb(0xFAFAF8).into(),
             menu_background: rgba(0xFFFFFFF7).into(),

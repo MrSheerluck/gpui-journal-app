@@ -14,7 +14,7 @@ use gpui::{
 use crate::{
     buffer::Buffer,
     commands::{self, BlockFormat, Edit as CommandEdit, InlineFormat, SlashItem},
-    display::{DisplayPlan, WidgetKind},
+    display::{DisplayPlan, MediaKind, WidgetKind, media_kind},
     input::{
         EditorElement, EditorLayout, EditorScrollState, Selection,
         history::{Edit, History, MergeKind},
@@ -395,6 +395,8 @@ impl MarkdownEditor {
     }
 
     /// Starts background loads for every referenced image not yet tracked.
+    /// Audio, video and other files are not decoded here; the host plays
+    /// them, and video poster frames arrive through the host as well.
     fn ensure_images(&mut self, text: &str, cx: &mut Context<Self>) {
         let destinations: Vec<String> = self
             .index
@@ -407,6 +409,7 @@ impl MarkdownEditor {
                     .map(|range| text[range.clone()].to_string()),
                 _ => None,
             })
+            .filter(|destination| media_kind(destination) == MediaKind::Image)
             .collect();
         for destination in destinations {
             if self.images.contains_key(&destination) {
@@ -506,7 +509,7 @@ impl MarkdownEditor {
             return;
         }
         if event.modifiers.platform && !event.modifiers.shift {
-            if let Some((_, WidgetKind::Image { path })) = &hit.widget {
+            if let Some((_, WidgetKind::Media { path, .. })) = &hit.widget {
                 let path = self.resolved_asset_path(path);
                 cx.open_url(&format!("file://{}", path.display()));
                 return;

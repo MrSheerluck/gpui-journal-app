@@ -65,8 +65,41 @@ pub enum WidgetKind {
     Task { checked: bool },
     /// A `---` rule rendered as a full-width painted line.
     Rule,
-    /// A whole-line `![alt](path)` rendered as the decoded image.
-    Image { path: String },
+    /// A whole-line `![alt](path)` rendered as the media it points at.
+    Media { kind: MediaKind, path: String },
+}
+
+/// What a media destination is, by its file extension. The classification is
+/// pure so the projection decides rendering and the host decides playback
+/// from the same answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Audio,
+    Video,
+    /// A whole-line reference the editor does not render inline: a file chip.
+    File,
+}
+
+/// Classifies a media destination by extension, case-insensitively and
+/// ignoring URL query/fragment suffixes. Unknown extensions are `File`.
+pub fn media_kind(destination: &str) -> MediaKind {
+    let path = destination.trim();
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let extension = path
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "heic" | "avif" => {
+            MediaKind::Image
+        }
+        "mp3" | "m4a" | "aac" | "wav" | "aif" | "aiff" | "flac" | "ogg" | "oga" | "opus" => {
+            MediaKind::Audio
+        }
+        "mp4" | "mov" | "m4v" | "webm" | "avi" | "mkv" => MediaKind::Video,
+        _ => MediaKind::File,
+    }
 }
 
 /// One piece of a projected line. Fragments tile both the source range and
@@ -334,17 +367,25 @@ fn project_line(
                         .unwrap_or("image");
                     let whole_line = is_whole_line(&construct.range, &source, text);
                     if whole_line {
+                        let path = destination.unwrap_or_default().to_string();
                         pieces.push((
                             reveal_range,
                             Piece::Glyph {
                                 text: " ".to_string(),
-                                widget: WidgetKind::Image {
-                                    path: destination.unwrap_or_default().to_string(),
+                                widget: WidgetKind::Media {
+                                    kind: media_kind(&path),
+                                    path,
                                 },
                             },
                         ));
                     } else {
-                        pieces.push((reveal_range, Piece::Text(format!("[image: {file_name}]"))));
+                        let label = match media_kind(destination.unwrap_or_default()) {
+                            MediaKind::Image => format!("[image: {file_name}]"),
+                            MediaKind::Audio => format!("[audio: {file_name}]"),
+                            MediaKind::Video => format!("[video: {file_name}]"),
+                            MediaKind::File => format!("[file: {file_name}]"),
+                        };
+                        pieces.push((reveal_range, Piece::Text(label)));
                     }
                 }
             }
@@ -819,7 +860,8 @@ mod tests {
         let (_, widget) = line.widget_at_display(0).expect("image widget");
         assert_eq!(
             widget,
-            WidgetKind::Image {
+            WidgetKind::Media {
+                kind: super::MediaKind::Image,
                 path: "assets/x.png".into()
             }
         );
@@ -833,6 +875,56 @@ mod tests {
         let text = "text ![a](p.png) more\n";
         let plan = plan_for(text, Selection::caret(0));
         assert_eq!(plan.lines[0].text, "text [image: p.png] more");
+    }
+
+    #[test]
+    fn media_classification_follows_the_extension() {
+        use super::{MediaKind, media_kind};
+        assert_eq!(media_kind("assets/x.png"), MediaKind::Image);
+        assert_eq!(media_kind("assets/X.JPEG"), MediaKind::Image);
+        assert_eq!(media_kind("assets/x.png?v=2"), MediaKind::Image);
+        assert_eq!(media_kind("assets/take.mp3"), MediaKind::Audio);
+        assert_eq!(media_kind("assets/take.M4A"), MediaKind::Audio);
+        assert_eq!(media_kind("assets/clip.mp4"), MediaKind::Video);
+        assert_eq!(media_kind("assets/clip.MOV#t=3"), MediaKind::Video);
+        assert_eq!(media_kind("assets/notes.txt"), MediaKind::File);
+        assert_eq!(media_kind("assets/no_dot"), MediaKind::File);
+        assert_eq!(media_kind("assets/v1.2/x"), MediaKind::File);
+    }
+
+    #[test]
+    fn whole_line_media_carries_its_kind() {
+        let text = "![](assets/take.mp3)\n";
+        let plan = plan_for(text, Selection::caret(0));
+        let (_, widget) = plan.lines[0].widget_at_display(0).expect("media widget");
+        assert_eq!(
+            widget,
+            WidgetKind::Media {
+                kind: super::MediaKind::Audio,
+                path: "assets/take.mp3".into()
+            }
+        );
+
+        let text = "![](assets/clip.mp4)\n";
+        let plan = plan_for(text, Selection::caret(0));
+        let (_, widget) = plan.lines[0].widget_at_display(0).expect("media widget");
+        assert_eq!(
+            widget,
+            WidgetKind::Media {
+                kind: super::MediaKind::Video,
+                path: "assets/clip.mp4".into()
+            }
+        );
+    }
+
+    #[test]
+    fn inline_media_chips_name_their_kind() {
+        let plan = plan_for("a ![t](take.mp3) b\n", Selection::caret(0));
+        assert_eq!(plan.lines[0].text, "a [audio: take.mp3] b");
+        let plan = plan_for("a ![c](clip.mov) b\n", Selection::caret(0));
+        assert_eq!(plan.lines[0].text, "a [video: clip.mov] b");
+        let plan = plan_for("a ![n](notes.txt) b\n", Selection::caret(0));
+        assert_eq!(plan.lines[0].text, "a [file: notes.txt] b");
     }
 
     #[test]

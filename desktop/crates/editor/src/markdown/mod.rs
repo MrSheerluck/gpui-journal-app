@@ -404,6 +404,15 @@ impl MarkdownIndex {
                 offset,
                 &mut inner,
             );
+            // `![]` parses with no description node at all. Keep the
+            // `[alt, destination]` convention by inserting an empty
+            // description ahead of the destination.
+            if kind == ConstructKind::Image
+                && inner.len() == 1
+                && let Some(destination) = inner.first().cloned()
+            {
+                inner.insert(0, destination.start..destination.start);
+            }
 
             out.push(Construct {
                 kind,
@@ -683,6 +692,18 @@ mod tests {
         let image = find(&index, |c| c.kind == ConstructKind::Image);
         assert_eq!(&FIXTURE[image.inner[0].clone()], "alt");
         assert_eq!(&FIXTURE[image.inner[1].clone()], "assets/x.png");
+    }
+
+    #[test]
+    fn empty_alt_images_still_carry_a_destination() {
+        let index = index_of("![](assets/x.png)\n\n");
+        let image = find(&index, |c| c.kind == ConstructKind::Image);
+        assert_eq!(image.inner.len(), 2, "alt range + destination");
+        assert!(image.inner[0].is_empty(), "the alt range is empty");
+        assert_eq!(
+            &"![](assets/x.png)\n\n"[image.inner[1].clone()],
+            "assets/x.png"
+        );
     }
 
     #[test]

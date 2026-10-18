@@ -654,15 +654,7 @@ fn main() {
 
     // A folder argument overrides the configured journal for this session;
     // it is never persisted.
-    let arg = std::env::args_os().nth(1).map(PathBuf::from);
-    let cli_root = match arg {
-        Some(path) if path.is_dir() => Some(path),
-        Some(path) => {
-            tracing::warn!(path = %path.display(), "argument ignored: pass a journal folder");
-            None
-        }
-        None => None,
-    };
+    let cli_root = resolve_cli_root(std::env::args_os().nth(1).map(PathBuf::from));
     let root = cli_root.or_else(|| config::load().journal_root);
     if let Some(root) = &root {
         tracing::info!(root = %root.display(), "opening journal");
@@ -677,6 +669,30 @@ fn main() {
         open_app_window(cx, root.clone()).expect("failed to open the Dainiki window");
         cx.activate(true);
     });
+}
+
+/// Resolves a folder argument for this session: an existing folder is used
+/// as-is; a path that does not exist yet is created, so a fresh journal can
+/// be spun up from the command line; anything else is ignored.
+fn resolve_cli_root(arg: Option<PathBuf>) -> Option<PathBuf> {
+    let path = arg?;
+    if path.is_dir() {
+        return Some(path);
+    }
+    if !path.exists() {
+        return match std::fs::create_dir_all(&path) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "created the journal folder from the argument");
+                Some(path)
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), error = %error, "could not create the journal folder");
+                None
+            }
+        };
+    }
+    tracing::warn!(path = %path.display(), "argument ignored: pass a journal folder");
+    None
 }
 
 fn open_app_window(cx: &mut App, root: Option<PathBuf>) -> Result<()> {
@@ -719,7 +735,7 @@ mod tests {
     // NOTE: no `use super::*` here. The crate root glob-imports `gpui_kit::*`,
     // which re-exports gpui's `test` proc macro; globbing it in would shadow
     // the builtin `#[test]` inside the generated harness and recurse forever.
-    use super::{DainikiApp, EditorTheme, Screen, journal};
+    use super::{DainikiApp, EditorTheme, Screen, journal, resolve_cli_root};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -736,6 +752,36 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("create scratch dir");
         dir
+    }
+
+    #[test]
+    fn no_argument_resolves_to_nothing() {
+        assert_eq!(resolve_cli_root(None), None);
+    }
+
+    #[test]
+    fn an_existing_folder_argument_is_used_as_is() {
+        let dir = scratch_dir();
+        assert_eq!(resolve_cli_root(Some(dir.clone())), Some(dir.clone()));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_folder_argument_is_created() {
+        let dir = scratch_dir();
+        let fresh = dir.join("fresh-journal");
+        assert_eq!(resolve_cli_root(Some(fresh.clone())), Some(fresh.clone()));
+        assert!(fresh.is_dir());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_argument_is_ignored() {
+        let dir = scratch_dir();
+        let file = dir.join("entry.md");
+        fs::write(&file, "x").expect("seed");
+        assert_eq!(resolve_cli_root(Some(file)), None);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[gpui::test]

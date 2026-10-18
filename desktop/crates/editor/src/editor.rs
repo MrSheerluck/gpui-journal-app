@@ -10,11 +10,13 @@ use gpui::{
 
 use crate::{
     buffer::Buffer,
+    display::DisplayPlan,
     input::{
         EditorElement, EditorLayout, EditorScrollState, Selection,
         history::{Edit, History, MergeKind},
         movement,
     },
+    markdown::MarkdownIndex,
     theme::EditorTheme,
 };
 
@@ -39,6 +41,11 @@ pub struct MarkdownEditor {
     focus_handle: FocusHandle,
     marked_range: Option<Range<usize>>,
     history: History,
+    index: MarkdownIndex,
+    plan: Rc<DisplayPlan>,
+    revision: u64,
+    display_revision: u64,
+    display_selection: Selection,
     caret_visible: bool,
     blink_epoch: u64,
     focused: bool,
@@ -58,6 +65,11 @@ impl MarkdownEditor {
             focus_handle: cx.focus_handle(),
             marked_range: None,
             history: History::default(),
+            index: MarkdownIndex::new(),
+            plan: Rc::new(DisplayPlan::default()),
+            revision: 0,
+            display_revision: u64::MAX,
+            display_selection: Selection::default(),
             caret_visible: true,
             blink_epoch: 0,
             focused: false,
@@ -121,6 +133,24 @@ impl MarkdownEditor {
     pub fn content(&self, cx: &App) -> String {
         let buffer = self.buffer.read(cx);
         buffer.slice(0..buffer.len_bytes())
+    }
+
+    /// The current display projection (cheap `Rc` clone).
+    pub(crate) fn plan(&self) -> Rc<DisplayPlan> {
+        self.plan.clone()
+    }
+
+    /// Re-projects the display when the text or selection changed since the
+    /// last call. Called at the top of every render; a no-op otherwise.
+    fn sync_display(&mut self, cx: &mut Context<Self>) {
+        if self.revision == self.display_revision && self.selection == self.display_selection {
+            return;
+        }
+        let text = self.content(cx);
+        self.index.update(&text);
+        self.plan = Rc::new(DisplayPlan::compute(&text, &self.index, self.selection));
+        self.display_revision = self.revision;
+        self.display_selection = self.selection;
     }
 
     pub fn scroll_by(&mut self, delta: Pixels, cx: &mut Context<Self>) {
@@ -206,7 +236,7 @@ impl MarkdownEditor {
         let Some(bounds) = self.layout.bounds() else {
             return false;
         };
-        let margin = self.layout.line_height().unwrap_or(px(20.));
+        let margin = self.layout.body_line_height().unwrap_or(px(20.));
         autoscroll_step(
             self.drag_position.y,
             bounds.origin.y,
@@ -225,7 +255,7 @@ impl MarkdownEditor {
         let Some(bounds) = self.layout.bounds() else {
             return false;
         };
-        let margin = self.layout.line_height().unwrap_or(px(20.));
+        let margin = self.layout.body_line_height().unwrap_or(px(20.));
         let Some(step) = autoscroll_step(
             self.drag_position.y,
             bounds.origin.y,
@@ -274,23 +304,23 @@ impl MarkdownEditor {
     }
 
     /// Hit-tests a window position to a byte offset: the shaped line containing
-    /// the y coordinate, then the grapheme boundary closest to x.
+    /// the y coordinate, then the grapheme boundary closest to x, mapped from
+    /// display space back to source.
     fn offset_for_point(&self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<usize> {
-        let buffer = self.buffer.read(cx);
         let bounds = self.layout.bounds()?;
         let content_y = position.y - bounds.origin.y + self.scroll.offset();
         if content_y < Pixels::ZERO {
             return Some(0);
         }
         let Some((line_ix, within_line)) = self.layout.line_at_y(content_y) else {
-            return Some(buffer.len_bytes());
+            return Some(self.buffer.read(cx).len_bytes());
         };
-        let line_height = self.layout.line_height()?;
+        let projected = self.plan.lines.get(line_ix)?;
         let x = position.x - bounds.origin.x;
-        let local = self.layout.with_line(line_ix, |line, _| {
-            snap_index(line.closest_index_for_position(point(x, within_line), line_height))
+        let display = self.layout.with_line(line_ix, |line, height| {
+            snap_index(line.closest_index_for_position(point(x, within_line), height))
         })?;
-        Some(buffer.line_start_byte(line_ix) + local)
+        Some(projected.source.start + projected.source_for_display(display))
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -439,6 +469,7 @@ impl MarkdownEditor {
         });
         if let Some(selection) = selection {
             self.selection = selection;
+            self.revision += 1;
             self.restart_blink();
             cx.emit(EditorEvent::Edited);
             cx.notify();
@@ -498,8 +529,10 @@ impl MarkdownEditor {
 
     fn vertical_offset(&self, buffer: &Buffer, direction: i32) -> Option<usize> {
         let (line_ix, local) = buffer.offset_to_line(self.selection.head());
+        let projected = self.plan.lines.get(line_ix)?;
+        let display = projected.display_for_source(projected.source.start + local);
         let (x, y, line_height) = self.layout.with_line(line_ix, |line, line_height| {
-            line.position_for_index(local, line_height)
+            line.position_for_index(display, line_height)
                 .map(|position| (position.x, position.y, line_height))
         })??;
 
@@ -513,7 +546,7 @@ impl MarkdownEditor {
             let index = self.layout.with_line(line_ix, |line, line_height| {
                 snap_index(line.closest_index_for_position(point(x, target_y), line_height))
             })?;
-            return Some(buffer.line_start_byte(line_ix) + index);
+            return Some(projected.source.start + projected.source_for_display(index));
         }
 
         if direction < 0 {
@@ -521,20 +554,22 @@ impl MarkdownEditor {
                 return Some(0);
             }
             let ix = line_ix - 1;
+            let target = self.plan.lines.get(ix)?;
             let last_y = line_height * (segments(ix) - 1) as f32;
             let index = self.layout.with_line(ix, |line, line_height| {
                 snap_index(line.closest_index_for_position(point(x, last_y), line_height))
             })?;
-            Some(buffer.line_start_byte(ix) + index)
+            Some(target.source.start + target.source_for_display(index))
         } else {
             let ix = line_ix + 1;
             if ix >= buffer.len_lines() {
                 return Some(buffer.len_bytes());
             }
+            let target = self.plan.lines.get(ix)?;
             let index = self.layout.with_line(ix, |line, line_height| {
                 snap_index(line.closest_index_for_position(point(x, Pixels::ZERO), line_height))
             })?;
-            Some(buffer.line_start_byte(ix) + index)
+            Some(target.source.start + target.source_for_display(index))
         }
     }
 }
@@ -693,11 +728,13 @@ impl EntityInputHandler for MarkdownEditor {
             let buffer = self.buffer.read(cx);
             buffer.offset_to_line(buffer.utf16_to_byte(range_utf16.start))
         };
+        let projected = self.plan.lines.get(line_ix)?;
+        let display = projected.display_for_source(projected.source.start + local);
         let position = self.layout.with_line(line_ix, |line, line_height| {
-            line.position_for_index(local, line_height)
+            line.position_for_index(display, line_height)
         })??;
         let top = self.layout.line_top(line_ix)?;
-        let line_height = self.layout.line_height()?;
+        let line_height = self.layout.with_line(line_ix, |_, height| height)?;
         let origin = point(
             element_bounds.origin.x + position.x,
             element_bounds.origin.y + top + position.y - self.scroll.offset(),
@@ -772,6 +809,7 @@ impl MarkdownEditor {
             },
             merge,
         );
+        self.revision += 1;
         self.restart_blink();
         cx.emit(EditorEvent::Edited);
         cx.notify();
@@ -780,6 +818,7 @@ impl MarkdownEditor {
 
 impl Render for MarkdownEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_display(cx);
         let focused = self.focus_handle.is_focused(window);
         if focused != self.focused {
             self.focused = focused;
@@ -795,7 +834,6 @@ impl Render for MarkdownEditor {
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .child(EditorElement::new(
                 cx.entity(),
-                self.buffer.clone(),
                 self.scroll.clone(),
                 self.layout.clone(),
             ))

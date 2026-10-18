@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
@@ -8,7 +9,7 @@ use gpui::{
 };
 
 use crate::{
-    buffer::Buffer,
+    display::Style as LineStyle,
     editor::MarkdownEditor,
     input::scroll::{EditorScrollState, clamp_offset},
 };
@@ -19,7 +20,6 @@ const THUMB_MARGIN: f32 = 4.;
 
 pub struct EditorElement {
     view: Entity<MarkdownEditor>,
-    buffer: Entity<Buffer>,
     scroll: Rc<EditorScrollState>,
     layout: EditorLayout,
 }
@@ -27,13 +27,11 @@ pub struct EditorElement {
 impl EditorElement {
     pub fn new(
         view: Entity<MarkdownEditor>,
-        buffer: Entity<Buffer>,
         scroll: Rc<EditorScrollState>,
         layout: EditorLayout,
     ) -> Self {
         Self {
             view,
-            buffer,
             scroll,
             layout,
         }
@@ -68,16 +66,16 @@ impl Element for EditorElement {
         _cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let text_style = window.text_style();
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let line_height = window.pixel_snap(
+        let base_font_size = text_style.font_size.to_pixels(window.rem_size());
+        let base_line_height = window.pixel_snap(
             text_style
                 .line_height
-                .to_pixels(font_size.into(), window.rem_size()),
+                .to_pixels(base_font_size.into(), window.rem_size()),
         );
 
         let state = self.layout.clone();
         let measure_state = self.layout.clone();
-        let buffer = self.buffer.clone();
+        let view = self.view.clone();
         let layout_id = window.request_measured_layout(
             Style {
                 size: Size {
@@ -92,34 +90,48 @@ impl Element for EditorElement {
                     _ => None,
                 });
 
-                let buffer = buffer.read(cx);
-                let mut lines = Vec::with_capacity(buffer.len_lines());
+                let (plan, theme) = {
+                    let view = view.read(cx);
+                    (view.plan(), view.theme().clone())
+                };
+
+                let mut lines = Vec::with_capacity(plan.lines.len());
                 let mut content_size: Size<Pixels> = Size::default();
-                for ix in 0..buffer.len_lines() {
-                    let text = buffer.line_text(ix);
+                for projected in &plan.lines {
+                    let scale = match projected.style {
+                        LineStyle::Body => 1.0,
+                        LineStyle::Heading { level } => theme.heading_scale(level),
+                    };
+                    let font_size = base_font_size * scale;
+                    let line_height = base_line_height * scale;
+                    let mut style = text_style.clone();
+                    style.font_size = font_size.into();
                     let shaped = window.text_system().shape_text(
-                        SharedString::new(text.as_str()),
+                        SharedString::new(projected.text.as_str()),
                         font_size,
-                        &[text_style.to_run(text.len())],
+                        &[style.to_run(projected.text.len())],
                         wrap_width,
                         None,
                     );
                     let line = match shaped {
                         Ok(mut shaped) => shaped.pop().unwrap_or_default(),
                         Err(error) => {
-                            tracing::warn!(line = ix, error = %error, "failed to shape line");
+                            tracing::warn!(error = %error, "failed to shape line");
                             WrappedLine::default()
                         }
                     };
                     let line_size = line.size(line_height);
                     content_size.height += line_size.height;
                     content_size.width = content_size.width.max(line_size.width).ceil();
-                    lines.push(line);
+                    lines.push(LaidLine {
+                        wrapped: line,
+                        height: line_height,
+                    });
                 }
 
                 *measure_state.0.borrow_mut() = Some(EditorLayoutInner {
                     lines,
-                    line_height,
+                    body_line_height: base_line_height,
                     content_height: content_size.height,
                     bounds: None,
                 });
@@ -179,16 +191,7 @@ impl Element for EditorElement {
         };
         let align = window.text_style().text_align;
 
-        let viewport_bottom = bounds.origin.y + bounds.size.height;
-        let max_offset = (inner.content_height - bounds.size.height).max(Pixels::ZERO);
-        let offset = clamp_offset(self.scroll.offset(), max_offset);
-        let scroll_progress = if max_offset > Pixels::ZERO {
-            offset.as_f32() / max_offset.as_f32()
-        } else {
-            0.0
-        };
-
-        let (theme, selection_state, caret_visible, focus_handle, marked_range) = {
+        let (theme, selection_state, caret_visible, focus_handle, marked_range, plan) = {
             let view = self.view.read(cx);
             (
                 view.theme().clone(),
@@ -196,6 +199,7 @@ impl Element for EditorElement {
                 view.caret_visible(),
                 view.focus_handle().clone(),
                 view.marked_range(),
+                view.plan(),
             )
         };
         window.handle_input(
@@ -216,97 +220,104 @@ impl Element for EditorElement {
             }
         });
 
-        // Reveal the caret before painting: while focused with a collapsed
-        // caret, keep it inside the viewport with one line of margin.
-        let caret_position = if focus_handle.is_focused(window) && selection_state.is_caret() {
-            let buffer = self.buffer.read(cx);
-            Some(buffer.offset_to_line(selection_state.head()))
+        let focused = focus_handle.is_focused(window);
+        let caret_source = if focused && selection_state.is_caret() {
+            Some(selection_state.head())
         } else {
             None
         };
-        if let Some((line_ix, local)) = caret_position
-            && line_ix < inner.lines.len()
+
+        // Reveal the caret before painting: while focused with a collapsed
+        // caret, keep it inside the viewport with one line of margin.
+        if let Some(source) = caret_source
+            && let Some(plan_index) = plan.line_for_source(source)
+            && let Some(laid) = inner.lines.get(plan_index)
+            && let Some(projected) = plan.lines.get(plan_index)
         {
-            let line_height = inner.line_height;
             let mut caret_top = Pixels::ZERO;
-            for line in &inner.lines[..line_ix] {
-                caret_top += line.size(inner.line_height).height;
+            for line in &inner.lines[..plan_index] {
+                caret_top += line.wrapped.size(line.height).height;
             }
-            if let Some(segment) = inner.lines[line_ix].position_for_index(local, inner.line_height)
+            if let Some(segment) = laid
+                .wrapped
+                .position_for_index(projected.display_for_source(source), laid.height)
             {
                 caret_top += segment.y;
             }
             let target = reveal_offset(
                 caret_top,
-                line_height,
+                laid.height,
                 bounds.size.height,
                 self.scroll.offset(),
-                line_height,
+                laid.height,
             );
             self.scroll.set_offset(target);
         }
 
+        let viewport_bottom = bounds.origin.y + bounds.size.height;
+        let max_offset = (inner.content_height - bounds.size.height).max(Pixels::ZERO);
+        let offset = clamp_offset(self.scroll.offset(), max_offset);
+        let scroll_progress = if max_offset > Pixels::ZERO {
+            offset.as_f32() / max_offset.as_f32()
+        } else {
+            0.0
+        };
+
         let show_selection = !selection_state.is_caret();
         let selection = (selection_state.start(), selection_state.end());
-        let show_caret = caret_visible && !show_selection && focus_handle.is_focused(window);
-        let caret = if show_caret { caret_position } else { None };
-        let line_ranges: Vec<(usize, usize)> = if show_selection || marked_range.is_some() {
-            let buffer = self.buffer.read(cx);
-            (0..buffer.len_lines())
-                .map(|ix| (buffer.line_start_byte(ix), buffer.line_end_byte(ix)))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let show_caret = caret_visible && !show_selection && focused;
 
         window.paint_layer(bounds, |window| {
             let mut line_origin = point(bounds.origin.x, bounds.origin.y - offset);
-            for (ix, line) in inner.lines.iter().enumerate() {
-                let height = line.size(inner.line_height).height;
+            for (ix, laid) in inner.lines.iter().enumerate() {
+                let height = laid.height;
                 let line_bottom = line_origin.y + height;
                 if line_bottom > bounds.origin.y && line_origin.y < viewport_bottom {
-                    if let Some(&line_range) = line_ranges.get(ix) {
+                    if let Some(projected) = plan.lines.get(ix) {
                         if show_selection {
                             paint_selection(
-                                line,
+                                &laid.wrapped,
                                 line_origin,
-                                inner.line_height,
-                                line_range,
+                                height,
+                                projected,
                                 selection,
                                 theme.selection,
                                 window,
                             );
                         }
                         if let Some(marked) = &marked_range {
-                            paint_marked(
-                                line,
-                                line_origin,
-                                inner.line_height,
-                                line_range,
-                                (marked.start, marked.end),
-                                theme.text,
-                                window,
-                            );
+                            let start = marked.start.max(projected.source.start);
+                            let end = marked.end.min(projected.source.end);
+                            if start < end {
+                                paint_marked(
+                                    &laid.wrapped,
+                                    line_origin,
+                                    height,
+                                    projected.display_for_source(start)
+                                        ..projected.display_for_source(end),
+                                    theme.text,
+                                    window,
+                                );
+                            }
                         }
                     }
-                    if let Err(error) = line.paint(
-                        line_origin,
-                        inner.line_height,
-                        align,
-                        Some(bounds),
-                        window,
-                        cx,
-                    ) {
+                    if let Err(error) =
+                        laid.wrapped
+                            .paint(line_origin, height, align, Some(bounds), window, cx)
+                    {
                         tracing::warn!(error = %error, "failed to paint a line");
                     }
-                    if let Some((caret_line, caret_local)) = caret
-                        && ix == caret_line
+                    if show_caret
+                        && let Some(source) = caret_source
+                        && let Some(projected) = plan.lines.get(ix)
+                        && projected.source.start <= source
+                        && source <= projected.source.end
                     {
                         paint_caret(
-                            line,
+                            &laid.wrapped,
                             line_origin,
-                            inner.line_height,
-                            caret_local,
+                            height,
+                            projected.display_for_source(source),
                             theme.caret,
                             window,
                         );
@@ -345,19 +356,27 @@ fn paint_selection(
     line: &WrappedLine,
     origin: Point<Pixels>,
     line_height: Pixels,
-    line_range: (usize, usize),
+    projected: &crate::display::ProjectedLine,
     selection: (usize, usize),
     color: Hsla,
     window: &mut Window,
 ) {
-    for quad in range_quads(line, origin, line_height, line_range, selection) {
-        window.paint_quad(fill(quad, color));
+    let source = projected.source.clone();
+    if selection.0 > source.end {
+        return;
     }
-
-    let (line_start, line_end) = line_range;
-    if selection.0 <= line_end
-        && selection.1 > line_end
-        && let Some(position) = line.position_for_index(line_end - line_start, line_height)
+    let spans_past = selection.1 > source.end;
+    let start = selection.0.max(source.start);
+    let end = selection.1.min(source.end);
+    if start < end || (spans_past && selection.0 <= source.end) {
+        let display = projected.display_for_source(start)..projected.display_for_source(end);
+        for quad in range_quads(line, origin, line_height, display) {
+            window.paint_quad(fill(quad, color));
+        }
+    }
+    if spans_past
+        && selection.0 <= source.end
+        && let Some(position) = line.position_for_index(projected.text.len(), line_height)
     {
         let sliver = Bounds {
             origin: point(origin.x + position.x, origin.y + position.y),
@@ -370,18 +389,16 @@ fn paint_selection(
     }
 }
 
-/// Paints the IME composition underline over a marked range: a short bar at
-/// the bottom of the line box for every wrapped segment the range covers.
+/// Paints the IME composition underline over a display range.
 fn paint_marked(
     line: &WrappedLine,
     origin: Point<Pixels>,
     line_height: Pixels,
-    line_range: (usize, usize),
-    marked: (usize, usize),
+    display: Range<usize>,
     color: Hsla,
     window: &mut Window,
 ) {
-    for quad in range_quads(line, origin, line_height, line_range, marked) {
+    for quad in range_quads(line, origin, line_height, display) {
         let underline = Bounds {
             origin: point(quad.origin.x, quad.origin.y + line_height - px(2.)),
             size: Size {
@@ -393,22 +410,39 @@ fn paint_marked(
     }
 }
 
-/// Highlight rectangles for `range` (global bytes) within one line, one per
+/// Paints the caret bar for one line at a display byte offset.
+fn paint_caret(
+    line: &WrappedLine,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    display: usize,
+    color: Hsla,
+    window: &mut Window,
+) {
+    let Some(position) = line.position_for_index(display, line_height) else {
+        return;
+    };
+    let caret = Bounds {
+        origin: point(origin.x + position.x, origin.y + position.y),
+        size: Size {
+            width: px(2.),
+            height: line_height,
+        },
+    };
+    window.paint_quad(fill(caret, color));
+}
+
+/// Highlight rectangles for a display byte range within one line, one per
 /// wrapped segment the range covers.
 fn range_quads(
     line: &WrappedLine,
     origin: Point<Pixels>,
     line_height: Pixels,
-    line_range: (usize, usize),
-    range: (usize, usize),
+    display: Range<usize>,
 ) -> Vec<Bounds<Pixels>> {
-    let (line_start, line_end) = line_range;
-    if range.0 > line_end {
-        return Vec::new();
-    }
-    let content_len = line_end - line_start;
-    let clip_start = range.0.saturating_sub(line_start).min(content_len);
-    let clip_end = range.1.saturating_sub(line_start).min(content_len);
+    let content_len = line.len();
+    let clip_start = display.start.min(content_len);
+    let clip_end = display.end.min(content_len);
 
     let mut quads = Vec::new();
     if clip_start < clip_end {
@@ -433,28 +467,6 @@ fn range_quads(
         }
     }
     quads
-}
-
-/// Paints the caret bar for one line at a byte offset within its text.
-fn paint_caret(
-    line: &WrappedLine,
-    origin: Point<Pixels>,
-    line_height: Pixels,
-    local: usize,
-    color: Hsla,
-    window: &mut Window,
-) {
-    let Some(position) = line.position_for_index(local, line_height) else {
-        return;
-    };
-    let caret = Bounds {
-        origin: point(origin.x + position.x, origin.y + position.y),
-        size: Size {
-            width: px(2.),
-            height: line_height,
-        },
-    };
-    window.paint_quad(fill(caret, color));
 }
 
 /// Byte offsets where each wrapped segment of the line starts, terminated by
@@ -494,7 +506,7 @@ fn reveal_offset(
 pub struct EditorLayout(Rc<RefCell<Option<EditorLayoutInner>>>);
 
 impl EditorLayout {
-    /// Runs `f` over the wrapped line at `ix` together with the line height.
+    /// Runs `f` over the wrapped line at `ix` together with its height.
     pub(crate) fn with_line<R>(
         &self,
         ix: usize,
@@ -502,13 +514,17 @@ impl EditorLayout {
     ) -> Option<R> {
         let inner = self.0.borrow();
         let inner = inner.as_ref()?;
-        inner.lines.get(ix).map(|line| f(line, inner.line_height))
+        inner
+            .lines
+            .get(ix)
+            .map(|laid| f(&laid.wrapped, laid.height))
     }
 
-    pub(crate) fn line_height(&self) -> Option<Pixels> {
+    /// The body line height (computed from the window text style).
+    pub(crate) fn body_line_height(&self) -> Option<Pixels> {
         let inner = self.0.borrow();
         let inner = inner.as_ref()?;
-        Some(inner.line_height)
+        Some(inner.body_line_height)
     }
 
     pub(crate) fn bounds(&self) -> Option<Bounds<Pixels>> {
@@ -526,7 +542,7 @@ impl EditorLayout {
         }
         let mut top = Pixels::ZERO;
         for line in &inner.lines[..ix] {
-            top += line.size(inner.line_height).height;
+            top += line.wrapped.size(line.height).height;
         }
         Some(top)
     }
@@ -540,7 +556,7 @@ impl EditorLayout {
         }
         let mut top = Pixels::ZERO;
         for (ix, line) in inner.lines.iter().enumerate() {
-            let height = line.size(inner.line_height).height;
+            let height = line.wrapped.size(line.height).height;
             if y < top + height {
                 return Some((ix, y - top));
             }
@@ -550,9 +566,14 @@ impl EditorLayout {
     }
 }
 
+struct LaidLine {
+    wrapped: WrappedLine,
+    height: Pixels,
+}
+
 struct EditorLayoutInner {
-    lines: Vec<WrappedLine>,
-    line_height: Pixels,
+    lines: Vec<LaidLine>,
+    body_line_height: Pixels,
     content_height: Pixels,
     bounds: Option<Bounds<Pixels>>,
 }

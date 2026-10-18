@@ -9,8 +9,8 @@ use gpui::{
 };
 
 use crate::{
-    display::{FragmentKind, InlineStyle, ProjectedLine, Style as LineStyle, WidgetKind},
-    editor::MarkdownEditor,
+    display::{Fragment, FragmentKind, InlineStyle, ProjectedLine, Style as LineStyle, WidgetKind},
+    editor::{ImageState, MarkdownEditor},
     input::scroll::{EditorScrollState, clamp_offset},
     theme::EditorTheme,
 };
@@ -91,9 +91,9 @@ impl Element for EditorElement {
                     _ => None,
                 });
 
-                let (plan, theme) = {
+                let (plan, theme, images) = {
                     let view = view.read(cx);
-                    (view.plan(), view.theme().clone())
+                    (view.plan(), view.theme().clone(), view.image_metrics())
                 };
 
                 let mut lines = Vec::with_capacity(plan.lines.len());
@@ -104,7 +104,26 @@ impl Element for EditorElement {
                         LineStyle::Heading { level } => theme.heading_scale(level),
                     };
                     let font_size = base_font_size * scale;
-                    let line_height = base_line_height * scale;
+                    let mut line_height = base_line_height * scale;
+                    if let Some(path) = line_image(&projected.fragments) {
+                        let natural = match images.get(&path) {
+                            Some(ImageState::Loaded(image)) => {
+                                let size = image.size(0);
+                                let scale_factor = window.scale_factor();
+                                Some((
+                                    size.width.0 as f32 / scale_factor,
+                                    size.height.0 as f32 / scale_factor,
+                                ))
+                            }
+                            _ => None,
+                        };
+                        let natural_min = base_line_height.as_f32() * 2.;
+                        let target = match natural {
+                            Some((_, height)) => px(height.min(360.).max(natural_min)),
+                            None => px(120.),
+                        };
+                        line_height = line_height.max(target);
+                    }
                     let mut style = text_style.clone();
                     style.font_size = font_size.into();
                     match projected.style {
@@ -203,7 +222,7 @@ impl Element for EditorElement {
         };
         let align = window.text_style().text_align;
 
-        let (theme, selection_state, caret_visible, focus_handle, marked_range, plan) = {
+        let (theme, selection_state, caret_visible, focus_handle, marked_range, plan, images) = {
             let view = self.view.read(cx);
             (
                 view.theme().clone(),
@@ -212,6 +231,7 @@ impl Element for EditorElement {
                 view.focus_handle().clone(),
                 view.marked_range(),
                 view.plan(),
+                view.image_metrics(),
             )
         };
         window.handle_input(
@@ -295,6 +315,20 @@ impl Element for EditorElement {
                                 },
                             };
                             window.paint_quad(fill(block, theme.code_block_background));
+                        }
+                        if let Some(path) = line_image(&projected.fragments) {
+                            paint_image_line(
+                                &laid.wrapped,
+                                line_origin,
+                                height,
+                                projected,
+                                &path,
+                                &images,
+                                bounds,
+                                &theme,
+                                window,
+                                cx,
+                            );
                         }
                         if show_selection {
                             paint_selection(
@@ -388,6 +422,128 @@ impl Element for EditorElement {
         if let Some((url, position)) = self.view.read(cx).hover_link() {
             paint_tooltip(&url, position, bounds, &theme, window, cx);
         }
+    }
+}
+
+/// The image destination referenced by a line's widget, if any.
+fn line_image(fragments: &[Fragment]) -> Option<String> {
+    fragments.iter().find_map(|fragment| match &fragment.kind {
+        FragmentKind::Widget(WidgetKind::Image { path }) => Some(path.clone()),
+        _ => None,
+    })
+}
+
+/// Paints a whole-line image at its natural size (clamped to the content
+/// width and 360 pt height), or a placeholder while loading/failed.
+#[allow(clippy::too_many_arguments)]
+fn paint_image_line(
+    line: &WrappedLine,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    projected: &ProjectedLine,
+    path: &str,
+    images: &std::collections::HashMap<String, ImageState>,
+    bounds: Bounds<Pixels>,
+    theme: &EditorTheme,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let display = projected
+        .fragments
+        .iter()
+        .find_map(|fragment| match &fragment.kind {
+            FragmentKind::Widget(WidgetKind::Image { path: widget_path })
+                if widget_path == path =>
+            {
+                Some(fragment.display.start)
+            }
+            _ => None,
+        });
+    let Some(display) = display else {
+        return;
+    };
+    let Some(position) = line.position_for_index(display, line_height) else {
+        return;
+    };
+    let x = origin.x + position.x;
+    let y = origin.y + position.y;
+
+    if let Some(ImageState::Loaded(image)) = images.get(path) {
+        let scale_factor = window.scale_factor();
+        let size = image.size(0);
+        let natural_width = size.width.0 as f32 / scale_factor;
+        let natural_height = size.height.0 as f32 / scale_factor;
+        if natural_width <= 0. || natural_height <= 0. {
+            return;
+        }
+        let fit = (bounds.size.width.as_f32() / natural_width)
+            .min(360. / natural_height)
+            .min(1.0);
+        let target = gpui::size(px(natural_width * fit), px(natural_height * fit));
+        let rect = Bounds {
+            origin: point(x, y),
+            size: target,
+        };
+        if let Err(error) = window.paint_image(rect, rect, px(4.).into(), image.clone(), 0, false) {
+            tracing::warn!(error = %error, "failed to paint image");
+        }
+        return;
+    }
+
+    // Loading or failed: a placeholder box labeled with the file name.
+    let label = format!("▢ {path}");
+    let rect = Bounds {
+        origin: point(x, y),
+        size: gpui::size(
+            bounds.size.width.min(px(320.)),
+            (line_height - px(8.)).max(px(24.)),
+        ),
+    };
+    window.paint_quad(fill(rect, theme.code_background).corner_radii(6.));
+    paint_label(
+        &label,
+        point(
+            rect.origin.x + px(8.),
+            rect.origin.y + (rect.size.height - px(14.)) / 2.,
+        ),
+        theme,
+        window,
+        cx,
+    );
+}
+
+/// Paints one small dimmed line of text (labels, tooltips).
+fn paint_label(
+    label: &str,
+    origin: Point<Pixels>,
+    theme: &EditorTheme,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let mut style = window.text_style().clone();
+    style.font_size = px(12.).into();
+    style.color = theme.text.opacity(0.6);
+    let Ok(mut shaped) = window.text_system().shape_text(
+        SharedString::new(label),
+        px(12.),
+        &[style.to_run(label.len())],
+        None,
+        None,
+    ) else {
+        return;
+    };
+    let Some(line) = shaped.pop() else {
+        return;
+    };
+    if let Err(error) = line.paint(
+        origin,
+        window.pixel_snap(px(14.)),
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    ) {
+        tracing::warn!(error = %error, "failed to paint label");
     }
 }
 

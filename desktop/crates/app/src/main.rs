@@ -153,11 +153,18 @@ fn open_app_window(cx: &mut App, path: Option<PathBuf>) -> Result<()> {
         },
         None => WELCOME.to_string(),
     };
+    let base_dir = path
+        .as_ref()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
 
     gpui_kit::open_window(options, cx, move |window, cx| {
         let theme = EditorTheme::default();
         let buffer = cx.new(|_| Buffer::from_text(&content));
-        let editor = cx.new(|cx| MarkdownEditor::new(buffer, theme.clone(), cx));
+        let editor = cx.new(|cx| {
+            let mut editor = MarkdownEditor::new(buffer, theme.clone(), cx);
+            editor.set_base_dir(base_dir.clone(), cx);
+            editor
+        });
         let focus_handle = editor.read(cx).focus_handle().clone();
         window.focus(&focus_handle, cx);
         cx.new(|cx| DainikiApp::new(editor, theme, path, cx))

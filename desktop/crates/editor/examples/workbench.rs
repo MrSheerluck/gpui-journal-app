@@ -32,6 +32,11 @@ markers. Links collapse to colored text: hover
 URL, cmd-click to open it, click to reveal the source. Headings collapse to
 real sizes once the caret leaves their line.
 
+Images reference files next to the journal; a missing one shows a labeled
+placeholder until you point it at a real file:
+
+![missing](assets/does-not-exist.png)
+
 - Unicode shaping works too: héllo - 日本語 - emoji 🎉
 - This second item exists mainly to make the list rhythm visible.
 - [ ] Click this checkbox: it toggles without moving the caret, and one undo
@@ -86,14 +91,20 @@ fn init_tracing() {
 fn main() {
     init_tracing();
 
+    let mut base_dir = None;
     let text = match std::env::args().nth(1) {
-        Some(path) => match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) => {
-                eprintln!("failed to read {path}: {error}");
-                std::process::exit(1);
+        Some(path) => {
+            base_dir = std::path::Path::new(&path)
+                .parent()
+                .map(std::path::Path::to_path_buf);
+            match fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    eprintln!("failed to read {path}: {error}");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         None => SAMPLE.to_string(),
     };
 
@@ -112,7 +123,11 @@ fn main() {
             },
             move |window, cx| {
                 let theme = EditorTheme::default();
-                let editor = cx.new(|cx| MarkdownEditor::new(buffer.clone(), theme.clone(), cx));
+                let editor = cx.new(|cx| {
+                    let mut editor = MarkdownEditor::new(buffer.clone(), theme.clone(), cx);
+                    editor.set_base_dir(base_dir.clone(), cx);
+                    editor
+                });
                 let focus_handle = editor.read(cx).focus_handle().clone();
                 window.focus(&focus_handle, cx);
                 cx.new(|_cx| Workbench { theme, editor })

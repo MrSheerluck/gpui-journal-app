@@ -7,6 +7,7 @@ description = "Dainiki's live-preview markdown editor, built directly on GPUI pr
 
 [dependencies]
 gpui.workspace = true
+image.workspace = true
 ropey.workspace = true
 tracing.workspace = true
 tree-sitter.workspace = true

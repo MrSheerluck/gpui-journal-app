@@ -44,18 +44,18 @@ pub struct StyleRun {
     pub style: InlineStyle,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FragmentKind {
     /// Text the user sees; maps linearly from source to display.
     Visible,
     /// Markup the live preview hides while collapsed; zero width in display.
     Hidden,
-    /// A rendered stand-in for markup: bullet glyph, task checkbox.
+    /// A rendered stand-in for markup: bullet glyph, task checkbox, image.
     Widget(WidgetKind),
 }
 
 /// Widgets that replace source markup while collapsed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WidgetKind {
     /// A `-`/`*`/`+` marker rendered as `•`.
     Bullet,
@@ -63,6 +63,8 @@ pub enum WidgetKind {
     Task { checked: bool },
     /// A `---` rule rendered as a full-width painted line.
     Rule,
+    /// A whole-line `![alt](path)` rendered as the decoded image.
+    Image { path: String },
 }
 
 /// One piece of a projected line. Fragments tile both the source range and
@@ -132,11 +134,11 @@ impl ProjectedLine {
     /// The widget under a display byte, if any: its source range and kind.
     pub fn widget_at_display(&self, display: usize) -> Option<(Range<usize>, WidgetKind)> {
         for fragment in &self.fragments {
-            if let FragmentKind::Widget(kind) = fragment.kind
+            if let FragmentKind::Widget(kind) = &fragment.kind
                 && fragment.display.start <= display
                 && display < fragment.display.end
             {
-                return Some((fragment.source.clone(), kind));
+                return Some((fragment.source.clone(), kind.clone()));
             }
         }
         None
@@ -331,6 +333,28 @@ fn project_line(
                     }
                 }
             }
+            ConstructKind::Image => {
+                if !revealed(construct, selection) {
+                    let destination = construct.inner.get(1).map(|range| &text[range.clone()]);
+                    let file_name = destination
+                        .and_then(|destination| destination.rsplit('/').next())
+                        .unwrap_or("image");
+                    let whole_line = is_whole_line(&construct.range, &source, text);
+                    if whole_line {
+                        pieces.push((
+                            reveal_range,
+                            Piece::Glyph {
+                                text: " ".to_string(),
+                                widget: WidgetKind::Image {
+                                    path: destination.unwrap_or_default().to_string(),
+                                },
+                            },
+                        ));
+                    } else {
+                        pieces.push((reveal_range, Piece::Text(format!("[image: {file_name}]"))));
+                    }
+                }
+            }
             ConstructKind::Emphasis
             | ConstructKind::Strong
             | ConstructKind::Strikethrough
@@ -355,7 +379,6 @@ fn project_line(
                     }
                 }
             }
-            _ => {}
         }
     }
 
@@ -371,11 +394,19 @@ fn project_line(
     }
 }
 
-/// What a source piece becomes in the display: nothing (hidden) or a widget
-/// glyph standing in for markup (bullet, checkbox).
+/// What a source piece becomes in the display: nothing (hidden), replacement
+/// text, or a widget glyph standing in for markup (bullet, checkbox, image).
 enum Piece {
     Hide,
+    Text(String),
     Glyph { text: String, widget: WidgetKind },
+}
+
+/// True when `range` spans the whole line content except surrounding spaces.
+fn is_whole_line(range: &Range<usize>, line: &Range<usize>, text: &str) -> bool {
+    let before = &text[line.start..range.start];
+    let after = &text[range.end..line.end];
+    before.trim().is_empty() && after.trim().is_empty()
 }
 
 fn inline_style(kind: &ConstructKind) -> InlineStyle {
@@ -438,6 +469,15 @@ fn build_fragments(
                     display: display..display,
                     kind: FragmentKind::Hidden,
                 });
+            }
+            Piece::Text(replacement) => {
+                output.push_str(&replacement);
+                fragments.push(Fragment {
+                    source: range.clone(),
+                    display: display..display + replacement.len(),
+                    kind: FragmentKind::Visible,
+                });
+                display += replacement.len();
             }
             Piece::Glyph {
                 text: glyph,
@@ -775,6 +815,31 @@ mod tests {
             plan.lines[0].text,
             "see [the docs](https://example.com) now"
         );
+    }
+
+    #[test]
+    fn whole_line_images_collapse_to_a_widget() {
+        let text = "before\n\n![alt](assets/x.png)\n\nafter\n";
+        let plan = plan_for(text, Selection::caret(0));
+        let line = &plan.lines[2];
+        assert_eq!(line.text, " ");
+        let (_, widget) = line.widget_at_display(0).expect("image widget");
+        assert_eq!(
+            widget,
+            WidgetKind::Image {
+                path: "assets/x.png".into()
+            }
+        );
+
+        let plan = plan_for(text, Selection::caret(10));
+        assert_eq!(plan.lines[2].text, "![alt](assets/x.png)");
+    }
+
+    #[test]
+    fn inline_images_fall_back_to_a_labeled_chip() {
+        let text = "text ![a](p.png) more\n";
+        let plan = plan_for(text, Selection::caret(0));
+        assert_eq!(plan.lines[0].text, "text [image: p.png] more");
     }
 
     #[test]

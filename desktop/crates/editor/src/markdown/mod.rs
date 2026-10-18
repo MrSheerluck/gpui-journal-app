@@ -326,6 +326,10 @@ fn scan_highlights(text: &str, existing: &[Construct], out: &mut Vec<Construct>)
                 Some(start) => {
                     open = None;
                     if position > start + 2 && !inside_code(line_start + position) {
+                        // One range element by design; the lint misreads
+                        // `vec![a..b]` as a mistaken `vec![x; n]`.
+                        #[allow(clippy::single_range_in_vec_init)]
+                        let inner = vec![line_start + start + 2..line_start + position];
                         out.push(Construct {
                             kind: ConstructKind::Highlight,
                             range: line_start + start..line_start + position + 2,
@@ -333,7 +337,7 @@ fn scan_highlights(text: &str, existing: &[Construct], out: &mut Vec<Construct>)
                                 line_start + start..line_start + start + 2,
                                 line_start + position..line_start + position + 2,
                             ],
-                            inner: vec![line_start + start + 2..line_start + position],
+                            inner,
                         });
                     }
                 }

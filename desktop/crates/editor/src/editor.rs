@@ -1,11 +1,14 @@
+use std::collections::HashMap;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollWheelEvent,
-    UTF16Selection, Window, div, point, prelude::*, px, size,
+    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render, RenderImage,
+    ScrollWheelEvent, UTF16Selection, Window, div, point, prelude::*, px, size,
 };
 
 use crate::{
@@ -53,6 +56,16 @@ pub struct MarkdownEditor {
     drag_position: Point<Pixels>,
     hover_link: Option<(String, Point<Pixels>)>,
     autoscroll_active: bool,
+    base_dir: Option<PathBuf>,
+    images: HashMap<String, ImageState>,
+}
+
+/// Decoded state of one referenced image, keyed by its destination string.
+#[derive(Clone)]
+pub(crate) enum ImageState {
+    Loading,
+    Loaded(Arc<RenderImage>),
+    Failed,
 }
 
 impl MarkdownEditor {
@@ -78,6 +91,8 @@ impl MarkdownEditor {
             drag_position: Point::default(),
             hover_link: None,
             autoscroll_active: false,
+            base_dir: None,
+            images: HashMap::new(),
         };
         this.spawn_blink(cx);
         this
@@ -153,6 +168,78 @@ impl MarkdownEditor {
         self.plan = Rc::new(DisplayPlan::compute(&text, &self.index, self.selection));
         self.display_revision = self.revision;
         self.display_selection = self.selection;
+        self.ensure_images(&text, cx);
+    }
+
+    /// The directory relative image destinations resolve against.
+    pub fn set_base_dir(&mut self, dir: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.base_dir = dir;
+        self.images.clear();
+        self.revision += 1;
+        cx.notify();
+    }
+
+    /// The resolved filesystem path for an image destination.
+    fn resolved_asset_path(&self, destination: &str) -> PathBuf {
+        let path = PathBuf::from(destination);
+        if path.is_absolute() {
+            return path;
+        }
+        match &self.base_dir {
+            Some(dir) => dir.join(path),
+            None => path,
+        }
+    }
+
+    /// Starts background loads for every referenced image not yet tracked.
+    fn ensure_images(&mut self, text: &str, cx: &mut Context<Self>) {
+        let destinations: Vec<String> = self
+            .index
+            .constructs()
+            .iter()
+            .filter_map(|construct| match construct.kind {
+                ConstructKind::Image => construct
+                    .inner
+                    .get(1)
+                    .map(|range| text[range.clone()].to_string()),
+                _ => None,
+            })
+            .collect();
+        for destination in destinations {
+            if self.images.contains_key(&destination) {
+                continue;
+            }
+            self.images.insert(destination.clone(), ImageState::Loading);
+            let path = self.resolved_asset_path(&destination);
+            cx.spawn(async move |this, cx| {
+                let decoded = cx
+                    .background_executor()
+                    .spawn({
+                        let path = path.clone();
+                        async move { load_render_image(&path) }
+                    })
+                    .await;
+                let state = match decoded {
+                    Ok(image) => ImageState::Loaded(image),
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), error = %error, "failed to load image");
+                        ImageState::Failed
+                    }
+                };
+                this.update(cx, |editor, cx| {
+                    editor.images.insert(destination, state);
+                    editor.revision += 1;
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    /// Snapshot of image load states for layout and painting.
+    pub(crate) fn image_metrics(&self) -> HashMap<String, ImageState> {
+        self.images.clone()
     }
 
     pub fn scroll_by(&mut self, delta: Pixels, cx: &mut Context<Self>) {
@@ -192,12 +279,16 @@ impl MarkdownEditor {
             self.toggle_task(marker, checked, cx);
             return;
         }
-        if event.modifiers.platform
-            && !event.modifiers.shift
-            && let Some(url) = self.link_at(hit.offset, cx)
-        {
-            cx.open_url(&url);
-            return;
+        if event.modifiers.platform && !event.modifiers.shift {
+            if let Some((_, WidgetKind::Image { path })) = &hit.widget {
+                let path = self.resolved_asset_path(path);
+                cx.open_url(&format!("file://{}", path.display()));
+                return;
+            }
+            if let Some(url) = self.link_at(hit.offset, cx) {
+                cx.open_url(&url);
+                return;
+            }
         }
         match event.click_count {
             2 => {
@@ -709,6 +800,14 @@ fn autoscroll_step(
 struct PointHit {
     offset: usize,
     widget: Option<(Range<usize>, WidgetKind)>,
+}
+
+/// Reads and decodes an image file into a renderer-ready image.
+fn load_render_image(path: &std::path::Path) -> Result<Arc<RenderImage>, String> {
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    let decoded = image::load_from_memory(&bytes).map_err(|error| error.to_string())?;
+    let frame = image::Frame::new(decoded.to_rgba8());
+    Ok(Arc::new(RenderImage::new([frame])))
 }
 
 /// Converts a UTF-16 offset inside `text` to a byte offset. An offset inside a

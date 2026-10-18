@@ -95,9 +95,11 @@ fn main() {
                 window_min_size: Some(size(px(480.0), px(320.0))),
                 ..Default::default()
             },
-            move |_window, cx| {
+            move |window, cx| {
                 let theme = EditorTheme::default();
-                let editor = cx.new(|_cx| MarkdownEditor::new(buffer.clone(), theme.clone()));
+                let editor = cx.new(|cx| MarkdownEditor::new(buffer.clone(), theme.clone(), cx));
+                let focus_handle = editor.read(cx).focus_handle().clone();
+                window.focus(&focus_handle, cx);
                 cx.new(|_cx| Workbench { theme, editor })
             },
         )

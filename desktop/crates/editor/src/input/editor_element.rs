@@ -1,14 +1,17 @@
 use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
-    App, AvailableSpace, Bounds, DefiniteLength, Element, ElementId, Entity, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, Length, Pixels, SharedString, Size, Style, Window,
-    WrappedLine, fill, point, px,
+    App, AvailableSpace, Bounds, DefiniteLength, Element, ElementId, Entity, GlobalElementId, Hsla,
+    InspectorElementId, IntoElement, LayoutId, Length, Pixels, Point, SharedString, Size, Style,
+    Window, WrappedLine, fill, point, px,
 };
 
 use crate::{
     buffer::Buffer,
-    input::scroll::{EditorScrollState, clamp_offset},
+    input::{
+        Selection,
+        scroll::{EditorScrollState, clamp_offset},
+    },
     theme::EditorTheme,
 };
 
@@ -21,6 +24,8 @@ pub struct EditorElement {
     theme: EditorTheme,
     scroll: Rc<EditorScrollState>,
     layout: EditorLayout,
+    selection: Selection,
+    show_caret: bool,
 }
 
 impl EditorElement {
@@ -29,12 +34,16 @@ impl EditorElement {
         theme: EditorTheme,
         scroll: Rc<EditorScrollState>,
         layout: EditorLayout,
+        selection: Selection,
+        show_caret: bool,
     ) -> Self {
         Self {
             buffer,
             theme,
             scroll,
             layout,
+            selection,
+            show_caret,
         }
     }
 }
@@ -187,23 +196,63 @@ impl Element for EditorElement {
             0.0
         };
 
+        let show_selection = !self.selection.is_caret();
+        let selection = (self.selection.start(), self.selection.end());
+        let show_caret = self.show_caret && !show_selection;
+        let caret = if show_caret {
+            let buffer = self.buffer.read(cx);
+            Some(buffer.offset_to_line(self.selection.head()))
+        } else {
+            None
+        };
+        let line_ranges: Vec<(usize, usize)> = if show_selection {
+            let buffer = self.buffer.read(cx);
+            (0..buffer.len_lines())
+                .map(|ix| (buffer.line_start_byte(ix), buffer.line_end_byte(ix)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         window.paint_layer(bounds, |window| {
             let mut line_origin = point(bounds.origin.x, bounds.origin.y - offset);
-            for line in &inner.lines {
+            for (ix, line) in inner.lines.iter().enumerate() {
                 let height = line.size(inner.line_height).height;
                 let line_bottom = line_origin.y + height;
-                if line_bottom > bounds.origin.y
-                    && line_origin.y < viewport_bottom
-                    && let Err(error) = line.paint(
+                if line_bottom > bounds.origin.y && line_origin.y < viewport_bottom {
+                    if let Some(&line_range) = line_ranges.get(ix) {
+                        paint_selection(
+                            line,
+                            line_origin,
+                            inner.line_height,
+                            line_range,
+                            selection,
+                            self.theme.selection,
+                            window,
+                        );
+                    }
+                    if let Err(error) = line.paint(
                         line_origin,
                         inner.line_height,
                         align,
                         Some(bounds),
                         window,
                         cx,
-                    )
-                {
-                    tracing::warn!(error = %error, "failed to paint a line");
+                    ) {
+                        tracing::warn!(error = %error, "failed to paint a line");
+                    }
+                    if let Some((caret_line, caret_local)) = caret
+                        && ix == caret_line
+                    {
+                        paint_caret(
+                            line,
+                            line_origin,
+                            inner.line_height,
+                            caret_local,
+                            self.theme.caret,
+                            window,
+                        );
+                    }
                 }
                 line_origin.y += height;
             }
@@ -230,6 +279,98 @@ impl Element for EditorElement {
             window.paint_quad(fill(thumb, self.theme.scrollbar).corner_radii(THUMB_WIDTH / 2.));
         }
     }
+}
+
+/// Paints the selection intersection of one line: highlight quads per wrapped
+/// segment, plus a newline sliver when the selection continues past the line.
+fn paint_selection(
+    line: &WrappedLine,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    line_range: (usize, usize),
+    selection: (usize, usize),
+    color: Hsla,
+    window: &mut Window,
+) {
+    let (line_start, line_end) = line_range;
+    if selection.0 > line_end {
+        return;
+    }
+    let content_len = line_end - line_start;
+    let clip_start = selection.0.saturating_sub(line_start).min(content_len);
+    let clip_end = selection.1.saturating_sub(line_start).min(content_len);
+
+    let starts = segment_starts(line);
+    let unwrapped = &line.unwrapped_layout;
+    if clip_start < clip_end {
+        for (segment, pair) in starts.windows(2).enumerate() {
+            let start = clip_start.max(pair[0]);
+            let end = clip_end.min(pair[1]);
+            if start >= end {
+                continue;
+            }
+            let base = unwrapped.x_for_index(pair[0]);
+            let x0 = unwrapped.x_for_index(start) - base;
+            let x1 = unwrapped.x_for_index(end) - base;
+            let quad = Bounds {
+                origin: point(origin.x + x0, origin.y + line_height * segment as f32),
+                size: Size {
+                    width: x1 - x0,
+                    height: line_height,
+                },
+            };
+            window.paint_quad(fill(quad, color));
+        }
+    }
+
+    if selection.1 > line_end
+        && let Some(position) = line.position_for_index(content_len, line_height)
+    {
+        let sliver = Bounds {
+            origin: point(origin.x + position.x, origin.y + position.y),
+            size: Size {
+                width: px(6.),
+                height: line_height,
+            },
+        };
+        window.paint_quad(fill(sliver, color));
+    }
+}
+
+/// Paints the caret bar for one line at a byte offset within its text.
+fn paint_caret(
+    line: &WrappedLine,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    local: usize,
+    color: Hsla,
+    window: &mut Window,
+) {
+    let Some(position) = line.position_for_index(local, line_height) else {
+        return;
+    };
+    let caret = Bounds {
+        origin: point(origin.x + position.x, origin.y + position.y),
+        size: Size {
+            width: px(2.),
+            height: line_height,
+        },
+    };
+    window.paint_quad(fill(caret, color));
+}
+
+/// Byte offsets where each wrapped segment of the line starts, terminated by
+/// the line's total length.
+fn segment_starts(line: &WrappedLine) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(line.wrap_boundaries().len() + 2);
+    starts.push(0);
+    for boundary in line.wrap_boundaries() {
+        if let Some(glyph) = line.runs()[boundary.run_ix].glyphs.get(boundary.glyph_ix) {
+            starts.push(glyph.index);
+        }
+    }
+    starts.push(line.len());
+    starts
 }
 
 #[derive(Clone, Default)]

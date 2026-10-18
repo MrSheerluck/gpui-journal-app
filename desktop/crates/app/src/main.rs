@@ -28,6 +28,7 @@ use gpui_kit::component::button::{Button, ButtonVariants, Toggle, ToggleGroup};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarAxis};
+use gpui_kit::component::separator::Separator;
 use gpui_kit::component::text::markdown;
 use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::{Icon, h_flex, v_flex};
@@ -1845,8 +1846,17 @@ impl JournalSession {
                             .items_center()
                             .child(
                                 Toolbar::new("editor-toolbar")
-                                    .child(active.inline_toolbar(cx))
-                                    .child(active.block_toolbar(cx)),
+                                    .content(
+                                        div()
+                                            .debug_selector(|| "inline-formats".to_string())
+                                            .child(active.inline_toolbar(cx)),
+                                    )
+                                    .content(Separator::vertical())
+                                    .content(
+                                        div()
+                                            .debug_selector(|| "block-formats".to_string())
+                                            .child(active.block_toolbar(cx)),
+                                    ),
                             )
                             .child(active.insert_menu())
                             .child(
@@ -2535,82 +2545,101 @@ fn finish_toggle(this: WeakEntity<DainikiApp>) -> Toggle {
 }
 
 impl ActiveDay {
-    fn inline_toggle(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        format: InlineFormat,
-        tooltip: &'static str,
-        cx: &App,
-    ) -> Toggle {
-        let active = self.editor.read(cx).inline_format_active(format);
-        let editor = self.editor.clone();
-        Toggle::new(id)
-            .label(label)
-            .tooltip(tooltip)
-            .checked(active)
-            .on_click(move |_checked, _window, cx| {
-                editor.update(cx, |editor, cx| editor.toggle_inline_format(format, cx));
-            })
-    }
-
-    fn block_toggle(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        format: BlockFormat,
-        tooltip: &'static str,
-        cx: &App,
-    ) -> Toggle {
-        let active = self.editor.read(cx).block_format_active(format, cx);
-        let editor = self.editor.clone();
-        Toggle::new(id)
-            .label(label)
-            .tooltip(tooltip)
-            .checked(active)
-            .on_click(move |_checked, _window, cx| {
-                editor.update(cx, |editor, cx| editor.toggle_block_format(format, cx));
-            })
-    }
-
+    /// The block-format toggles, in order. The group callback maps the
+    /// flipped index back to a format: the component replaces per-toggle
+    /// callbacks inside a group, so the group owns the click.
     fn block_toolbar(&self, cx: &App) -> ToggleGroup {
-        ToggleGroup::new("block-formats").segmented().children([
-            self.block_toggle("h1", "H1", BlockFormat::Heading(1), "Heading 1 — ⌘1", cx),
-            self.block_toggle("h2", "H2", BlockFormat::Heading(2), "Heading 2 — ⌘2", cx),
-            self.block_toggle("h3", "H3", BlockFormat::Heading(3), "Heading 3 — ⌘3", cx),
-            self.block_toggle("bullet", "•", BlockFormat::Bullet, "Bullet list — ⌘⇧8", cx),
-            self.block_toggle(
-                "ordered",
-                "1.",
-                BlockFormat::Ordered,
-                "Numbered list — ⌘⇧7",
-                cx,
-            ),
-            self.block_toggle("task", "☐", BlockFormat::Task, "Task list — ⌘⇧9", cx),
-            self.block_toggle("quote", ">", BlockFormat::Quote, "Quote", cx),
-        ])
+        let formats = [
+            BlockFormat::Heading(1),
+            BlockFormat::Heading(2),
+            BlockFormat::Heading(3),
+            BlockFormat::Bullet,
+            BlockFormat::Ordered,
+            BlockFormat::Task,
+            BlockFormat::Quote,
+        ];
+        let items: [(&'static str, IconName, &'static str); 7] = [
+            ("h1", IconName::Heading1, "Heading 1 — ⌘1"),
+            ("h2", IconName::Heading2, "Heading 2 — ⌘2"),
+            ("h3", IconName::Heading3, "Heading 3 — ⌘3"),
+            ("bullet", IconName::List, "Bullet list — ⌘⇧8"),
+            ("ordered", IconName::ListOrdered, "Numbered list — ⌘⇧7"),
+            ("task", IconName::ListTodo, "Task list — ⌘⇧9"),
+            ("quote", IconName::TextQuote, "Quote"),
+        ];
+        let checked: Vec<bool> = formats
+            .iter()
+            .map(|format| self.editor.read(cx).block_format_active(*format, cx))
+            .collect();
+        let known = checked.clone();
+        let editor = self.editor.clone();
+
+        let mut group = ToggleGroup::new("block-formats").segmented();
+        for (index, (id, icon, tooltip)) in items.into_iter().enumerate() {
+            group = group.child(
+                Toggle::new(id)
+                    .icon(Icon::new(icon))
+                    .tooltip(tooltip)
+                    .checked(checked[index]),
+            );
+        }
+        group.on_click(move |next: &Vec<bool>, _window, cx| {
+            let Some(index) = next
+                .iter()
+                .zip(&known)
+                .position(|(now, before)| now != before)
+            else {
+                return;
+            };
+            let format = formats[index];
+            editor.update(cx, |editor, cx| editor.toggle_block_format(format, cx));
+        })
     }
 
+    /// The inline-format toggles, in order. Same group-callback contract as
+    /// the block toolbar.
     fn inline_toolbar(&self, cx: &App) -> ToggleGroup {
-        ToggleGroup::new("inline-formats").segmented().children([
-            self.inline_toggle("bold", "B", InlineFormat::Bold, "Bold — ⌘B", cx),
-            self.inline_toggle("italic", "I", InlineFormat::Italic, "Italic — ⌘I", cx),
-            self.inline_toggle(
-                "strike",
-                "S",
-                InlineFormat::Strike,
-                "Strikethrough — ⌘⇧X",
-                cx,
-            ),
-            self.inline_toggle(
-                "highlight",
-                "H",
-                InlineFormat::Highlight,
-                "Highlight — ⌘⇧H",
-                cx,
-            ),
-            self.inline_toggle("code", "`", InlineFormat::Code, "Inline code — ⌘`", cx),
-        ])
+        let formats = [
+            InlineFormat::Bold,
+            InlineFormat::Italic,
+            InlineFormat::Strike,
+            InlineFormat::Highlight,
+            InlineFormat::Code,
+        ];
+        let items: [(&'static str, IconName, &'static str); 5] = [
+            ("bold", IconName::Bold, "Bold — ⌘B"),
+            ("italic", IconName::Italic, "Italic — ⌘I"),
+            ("strike", IconName::Strikethrough, "Strikethrough — ⌘⇧X"),
+            ("highlight", IconName::Highlighter, "Highlight — ⌘⇧H"),
+            ("code", IconName::Code, "Inline code — ⌘`"),
+        ];
+        let checked: Vec<bool> = formats
+            .iter()
+            .map(|format| self.editor.read(cx).inline_format_active(*format))
+            .collect();
+        let known = checked.clone();
+        let editor = self.editor.clone();
+
+        let mut group = ToggleGroup::new("inline-formats").segmented();
+        for (index, (id, icon, tooltip)) in items.into_iter().enumerate() {
+            group = group.child(
+                Toggle::new(id)
+                    .icon(Icon::new(icon))
+                    .tooltip(tooltip)
+                    .checked(checked[index]),
+            );
+        }
+        group.on_click(move |next: &Vec<bool>, _window, cx| {
+            let Some(index) = next
+                .iter()
+                .zip(&known)
+                .position(|(now, before)| now != before)
+            else {
+                return;
+            };
+            let format = formats[index];
+            editor.update(cx, |editor, cx| editor.toggle_inline_format(format, cx));
+        })
     }
 
     fn help_menu(&self) -> Popover {
@@ -2635,7 +2664,12 @@ impl ActiveDay {
             ("Reveal markup", "click into a construct"),
         ];
         Popover::new("shortcut-help")
-            .trigger(Button::new("help-trigger").label("?").compact())
+            .trigger(
+                Button::new("help-trigger")
+                    .icon(Icon::new(IconName::CircleQuestionMark))
+                    .tooltip("Shortcuts")
+                    .compact(),
+            )
             .content(move |_state, _window, _cx| {
                 v_flex()
                     .w(px(360.))
@@ -2660,7 +2694,12 @@ impl ActiveDay {
         let image_dir = document_dir.clone();
 
         Popover::new("insert-menu")
-            .trigger(Button::new("insert-trigger").label("Insert").compact())
+            .trigger(
+                Button::new("insert-trigger")
+                    .icon(Icon::new(IconName::Plus))
+                    .tooltip("Insert")
+                    .compact(),
+            )
             .content(move |_state, _window, _cx| {
                 let link = Button::new("insert-link")
                     .label("Link")
@@ -3326,6 +3365,53 @@ mod tests {
             let app = app.read(cx);
             let session = app.session().expect("an open session");
             assert!(session.video.is_none(), "closing the day drops the pump");
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn a_toolbar_toggle_formats_the_open_line(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        seed_day(&journal, today, "hello");
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let target = cx
+            .debug_bounds("block-formats")
+            .expect("the block toolbar renders while editing")
+            .center();
+        cx.simulate_click(target, gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let active = app
+                .session()
+                .and_then(|session| session.active.as_ref())
+                .expect("still editing");
+            let content = active.editor.read(cx).content(cx);
+            assert_ne!(content, "hello", "a toolbar click must reach the editor");
+            assert!(
+                content.starts_with("# ")
+                    || content.starts_with("- ")
+                    || content.starts_with("1. ")
+                    || content.starts_with("> "),
+                "the clicked toggle should apply a block format, got {content:?}"
+            );
         });
         fs::remove_dir_all(&dir).ok();
     }

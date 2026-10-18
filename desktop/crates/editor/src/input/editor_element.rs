@@ -376,6 +376,19 @@ fn segment_starts(line: &WrappedLine) -> Vec<usize> {
 #[derive(Clone, Default)]
 pub struct EditorLayout(Rc<RefCell<Option<EditorLayoutInner>>>);
 
+impl EditorLayout {
+    /// Runs `f` over the wrapped line at `ix` together with the line height.
+    pub(crate) fn with_line<R>(
+        &self,
+        ix: usize,
+        f: impl FnOnce(&WrappedLine, Pixels) -> R,
+    ) -> Option<R> {
+        let inner = self.0.borrow();
+        let inner = inner.as_ref()?;
+        inner.lines.get(ix).map(|line| f(line, inner.line_height))
+    }
+}
+
 struct EditorLayoutInner {
     lines: Vec<WrappedLine>,
     line_height: Pixels,

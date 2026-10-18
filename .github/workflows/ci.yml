@@ -44,3 +44,7 @@ jobs:
             echo "::error::dainiki-editor must not depend on the gpui-kit stack"
             exit 1
           fi
+          if cargo tree -p dainiki-editor --depth 1 | grep -E "objc2|gpui-kit"; then
+            echo "::error::dainiki-editor must not depend on platform frameworks (objc2 arrives transitively through gpui-pre alone)"
+            exit 1
+          fi

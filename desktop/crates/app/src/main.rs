@@ -2718,7 +2718,8 @@ impl ActiveDay {
                         }
                     });
                 let image = Button::new("insert-image")
-                    .label("Image…")
+                    .label("Media…")
+                    .tooltip("Insert an image, audio or video file")
                     .compact()
                     .disabled(image_dir.is_none())
                     .on_click({
@@ -2732,7 +2733,7 @@ impl ActiveDay {
                                 files: true,
                                 directories: false,
                                 multiple: false,
-                                prompt: Some("Choose an image".into()),
+                                prompt: Some("Choose an image, audio or video file".into()),
                             });
                             let editor = editor.clone();
                             window
@@ -2746,7 +2747,7 @@ impl ActiveDay {
                                     let assets = directory.join("assets");
                                     let copied = cx
                                         .background_executor()
-                                        .spawn(async move { copy_image(&source, &assets) })
+                                        .spawn(async move { copy_into_assets(&source, &assets) })
                                         .await;
                                     let Ok((alt, relative)) = copied else {
                                         return;
@@ -2982,14 +2983,15 @@ fn parse_jump_date(input: &str, today: NaiveDate) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(&text.replace('/', "-"), "%Y-%m-%d").ok()
 }
 
-/// Copies an image into the journal's `assets/` folder under a fresh name,
-/// returning `(alt text, relative markdown path)`.
-fn copy_image(source: &Path, assets: &Path) -> Result<(String, String), String> {
+/// Copies a media file into the journal's `assets/` folder under a fresh
+/// name, returning `(alt text, relative markdown path)`. Images, audio and
+/// video all ride the same `![](…)` reference.
+fn copy_into_assets(source: &Path, assets: &Path) -> Result<(String, String), String> {
     std::fs::create_dir_all(assets).map_err(|error| error.to_string())?;
     let stem = source
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "image".to_string());
+        .unwrap_or_else(|| "media".to_string());
     let extension = source
         .extension()
         .map(|extension| extension.to_string_lossy().into_owned())
@@ -3000,7 +3002,7 @@ fn copy_image(source: &Path, assets: &Path) -> Result<(String, String), String> 
             source
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "image".to_string())
+                .unwrap_or_else(|| "media".to_string())
         } else if extension.is_empty() {
             format!("{stem}-{counter}")
         } else {

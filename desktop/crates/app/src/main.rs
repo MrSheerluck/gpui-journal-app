@@ -918,9 +918,9 @@ impl JournalSession {
             self.stream.reset(dates.len() + 1);
         }
 
-        // The live day gets a capped editing surface inside the stream, so
-        // history is always visible below it.
-        let editor_height = px((window.viewport_size().height.as_f32() * 0.55).clamp(320., 440.));
+        // The live day's editor takes the full remaining height under the
+        // chrome; it scrolls internally when the entry is long.
+        let editor_height = px((window.viewport_size().height.as_f32() - 160.).max(320.));
 
         // A day that swapped between editor and render changed height; the
         // list must remeasure it (preserving the scroll anchor).
@@ -934,16 +934,17 @@ impl JournalSession {
         }
 
         // A jump asked for this day to be revealed; do it on the frame that
-        // knows where it sits in the stream.
+        // knows where it sits in the stream. Pinning the item's top is
+        // deterministic even when far items are still unmeasured.
         if let Some(date) = self.pending_reveal.take()
             && let Some(ix) = dates.iter().position(|day| *day == date)
         {
-            self.stream.scroll_to_reveal_item(ix);
+            self.stream.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: px(0.),
+            });
         }
 
-        // The gutter and the history marker only appear when the window has
-        // room for them (the mock gates them behind xl).
-        let show_gutter = window.viewport_size().width > px(1000.);
         let oldest_label = dates
             .last()
             .map(|date| date.format("%B %-d, %Y").to_string());
@@ -989,25 +990,26 @@ impl JournalSession {
                 clickable_day(item_this.clone(), date, inner)
             };
 
-            let content = v_flex()
+            // The day as a row: the gutter number, the timeline rule, and the
+            // content column filling the rest of the window.
+            let content = h_flex()
                 .w_full()
-                .max_w(px(672.))
-                .mx_auto()
-                .relative()
-                .when(show_gutter, |el| {
-                    el.child(day_gutter(date, today)).child(
-                        // The timeline rule running down the content column.
-                        div()
-                            .absolute()
-                            .left(px(-28.))
-                            .top(px(24.))
-                            .bottom(px(24.))
-                            .w(px(1.))
-                            .bg(brand::outline_variant().opacity(0.2)),
-                    )
-                })
-                .child(day_header(date, today, is_active))
-                .child(body);
+                .items_start()
+                .child(day_gutter(date, today))
+                .child(
+                    div()
+                        .w(px(1.))
+                        .self_stretch()
+                        .mx_4()
+                        .bg(brand::outline_variant().opacity(0.2)),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(day_header(date, today, is_active))
+                        .child(body),
+                );
 
             let divider = h_flex().my_4().justify_center().child(
                 div()
@@ -1048,8 +1050,6 @@ impl JournalSession {
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .max_w(px(672.))
-                            .mx_auto()
                             .child(div().w(px(360.)).child(Input::new(&self.search_input)))
                             .when(self.filter.is_active(), |el| {
                                 el.child(
@@ -1090,8 +1090,6 @@ impl JournalSession {
                     .child(
                         v_flex()
                             .gap_3()
-                            .max_w(px(672.))
-                            .mx_auto()
                             .child(
                                 h_flex()
                                     .justify_between()
@@ -1259,8 +1257,6 @@ impl JournalSession {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(672.))
-                        .mx_auto()
                         .h_full()
                         .child(stream_list.size_full().px_8().pt_8()),
                 )
@@ -1847,36 +1843,32 @@ fn day_header(date: NaiveDate, today: NaiveDate, is_active: bool) -> AnyElement 
         .into_any_element()
 }
 
-/// The ghosted day number and its weekday caption, in the gutter left of the
-/// content column as in the showcase.
+/// The ghosted day number and its weekday caption in the day's left gutter,
+/// as in the showcase.
 fn day_gutter(date: NaiveDate, today: NaiveDate) -> AnyElement {
     let caption = if date == today {
         "TODAY".to_string()
     } else {
         date.format("%a").to_string().to_uppercase()
     };
-    div()
-        .absolute()
-        .left(px(-96.))
-        .top(px(4.))
+    v_flex()
+        .w(px(72.))
+        .items_end()
+        .pt_1()
         .opacity(0.4)
         .child(
-            v_flex()
-                .items_end()
-                .child(
-                    div()
-                        .font_family(brand::SERIF_FAMILY)
-                        .text_size(px(48.))
-                        .line_height(px(48.))
-                        .text_color(brand::outline_variant())
-                        .child(day_number(date)),
-                )
-                .child(
-                    div()
-                        .text_size(px(10.))
-                        .text_color(brand::on_surface_variant())
-                        .child(caption),
-                ),
+            div()
+                .font_family(brand::SERIF_FAMILY)
+                .text_size(px(48.))
+                .line_height(px(48.))
+                .text_color(brand::outline_variant())
+                .child(day_number(date)),
+        )
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(brand::on_surface_variant())
+                .child(caption),
         )
         .into_any_element()
 }
@@ -2867,6 +2859,15 @@ mod tests {
                 app.enter_journal(dir, window, cx);
                 app
             }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // Reading mode first: with the full-height editor open, yesterday
+        // sits below the fold. Finishing editing renders today as a day too.
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| app.stop_editing(cx));
         });
         cx.update(|window, cx| {
             let _ = window.draw(cx);

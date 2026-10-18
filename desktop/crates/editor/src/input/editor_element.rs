@@ -222,7 +222,16 @@ impl Element for EditorElement {
         };
         let align = window.text_style().text_align;
 
-        let (theme, selection_state, caret_visible, focus_handle, marked_range, plan, images) = {
+        let (
+            theme,
+            selection_state,
+            caret_visible,
+            focus_handle,
+            marked_range,
+            plan,
+            images,
+            reveal_pending,
+        ) = {
             let view = self.view.read(cx);
             (
                 view.theme().clone(),
@@ -232,6 +241,7 @@ impl Element for EditorElement {
                 view.marked_range(),
                 view.plan(),
                 view.image_metrics(),
+                view.reveal_pending(),
             )
         };
         window.handle_input(
@@ -259,31 +269,35 @@ impl Element for EditorElement {
             None
         };
 
-        // Reveal the caret before painting: while focused with a collapsed
-        // caret, keep it inside the viewport with one line of margin.
-        if let Some(source) = caret_source
-            && let Some(plan_index) = plan.line_for_source(source)
-            && let Some(laid) = inner.lines.get(plan_index)
-            && let Some(projected) = plan.lines.get(plan_index)
-        {
-            let mut caret_top = Pixels::ZERO;
-            for line in &inner.lines[..plan_index] {
-                caret_top += line.wrapped.size(line.height).height;
-            }
-            if let Some(segment) = laid
-                .wrapped
-                .position_for_index(projected.display_for_source(source), laid.height)
+        // Reveal the caret once per caret/text change: keep it inside the
+        // viewport with one line of margin. Pure scrolling never sets the
+        // flag, so the wheel is never fought by the reveal.
+        if reveal_pending {
+            if let Some(source) = caret_source
+                && let Some(plan_index) = plan.line_for_source(source)
+                && let Some(laid) = inner.lines.get(plan_index)
+                && let Some(projected) = plan.lines.get(plan_index)
             {
-                caret_top += segment.y;
+                let mut caret_top = Pixels::ZERO;
+                for line in &inner.lines[..plan_index] {
+                    caret_top += line.wrapped.size(line.height).height;
+                }
+                if let Some(segment) = laid
+                    .wrapped
+                    .position_for_index(projected.display_for_source(source), laid.height)
+                {
+                    caret_top += segment.y;
+                }
+                let target = reveal_offset(
+                    caret_top,
+                    laid.height,
+                    bounds.size.height,
+                    self.scroll.offset(),
+                    laid.height,
+                );
+                self.scroll.set_offset(target);
             }
-            let target = reveal_offset(
-                caret_top,
-                laid.height,
-                bounds.size.height,
-                self.scroll.offset(),
-                laid.height,
-            );
-            self.scroll.set_offset(target);
+            self.view.update(cx, |view, _| view.clear_reveal());
         }
 
         let viewport_bottom = bounds.origin.y + bounds.size.height;

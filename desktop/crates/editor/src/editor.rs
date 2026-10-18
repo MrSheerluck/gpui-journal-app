@@ -58,6 +58,10 @@ pub struct MarkdownEditor {
     autoscroll_active: bool,
     base_dir: Option<PathBuf>,
     images: HashMap<String, ImageState>,
+    /// Set when the caret or text changed; consumed by one paint to scroll
+    /// the caret into view. Scrolling never triggers it, so the wheel is
+    /// never fought by the reveal.
+    reveal_pending: bool,
 }
 
 /// Decoded state of one referenced image, keyed by its destination string.
@@ -93,6 +97,7 @@ impl MarkdownEditor {
             autoscroll_active: false,
             base_dir: None,
             images: HashMap::new(),
+            reveal_pending: true,
         };
         this.spawn_blink(cx);
         this
@@ -168,7 +173,17 @@ impl MarkdownEditor {
         self.plan = Rc::new(DisplayPlan::compute(&text, &self.index, self.selection));
         self.display_revision = self.revision;
         self.display_selection = self.selection;
+        self.reveal_pending = true;
         self.ensure_images(&text, cx);
+    }
+
+    /// Whether this frame should scroll the caret into view. Consumed once.
+    pub(crate) fn reveal_pending(&self) -> bool {
+        self.reveal_pending
+    }
+
+    pub(crate) fn clear_reveal(&mut self) {
+        self.reveal_pending = false;
     }
 
     /// The directory relative image destinations resolve against.

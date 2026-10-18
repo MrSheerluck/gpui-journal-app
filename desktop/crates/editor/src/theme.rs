@@ -18,6 +18,8 @@ pub struct EditorTheme {
     /// Hover tooltip behind link URLs.
     pub tooltip_background: Hsla,
     pub tooltip_text: Hsla,
+    /// Slash-menu panel.
+    pub menu_background: Hsla,
     /// Family used for inline code and fenced code.
     pub mono_font_family: SharedString,
     /// Font size multipliers for H1–H3; deeper headings use the last entry.
@@ -38,6 +40,7 @@ impl Default for EditorTheme {
             link: rgb(0x2F6FEB).into(),
             tooltip_background: rgba(0x1F2328F2).into(),
             tooltip_text: rgb(0xFAFAF8).into(),
+            menu_background: rgba(0xFFFFFFF7).into(),
             mono_font_family: SharedString::new_static("Menlo"),
             heading_scales: [1.6, 1.35, 1.15],
         }

@@ -13,7 +13,7 @@ use gpui::{
 
 use crate::{
     buffer::Buffer,
-    commands::{self, BlockFormat, Edit as CommandEdit, InlineFormat},
+    commands::{self, BlockFormat, Edit as CommandEdit, InlineFormat, SlashItem},
     display::{DisplayPlan, WidgetKind},
     input::{
         EditorElement, EditorLayout, EditorScrollState, Selection,
@@ -59,6 +59,10 @@ pub struct MarkdownEditor {
     base_dir: Option<PathBuf>,
     images: HashMap<String, ImageState>,
     pending_edit: Option<PendingEdit>,
+    slash: Option<SlashMenu>,
+    /// A slash position the user dismissed with Escape; no menu re-opens
+    /// there until the `/` itself is gone.
+    slash_dismissed: Option<usize>,
     /// Set when the caret or text changed; consumed by one paint to scroll
     /// the caret into view. Scrolling never triggers it, so the wheel is
     /// never fought by the reveal.
@@ -80,6 +84,20 @@ enum PendingEdit {
     One { range: Range<usize>, new_len: usize },
     Full,
 }
+
+/// The slash menu's live state, derived from the buffer on every projection.
+#[derive(Clone, Debug)]
+pub(crate) struct SlashMenu {
+    /// Byte offset of the `/` that opened the menu.
+    pub query_start: usize,
+    /// What has been typed after the slash so far.
+    pub query: String,
+    pub items: Vec<SlashItem>,
+    pub selected: usize,
+}
+
+pub(crate) const SLASH_ROW_HEIGHT: f32 = 26.;
+pub(crate) const SLASH_PANEL_WIDTH: f32 = 240.;
 
 impl MarkdownEditor {
     pub fn new(buffer: Entity<Buffer>, theme: EditorTheme, cx: &mut Context<Self>) -> Self {
@@ -107,6 +125,8 @@ impl MarkdownEditor {
             base_dir: None,
             images: HashMap::new(),
             pending_edit: None,
+            slash: None,
+            slash_dismissed: None,
             reveal_pending: true,
         };
         this.spawn_blink(cx);
@@ -198,7 +218,136 @@ impl MarkdownEditor {
         self.display_revision = self.revision;
         self.display_selection = self.selection;
         self.reveal_pending = true;
+        self.sync_slash(&text);
         self.ensure_images(&text, cx);
+    }
+
+    /// Re-derives the slash menu from the buffer: a `/` typed at a word
+    /// boundary on the caret's line, followed only by a short query.
+    fn sync_slash(&mut self, text: &str) {
+        let previous = self.slash.take();
+        self.slash = self.detect_slash(text).map(|mut menu| {
+            if let Some(previous) = &previous
+                && previous.query_start == menu.query_start
+                && previous.query == menu.query
+                && !menu.items.is_empty()
+            {
+                menu.selected = previous.selected.min(menu.items.len() - 1);
+            }
+            menu
+        });
+    }
+
+    fn detect_slash(&self, text: &str) -> Option<SlashMenu> {
+        if !self.selection.is_caret() {
+            return None;
+        }
+        let caret = self.selection.head().min(text.len());
+        let line_start = text[..caret].rfind('\n').map(|ix| ix + 1).unwrap_or(0);
+        let typed = &text[line_start..caret];
+
+        let mut query_start = None;
+        for (ix, ch) in typed.char_indices() {
+            let at_boundary = typed[..ix]
+                .chars()
+                .last()
+                .map(|before| before.is_whitespace())
+                .unwrap_or(true);
+            if ch == '/' && at_boundary {
+                query_start = Some(line_start + ix);
+            }
+        }
+        let query_start = query_start?;
+        if self.slash_dismissed == Some(query_start) {
+            return None;
+        }
+        // No menu inside code spans or fences.
+        if self
+            .index
+            .constructs_in(query_start..query_start + 1)
+            .any(|c| matches!(c.kind, ConstructKind::CodeSpan | ConstructKind::Fence))
+        {
+            return None;
+        }
+
+        let query = &text[query_start + 1..caret];
+        if query.chars().any(char::is_whitespace) || query.len() > 24 {
+            return None;
+        }
+        let items = commands::slash_items(query);
+        if items.is_empty() {
+            return None;
+        }
+        Some(SlashMenu {
+            query_start,
+            query: query.to_string(),
+            items,
+            selected: 0,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn slash_menu(&self) -> Option<SlashMenu> {
+        self.slash.clone()
+    }
+
+    fn apply_slash_item(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(menu) = self.slash.take() else {
+            return;
+        };
+        let Some(item) = menu.items.get(index).copied() else {
+            return;
+        };
+        let text = self.content(cx);
+        let caret = self.selection.head();
+        let command = commands::apply_slash(&text, caret, menu.query_start, item);
+        self.slash_dismissed = None;
+        self.apply_command(command, cx);
+    }
+
+    /// The dropdown panel's screen rectangle for the current slash menu,
+    /// anchored below the slash and clamped to the editor's bounds.
+    pub(crate) fn slash_panel(&self, cx: &App) -> Option<(SlashMenu, gpui::Bounds<Pixels>)> {
+        let menu = self.slash.clone()?;
+        let bounds = self.layout.bounds()?;
+        let line_height = self.layout.body_line_height()?;
+        let (line_ix, local) = {
+            let buffer = self.buffer.read(cx);
+            buffer.offset_to_line(menu.query_start)
+        };
+        let display = self
+            .plan
+            .lines
+            .get(line_ix)
+            .map(|line| line.display_for_source(menu.query_start))
+            .unwrap_or(local);
+        let (x, segment_y) = self.layout.with_line(line_ix, |line, height| {
+            line.position_for_index(display, height)
+                .map(|position| (position.x, position.y))
+        })??;
+        let top = self.layout.line_top(line_ix)?;
+
+        let width = px(SLASH_PANEL_WIDTH);
+        let rows = menu.items.len();
+        let height = px(SLASH_ROW_HEIGHT * rows as f32 + 8.);
+        let gap = px(4.);
+        let mut origin_x = bounds.origin.x + x;
+        let below = bounds.origin.y + top + segment_y + line_height - self.scroll.offset() + gap;
+        let origin_y = if below + height <= bounds.origin.y + bounds.size.height {
+            below
+        } else {
+            (below - height - line_height - px(8.)).max(bounds.origin.y)
+        };
+        origin_x = origin_x
+            .min(bounds.origin.x + bounds.size.width - width - gap)
+            .max(bounds.origin.x + gap);
+        Some((
+            menu,
+            gpui::Bounds {
+                origin: point(origin_x, origin_y),
+                size: gpui::Size { width, height },
+            },
+        ))
     }
 
     /// Whether this frame should scroll the caret into view. Consumed once.
@@ -304,6 +453,16 @@ impl MarkdownEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A click inside the slash panel picks its row.
+        if let Some((menu, rect)) = self.slash_panel(cx)
+            && rect.contains(&event.position)
+        {
+            let row = ((event.position.y - rect.origin.y - px(4.)) / px(SLASH_ROW_HEIGHT)) as usize;
+            if row < menu.items.len() {
+                self.apply_slash_item(row, cx);
+                return;
+            }
+        }
         tracing::debug!(
             focused = self.focus_handle.is_focused(window),
             "editor mouse down"
@@ -569,6 +728,41 @@ impl MarkdownEditor {
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         tracing::debug!(key = %keystroke.key, "editor key down");
+        if let Some(menu) = self.slash.as_ref() {
+            let (selected, query_start, count) =
+                (menu.selected, menu.query_start, menu.items.len());
+            match keystroke.key.as_str() {
+                "up" => {
+                    if let Some(menu) = self.slash.as_mut() {
+                        menu.selected = selected.saturating_sub(1);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "down" => {
+                    if let Some(menu) = self.slash.as_mut() {
+                        menu.selected = (selected + 1).min(count.saturating_sub(1));
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                "enter" => {
+                    self.apply_slash_item(selected, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "escape" => {
+                    self.slash_dismissed = Some(query_start);
+                    self.slash = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
         // Return and Tab carry control characters: macOS routes them through
         // key-command selectors that land here, not through text input, so we
         // insert them ourselves.
@@ -1315,6 +1509,7 @@ impl Render for MarkdownEditor {
 mod interaction_tests {
     use super::*;
     use crate::buffer::Buffer;
+    use crate::commands::SlashItem;
     use gpui::{TestAppContext, VisualTestContext};
 
     fn setup<'a>(
@@ -1636,6 +1831,104 @@ mod interaction_tests {
         let text = cx.read_from_clipboard().and_then(|item| item.text());
         assert_eq!(text.as_deref(), Some("a **bold** and `code` tail"));
         let _ = editor;
+    }
+
+    #[gpui::test]
+    async fn slash_menu_applies_formatting_by_keyboard(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "");
+        cx.simulate_input("/hea");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_, app| {
+            let menu = editor.read(app).slash_menu().expect("menu open");
+            assert_eq!(
+                menu.items,
+                vec![
+                    SlashItem::Heading1,
+                    SlashItem::Heading2,
+                    SlashItem::Heading3
+                ]
+            );
+        });
+        cx.simulate_keystrokes("down enter");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "## ");
+            assert_eq!(editor.read(app).selection().head(), 3);
+        });
+        cx.simulate_keystrokes("cmd-z");
+        cx.update(|_, app| {
+            assert_eq!(
+                editor.read(app).content(app),
+                "/hea",
+                "one undo restores the query"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn slash_menu_geometry_and_click(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "");
+        cx.simulate_input("/h");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let panel = cx.update(|_, app| {
+            let (menu, rect) = editor.read(app).slash_panel(app).expect("panel laid out");
+            assert_eq!(menu.items.len(), 3, "headers match the query");
+            assert!(rect.size.width > px(100.));
+            rect
+        });
+        // Clicking the second row ("Heading 2") applies it.
+        let row = panel.origin.y + px(4.) + px(SLASH_ROW_HEIGHT * 1.5);
+        cx.simulate_click(
+            point(panel.origin.x + px(20.), row),
+            gpui::Modifiers::default(),
+        );
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "## ");
+            assert_eq!(editor.read(app).selection().head(), 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn slash_menu_filters_dismisses_and_respects_code(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "");
+        cx.simulate_input("/quo");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_, app| {
+            assert_eq!(
+                editor.read(app).slash_menu().expect("menu").items,
+                vec![SlashItem::Quote]
+            );
+            assert!(editor.read(app).slash_menu().is_some());
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.simulate_input("te");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_, app| {
+            assert!(
+                editor.read(app).slash_menu().is_none(),
+                "dismissal is sticky"
+            );
+        });
+
+        let (editor, cx) = setup(cx, "`a /b`");
+        cx.simulate_keystrokes("cmd-a right");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_, app| {
+            assert!(
+                editor.read(app).slash_menu().is_none(),
+                "no menu inside code spans"
+            );
+        });
     }
 
     #[gpui::test]

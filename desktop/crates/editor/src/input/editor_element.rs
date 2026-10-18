@@ -436,6 +436,47 @@ impl Element for EditorElement {
         if let Some((url, position)) = self.view.read(cx).hover_link() {
             paint_tooltip(&url, position, bounds, &theme, window, cx);
         }
+
+        if let Some((menu, rect)) = self.view.read(cx).slash_panel(cx) {
+            paint_slash_menu(&menu, rect, &theme, window, cx);
+        }
+    }
+}
+
+/// Paints the slash-command dropdown.
+fn paint_slash_menu(
+    menu: &crate::editor::SlashMenu,
+    rect: Bounds<Pixels>,
+    theme: &EditorTheme,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.paint_quad(fill(rect, theme.menu_background).corner_radii(8.));
+    let row_height = px(crate::editor::SLASH_ROW_HEIGHT);
+    for (ix, item) in menu.items.iter().enumerate() {
+        let row = Bounds {
+            origin: point(
+                rect.origin.x + px(4.),
+                rect.origin.y + px(4.) + row_height * ix as f32,
+            ),
+            size: Size {
+                width: rect.size.width - px(8.),
+                height: row_height,
+            },
+        };
+        if ix == menu.selected {
+            window.paint_quad(fill(row, theme.selection).corner_radii(5.));
+        }
+        paint_label(
+            item.label(),
+            point(
+                row.origin.x + px(10.),
+                row.origin.y + (row_height - px(14.)) / 2.,
+            ),
+            theme,
+            window,
+            cx,
+        );
     }
 }
 

@@ -745,6 +745,19 @@ impl MarkdownEditor {
         }
     }
 
+    /// Inserts a Markdown link around the selection (toolbar popover).
+    pub fn insert_link(&mut self, url: &str, cx: &mut Context<Self>) {
+        let text = self.content(cx);
+        let command = commands::insert_link(&text, self.selection, url);
+        self.apply_command(command, cx);
+    }
+
+    /// Inserts an image reference at the caret (toolbar popover).
+    pub fn insert_image(&mut self, alt: &str, path: &str, cx: &mut Context<Self>) {
+        let command = commands::insert_image(self.selection, alt, path);
+        self.apply_command(command, cx);
+    }
+
     /// Wraps the selection in a fenced code block, or inserts an empty one.
     pub fn insert_code_fence(&mut self, cx: &mut Context<Self>) {
         let text = self.content(cx);
@@ -1493,6 +1506,33 @@ mod interaction_tests {
                     .read(app)
                     .block_format_active(BlockFormat::Bullet, app)
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn link_and_image_api_inserts(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "hello");
+        cx.simulate_keystrokes("cmd-a");
+        cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| editor.insert_link("https://x.dev", cx));
+        });
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "[hello](https://x.dev)");
+        });
+        cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.insert_image("shot", "assets/a.png", cx)
+            });
+        });
+        cx.update(|_, app| {
+            assert_eq!(
+                editor.read(app).content(app),
+                "[hello](https://x.dev)![shot](assets/a.png)"
+            );
+        });
+        cx.simulate_keystrokes("cmd-z");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "[hello](https://x.dev)");
         });
     }
 

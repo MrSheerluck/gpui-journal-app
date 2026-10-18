@@ -327,6 +327,37 @@ fn strip_block_prefix(line: &str) -> String {
     line.to_string()
 }
 
+/// Inserts a Markdown link. A selection becomes the label; a collapsed caret
+/// uses the URL as the label so the result is immediately useful.
+pub fn insert_link(text: &str, selection: Selection, url: &str) -> Edit {
+    let url = url.trim();
+    let (start, end) = (selection.start(), selection.end());
+    let label = if selection.is_caret() {
+        url
+    } else {
+        &text[start..end]
+    };
+    let new_text = format!("[{label}]({url})");
+    let caret = start + new_text.len();
+    Edit {
+        range: start..end,
+        new_text,
+        new_selection: Selection::caret(caret),
+    }
+}
+
+/// Inserts an image reference at the caret, replacing any selection.
+pub fn insert_image(selection: Selection, alt: &str, path: &str) -> Edit {
+    let (start, end) = (selection.start(), selection.end());
+    let new_text = format!("![{alt}]({path})");
+    let caret = start + new_text.len();
+    Edit {
+        range: start..end,
+        new_text,
+        new_selection: Selection::caret(caret),
+    }
+}
+
 /// Removes an enclosing delimiter pair around a selection: `open` and `close`
 /// are the marker ranges (e.g. of a parsed strong construct).
 pub fn unwrap_delimiters(
@@ -487,6 +518,20 @@ mod tests {
         let edit = insert_code_fence("", Selection::caret(0)).unwrap();
         assert_eq!(apply("", &edit), "```\n\n```\n");
         assert_eq!(edit.new_selection, Selection::caret(4));
+    }
+
+    #[test]
+    fn link_and_image_inserts() {
+        let text = "the docs";
+        let edit = super::insert_link(text, Selection::new(4, 8), "https://example.com");
+        assert_eq!(apply(text, &edit), "the [docs](https://example.com)");
+        assert_eq!(edit.new_selection, Selection::caret(31));
+
+        let edit = super::insert_link("", Selection::caret(0), "  https://x.dev  ");
+        assert_eq!(apply("", &edit), "[https://x.dev](https://x.dev)");
+
+        let edit = super::insert_image(Selection::caret(0), "shot", "assets/shot.png");
+        assert_eq!(apply("", &edit), "![shot](assets/shot.png)");
     }
 
     #[test]

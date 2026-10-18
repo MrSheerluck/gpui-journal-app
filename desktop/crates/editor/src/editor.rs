@@ -3,9 +3,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    Bounds, Context, Entity, EntityInputHandler, FocusHandle, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollWheelEvent, UTF16Selection,
-    Window, div, point, prelude::*, px, size,
+    Bounds, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollWheelEvent,
+    UTF16Selection, Window, div, point, prelude::*, px, size,
 };
 
 use crate::{
@@ -190,6 +190,31 @@ impl MarkdownEditor {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform {
+            match keystroke.key.as_str() {
+                "c" => {
+                    self.copy_selection(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "x" => {
+                    self.cut_selection(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "v" => {
+                    self.paste_clipboard(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "a" => {
+                    self.select_all(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if matches!(keystroke.key.as_str(), "backspace" | "delete") {
             let backward = keystroke.key == "backspace";
             let alt = keystroke.modifiers.alt;
@@ -240,6 +265,50 @@ impl MarkdownEditor {
             self.restart_blink();
             self.apply_input_edit(range, "", None, false, cx);
         }
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if self.selection.is_caret() {
+            return;
+        }
+        let text = {
+            let buffer = self.buffer.read(cx);
+            buffer.slice(self.selection.start()..self.selection.end())
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        if self.selection.is_caret() {
+            return;
+        }
+        self.copy_selection(cx);
+        self.restart_blink();
+        self.apply_input_edit(
+            self.selection.start()..self.selection.end(),
+            "",
+            None,
+            false,
+            cx,
+        );
+    }
+
+    fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let range = self.resolve_input_range(None, cx);
+        self.apply_input_edit(range, &text, None, false, cx);
+    }
+
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        let end = self.buffer.read(cx).len_bytes();
+        self.selection = Selection::new(0, end);
+        self.restart_blink();
+        cx.notify();
     }
 
     /// The byte offset a navigation key should move the caret to: grapheme and

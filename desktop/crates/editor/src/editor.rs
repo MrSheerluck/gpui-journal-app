@@ -10,7 +10,11 @@ use gpui::{
 
 use crate::{
     buffer::Buffer,
-    input::{EditorElement, EditorLayout, EditorScrollState, Selection, movement},
+    input::{
+        EditorElement, EditorLayout, EditorScrollState, Selection,
+        history::{Edit, History, MergeKind},
+        movement,
+    },
     theme::EditorTheme,
 };
 
@@ -24,6 +28,7 @@ pub struct MarkdownEditor {
     selection: Selection,
     focus_handle: FocusHandle,
     marked_range: Option<Range<usize>>,
+    history: History,
     caret_visible: bool,
     blink_epoch: u64,
     focused: bool,
@@ -39,6 +44,7 @@ impl MarkdownEditor {
             selection: Selection::default(),
             focus_handle: cx.focus_handle(),
             marked_range: None,
+            history: History::default(),
             caret_visible: true,
             blink_epoch: 0,
             focused: false,
@@ -119,6 +125,7 @@ impl MarkdownEditor {
     ) {
         window.focus(&self.focus_handle, cx);
         self.restart_blink();
+        self.history.break_run();
         let Some(offset) = self.offset_for_point(event.position, cx) else {
             return;
         };
@@ -164,6 +171,7 @@ impl MarkdownEditor {
             return;
         };
         self.selection.move_head(offset);
+        self.history.break_run();
         self.restart_blink();
         cx.notify();
     }
@@ -212,6 +220,11 @@ impl MarkdownEditor {
                     cx.stop_propagation();
                     return;
                 }
+                "z" => {
+                    self.undo_redo(keystroke.modifiers.shift, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -237,6 +250,7 @@ impl MarkdownEditor {
         let Some(target) = target else {
             return;
         };
+        self.history.break_run();
         self.restart_blink();
         if extend {
             self.selection.move_head(target);
@@ -262,8 +276,13 @@ impl MarkdownEditor {
             deletion_range(buffer, self.selection, backward, word, line)
         };
         if let Some(range) = range {
+            let merge = if backward && !word && !line && self.selection.is_caret() {
+                MergeKind::TypingDelete
+            } else {
+                MergeKind::None
+            };
             self.restart_blink();
-            self.apply_input_edit(range, "", None, false, cx);
+            self.apply_input_edit(range, "", None, false, merge, cx);
         }
     }
 
@@ -289,6 +308,7 @@ impl MarkdownEditor {
             "",
             None,
             false,
+            MergeKind::None,
             cx,
         );
     }
@@ -301,14 +321,30 @@ impl MarkdownEditor {
             return;
         }
         let range = self.resolve_input_range(None, cx);
-        self.apply_input_edit(range, &text, None, false, cx);
+        self.apply_input_edit(range, &text, None, false, MergeKind::None, cx);
     }
 
     fn select_all(&mut self, cx: &mut Context<Self>) {
         let end = self.buffer.read(cx).len_bytes();
         self.selection = Selection::new(0, end);
+        self.history.break_run();
         self.restart_blink();
         cx.notify();
+    }
+
+    fn undo_redo(&mut self, redo: bool, cx: &mut Context<Self>) {
+        let selection = self.buffer.update(cx, |buffer, _| {
+            if redo {
+                self.history.redo(buffer)
+            } else {
+                self.history.undo(buffer)
+            }
+        });
+        if let Some(selection) = selection {
+            self.selection = selection;
+            self.restart_blink();
+            cx.notify();
+        }
     }
 
     /// The byte offset a navigation key should move the caret to: grapheme and
@@ -506,7 +542,14 @@ impl EntityInputHandler for MarkdownEditor {
         cx: &mut Context<Self>,
     ) {
         let range = self.resolve_input_range(range, cx);
-        self.apply_input_edit(range, text, None, false, cx);
+        let merge = if self.marked_range.is_some() {
+            MergeKind::Composition
+        } else if text.chars().count() == 1 && !text.contains('\n') {
+            MergeKind::TypingInsert
+        } else {
+            MergeKind::None
+        };
+        self.apply_input_edit(range, text, None, false, merge, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -521,7 +564,7 @@ impl EntityInputHandler for MarkdownEditor {
         let selection = new_selected_range.map(|range| {
             utf16_to_byte_in(new_text, range.start)..utf16_to_byte_in(new_text, range.end)
         });
-        self.apply_input_edit(range, new_text, selection, true, cx);
+        self.apply_input_edit(range, new_text, selection, true, MergeKind::Composition, cx);
     }
 
     fn bounds_for_range(
@@ -586,21 +629,34 @@ impl MarkdownEditor {
 
     /// Applies one input edit: replaces `range` with `text`, moves the caret to
     /// `caret_in_text` (a byte range inside `text`; `None` puts it at the end),
-    /// and tracks marked text while an IME composes.
+    /// tracks marked text while an IME composes, and records undo history.
     fn apply_input_edit(
         &mut self,
         range: Range<usize>,
         text: &str,
         caret_in_text: Option<Range<usize>>,
         mark_composition: bool,
+        merge: MergeKind,
         cx: &mut Context<Self>,
     ) {
+        let selection_before = self.selection;
         let caret = range.start + caret_in_text.map_or(text.len(), |range| range.end);
-        let marked = mark_composition.then(|| range.start..range.start + text.len());
-        self.buffer
-            .update(cx, |buffer, _| buffer.replace(range, text));
+        let removed = self
+            .buffer
+            .update(cx, |buffer, _| buffer.replace(range.clone(), text));
         self.selection.collapse(caret);
-        self.marked_range = marked;
+        self.marked_range = mark_composition.then(|| range.start..range.start + text.len());
+        self.history.record(
+            Edit {
+                range,
+                removed,
+                inserted: text.to_string(),
+                selection_before,
+                selection_after: self.selection,
+                kind: merge,
+            },
+            merge,
+        );
         self.restart_blink();
         cx.notify();
     }

@@ -1,4 +1,5 @@
 mod editor_element;
+pub(crate) mod history;
 pub mod movement;
 mod scroll;
 pub mod selection;

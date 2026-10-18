@@ -70,16 +70,22 @@ impl Buffer {
         self.rope.slice(start..end).to_string()
     }
 
-    /// Replaces the given byte range with `new_text`. The range is clamped to
-    /// the buffer; its start snaps to the previous character boundary and its
-    /// end to the next one. A collapsed range inside a character inserts
-    /// before it. An empty range is a plain insertion.
-    pub fn replace(&mut self, range: Range<usize>, new_text: &str) {
+    /// Replaces the given byte range with `new_text` and returns the text that
+    /// was removed. The range is clamped to the buffer; its start snaps to the
+    /// previous character boundary and its end to the next one. A collapsed
+    /// range inside a character inserts before it. An empty range is a plain
+    /// insertion.
+    pub fn replace(&mut self, range: Range<usize>, new_text: &str) -> String {
         let (start, end) = self.clamp_range(range);
-        if start != end {
+        let removed = if start != end {
+            let removed = self.rope.slice(start..end).to_string();
             self.rope.remove(start..end);
-        }
+            removed
+        } else {
+            String::new()
+        };
         self.rope.insert(start, new_text);
+        removed
     }
 
     /// Length of the buffer in UTF-16 code units, the unit platform text input
@@ -215,11 +221,11 @@ mod tests {
     #[test]
     fn replace_inserts_and_deletes_ranges() {
         let mut buffer = Buffer::from_text("hello world");
-        buffer.replace(5..6, ",");
+        assert_eq!(buffer.replace(5..6, ","), " ");
         assert_eq!(buffer.slice(0..buffer.len_bytes()), "hello,world");
         buffer.replace(0..0, "say ");
         assert_eq!(buffer.slice(0..buffer.len_bytes()), "say hello,world");
-        buffer.replace(3..4, "");
+        assert_eq!(buffer.replace(3..4, ""), " ");
         assert_eq!(buffer.slice(0..buffer.len_bytes()), "sayhello,world");
     }
 

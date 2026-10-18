@@ -8,6 +8,7 @@ mod config;
 mod journal;
 mod persistence;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -23,7 +24,7 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::component::button::{Button, ButtonVariants, Toggle, ToggleGroup};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::scroll::{ScrollableElement, ScrollbarAxis};
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarAxis};
 use gpui_kit::component::text::markdown;
 use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::{h_flex, v_flex};
@@ -57,9 +58,11 @@ struct JournalSession {
     active: Option<ActiveDay>,
     /// Every day with content except the active one, rendered read-only.
     days: BTreeMap<NaiveDate, String>,
-    /// The stream's scroll offset; the app owns it so navigation can move it
-    /// (and tests can watch it).
-    stream_scroll: ScrollHandle,
+    /// The virtualized stream: one item per visible-range day, plus the edge.
+    stream: ListState,
+    /// Which day the stream last rendered as the live editor, so a day that
+    /// swapped between editor and render (a different height) is remeasured.
+    active_rendered: Cell<Option<NaiveDate>>,
 }
 
 /// The day currently open in the editor, with its autosave state.
@@ -118,45 +121,46 @@ impl DainikiApp {
     }
 
     /// Opens the journal with today's entry in the editor and the past days
-    /// loaded for the stream, and swaps the screen to it.
+    /// loaded for the stream, and swaps the screen to it. Only today's file
+    /// is read on the UI thread; the rest of the journal loads in the
+    /// background and fills the stream in.
     fn open_session(
         &mut self,
         root: &Path,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> io::Result<()> {
-        let journal = journal::Journal::new(root);
         let today = Local::now().date_naive();
-
-        // Read the past days for the stream. Days with an empty file are no
-        // entry and stay out. (Reading happens once at open; a background
-        // scan is the G4 concern.)
-        let mut days = BTreeMap::new();
-        for date in journal.entry_dates() {
-            if date >= today {
-                continue;
-            }
-            let day_path = journal.entry_path(date);
-            match std::fs::read_to_string(&day_path) {
-                Ok(text) if !text.trim().is_empty() => {
-                    days.insert(date, text);
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(path = %day_path.display(), error = %error, "could not read an entry");
-                }
-            }
-        }
-
         let active = self.open_day(root, today, window, cx)?;
         tracing::info!(root = %root.display(), path = %active.path.display(), "journal opened");
         self.screen = Screen::Journal(Box::new(JournalSession {
             root: root.to_path_buf(),
             active: Some(active),
-            days,
-            stream_scroll: ScrollHandle::new(),
+            days: BTreeMap::new(),
+            stream: ListState::new(0, ListAlignment::Top, px(600.)),
+            active_rendered: Cell::new(None),
         }));
         cx.notify();
+
+        // The full scan runs off the UI thread; when it lands, merge in the
+        // days we do not already have (an in-session day is newer than disk).
+        let scan_root = root.to_path_buf();
+        let scan = cx
+            .background_executor()
+            .spawn(async move { read_days(&scan_root, today) });
+        cx.spawn(async move |this, cx| {
+            let days = scan.await;
+            this.update(cx, |app, cx| {
+                if let Some(session) = app.session_mut() {
+                    for (date, text) in days {
+                        session.days.entry(date).or_insert(text);
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
         Ok(())
     }
 
@@ -530,83 +534,72 @@ impl JournalSession {
         }
         let dates = journal::stream_dates(&existing, today, show_empty_days);
 
+        // The list renders one item per day plus the closing edge. Keep its
+        // item count in step with the day set.
+        if self.stream.item_count() != dates.len() + 1 {
+            self.stream.reset(dates.len() + 1);
+        }
+
         // The live day gets a capped editing surface inside the stream, so
         // history is always visible below it.
         let editor_height = px((window.viewport_size().height.as_f32() * 0.55).clamp(320., 440.));
 
-        let mut stream = v_flex().gap_8();
-        for date in dates {
-            let is_today = date == today;
-            let mut header = h_flex().items_center().gap_3();
-            if is_today {
-                header = header.child(
-                    div()
-                        .px_2()
-                        .py(px(2.))
-                        .rounded_full()
-                        .bg(brand::primary_fixed())
-                        .text_xs()
-                        .text_color(brand::on_primary_fixed())
-                        .child("TODAY"),
-                );
+        // A day that swapped between editor and render changed height; the
+        // list must remeasure it (preserving the scroll anchor).
+        let active_date = self.active.as_ref().map(|active| active.date);
+        if self.active_rendered.get() != active_date {
+            if let Some(date) = active_date.or(self.active_rendered.get())
+                && let Some(ix) = dates.iter().position(|day| *day == date)
+            {
+                self.stream.remeasure_items(ix..ix + 1);
             }
-            let header = header
-                .child(
-                    div()
-                        .font_family(brand::SERIF_FAMILY)
-                        .text_xl()
-                        .text_color(if is_today {
-                            brand::on_surface()
-                        } else {
-                            brand::on_surface_variant()
-                        })
-                        .child(day_label(date)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .h(px(1.))
-                        .bg(brand::outline_variant().opacity(0.55)),
-                );
-
-            let body: AnyElement = match &self.active {
-                Some(active) if active.date == date => div()
-                    .h(editor_height)
-                    .child(active.editor.clone())
-                    .into_any_element(),
-                _ => {
-                    let inner = if let Some(text) = self.days.get(&date) {
-                        div().child(markdown(text.clone())).into_any_element()
-                    } else {
-                        div()
-                            .font_family(brand::SERIF_FAMILY)
-                            .italic()
-                            .text_color(brand::outline())
-                            .child("Nothing written this day — click to write it.")
-                            .into_any_element()
-                    };
-                    clickable_day(this.clone(), date, inner)
-                }
-            };
-            stream = stream.child(v_flex().gap_4().child(header).child(body));
+            self.active_rendered.set(active_date);
         }
 
-        // The stream always ends with a designed edge, even on a fresh
-        // journal that has nothing below today.
-        stream = stream.child(
-            v_flex()
-                .items_center()
-                .gap_2()
-                .pt_4()
-                .child(div().text_xs().text_color(brand::outline()).child("· · ·"))
-                .child(
+        let active_editor = self.active.as_ref().map(|active| active.editor.clone());
+        let day_count = dates.len();
+        let item_this = this.clone();
+        let stream_list = list(self.stream.clone(), move |ix, _window, cx| {
+            if ix == day_count {
+                return stream_edge();
+            }
+            let date = dates[ix];
+            let header = day_header(date, today);
+            let body: AnyElement = if Some(date) == active_date {
+                let editor = active_editor
+                    .as_ref()
+                    .expect("the active day always has an editor");
+                div()
+                    .h(editor_height)
+                    .child(editor.clone())
+                    .into_any_element()
+            } else {
+                let text = item_this.upgrade().and_then(|app| {
+                    let app = app.read(cx);
+                    match &app.screen {
+                        Screen::Journal(session) => session.days.get(&date).cloned(),
+                        Screen::Welcome { .. } => None,
+                    }
+                });
+                let inner = if let Some(text) = text {
+                    div().child(markdown(text)).into_any_element()
+                } else {
                     div()
                         .font_family(brand::SERIF_FAMILY)
                         .italic()
                         .text_color(brand::outline())
-                        .child("This is the edge of your journal — everything you write adds to the stream."),
-                ),
-        );
+                        .child("Nothing written this day — click to write it.")
+                        .into_any_element()
+                };
+                clickable_day(item_this.clone(), date, inner)
+            };
+            v_flex()
+                .gap_4()
+                .pb_8()
+                .child(header)
+                .child(body)
+                .into_any_element()
+        });
 
         let mut column = div()
             .size_full()
@@ -642,24 +635,24 @@ impl JournalSession {
         }
 
         column.child(
-            div().flex_1().min_h_0().bg(theme.background).child(
-                div()
-                    .id("timeline")
-                    .relative()
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.stream_scroll)
-                    .scrollbar(&self.stream_scroll, ScrollbarAxis::Vertical)
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .max_w(px(760.))
-                            .mx_auto()
-                            .px_10()
-                            .py_6()
-                            .child(stream),
-                    ),
-            ),
+            div()
+                .flex_1()
+                .min_h_0()
+                .bg(theme.background)
+                .relative()
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(760.))
+                        .mx_auto()
+                        .h_full()
+                        .child(stream_list.size_full().px_10().pt_6()),
+                )
+                .child(
+                    Scrollbar::new(&self.stream)
+                        .id("stream-scrollbar")
+                        .axis(ScrollbarAxis::Vertical),
+                ),
         )
     }
 
@@ -679,6 +672,87 @@ impl JournalSession {
             }
         }
     }
+}
+
+/// Reads every past day with content, off the UI thread. Days with an empty
+/// file are no entry and stay out.
+fn read_days(root: &Path, today: NaiveDate) -> BTreeMap<NaiveDate, String> {
+    let journal = journal::Journal::new(root);
+    let mut days = BTreeMap::new();
+    for date in journal.entry_dates() {
+        if date >= today {
+            continue;
+        }
+        let day_path = journal.entry_path(date);
+        match std::fs::read_to_string(&day_path) {
+            Ok(text) if !text.trim().is_empty() => {
+                days.insert(date, text);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(path = %day_path.display(), error = %error, "could not read an entry");
+            }
+        }
+    }
+    days
+}
+
+/// One stream item's date header: the TODAY chip, the serif date, a hairline.
+fn day_header(date: NaiveDate, today: NaiveDate) -> AnyElement {
+    let is_today = date == today;
+    let mut header = h_flex().items_center().gap_3();
+    if is_today {
+        header = header.child(
+            div()
+                .px_2()
+                .py(px(2.))
+                .rounded_full()
+                .bg(brand::primary_fixed())
+                .text_xs()
+                .text_color(brand::on_primary_fixed())
+                .child("TODAY"),
+        );
+    }
+    header
+        .child(
+            div()
+                .font_family(brand::SERIF_FAMILY)
+                .text_xl()
+                .text_color(if is_today {
+                    brand::on_surface()
+                } else {
+                    brand::on_surface_variant()
+                })
+                .child(day_label(date)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .h(px(1.))
+                .bg(brand::outline_variant().opacity(0.55)),
+        )
+        .into_any_element()
+}
+
+/// The stream's closing item, so even a fresh journal reads intentionally
+/// bottom-out.
+fn stream_edge() -> AnyElement {
+    v_flex()
+        .items_center()
+        .gap_2()
+        .pt_4()
+        .pb_8()
+        .child(div().text_xs().text_color(brand::outline()).child("· · ·"))
+        .child(
+            div()
+                .font_family(brand::SERIF_FAMILY)
+                .italic()
+                .text_color(brand::outline())
+                .child(
+                    "This is the edge of your journal — everything you write adds to the stream.",
+                ),
+        )
+        .into_any_element()
 }
 
 /// Wraps a rendered day so a click opens it for editing.
@@ -1248,6 +1322,55 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn a_two_year_journal_opens_virtualized(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let mut date = today;
+        for _ in 0..730 {
+            date = date.pred_opt().expect("previous day");
+            seed_day(&journal, date, "# day\n\nA line written that day.\n");
+        }
+
+        let started = std::time::Instant::now();
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        println!("open + first frame: {:?}", started.elapsed());
+        cx.run_until_parked();
+        println!("scan settled: {:?}", started.elapsed());
+        let frame = std::time::Instant::now();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        println!("warm frame: {:?}", frame.elapsed());
+
+        // The scan fills the stream: 730 past days + today + the closing edge.
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert_eq!(session.stream.item_count(), 732);
+            assert!(session.stream.bounds_for_item(0).is_some());
+            assert!(
+                session.stream.bounds_for_item(700).is_none(),
+                "days far below the fold are not mounted"
+            );
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
     async fn the_stream_scrolls_through_history(cx: &mut TestAppContext) {
         init(cx);
         let dir = scratch_dir();
@@ -1273,9 +1396,10 @@ mod tests {
         });
 
         // A wheel over today's (short) editor must chain through to the
-        // stream instead of being swallowed.
+        // stream instead of being swallowed. The stream column is centered
+        // and capped at 760 px, so aim inside it.
         cx.simulate_event(ScrollWheelEvent {
-            position: point(px(400.), px(300.)),
+            position: point(px(960.), px(300.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-240.))),
             ..Default::default()
         });
@@ -1287,10 +1411,10 @@ mod tests {
             let Screen::Journal(session) = &app.screen else {
                 panic!("expected an open journal session");
             };
+            let top = session.stream.logical_scroll_top();
             assert!(
-                session.stream_scroll.offset().y != px(0.),
-                "the stream did not scroll: {:?}",
-                session.stream_scroll.offset()
+                top.item_ix > 0 || top.offset_in_item != px(0.),
+                "the stream did not scroll: {top:?}"
             );
         });
         fs::remove_dir_all(&dir).ok();

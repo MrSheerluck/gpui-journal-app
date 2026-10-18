@@ -7,6 +7,8 @@
 //! the end of the current or next word, a step left at the start of the
 //! previous word.
 
+use std::ops::Range;
+
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::buffer::Buffer;
@@ -98,6 +100,45 @@ pub fn line_end(buffer: &Buffer, offset: usize) -> usize {
     buffer.line_end_byte(ix)
 }
 
+/// The maximal run of same-class graphemes around `offset` within its line:
+/// a word's extent, or the extent of separators (whitespace, punctuation)
+/// when the offset sits on one. Used for double-click selection.
+pub fn run_at(buffer: &Buffer, offset: usize) -> Range<usize> {
+    let (ix, local) = buffer.offset_to_line(offset);
+    let line_start = buffer.line_start_byte(ix);
+    let text = buffer.line_text(ix);
+    let len = text.len();
+    if len == 0 {
+        return line_start..line_start;
+    }
+
+    let probe = if local >= len {
+        prev_grapheme(&text, len).1
+    } else {
+        next_grapheme(&text, local).1
+    };
+    let word = is_word_grapheme(probe);
+    let local = local.min(len);
+
+    let mut start = local;
+    while start > 0 {
+        let (previous, grapheme) = prev_grapheme(&text, start);
+        if is_word_grapheme(grapheme) != word {
+            break;
+        }
+        start = previous;
+    }
+    let mut end = local;
+    while end < len {
+        let (next, grapheme) = next_grapheme(&text, end);
+        if is_word_grapheme(grapheme) != word {
+            break;
+        }
+        end = next;
+    }
+    line_start + start..line_start + end
+}
+
 /// Start of the grapheme cluster ending at `local` within `text`.
 pub fn grapheme_left(text: &str, local: usize) -> usize {
     prev_grapheme(text, local).0
@@ -160,7 +201,7 @@ fn is_word_grapheme(grapheme: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{left, line_end, line_start, right, word_left, word_right};
+    use super::{left, line_end, line_start, right, run_at, word_left, word_right};
     use crate::buffer::Buffer;
 
     #[test]
@@ -236,6 +277,23 @@ mod tests {
         assert_eq!(word_right(&buffer, 0), 9);
         assert_eq!(word_left(&buffer, 9), 0);
         assert_eq!(word_right(&buffer, 9), 13);
+    }
+
+    #[test]
+    fn runs_select_words_and_separators() {
+        let buffer = Buffer::from_text("hello, world");
+        assert_eq!(run_at(&buffer, 2), 0..5);
+        assert_eq!(run_at(&buffer, 5), 5..7);
+        assert_eq!(run_at(&buffer, 8), 7..12);
+        assert_eq!(run_at(&buffer, 12), 7..12);
+    }
+
+    #[test]
+    fn runs_handle_cjk_and_empty_lines() {
+        let buffer = Buffer::from_text("日本語 test\n\nx");
+        assert_eq!(run_at(&buffer, 0), 0..9);
+        assert_eq!(run_at(&buffer, 10), 10..14);
+        assert_eq!(run_at(&buffer, 15), 15..15);
     }
 
     #[test]

@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use gpui::{
     Bounds, Context, Entity, EntityInputHandler, FocusHandle, KeyDownEvent, MouseButton,
-    MouseDownEvent, Pixels, Point, Render, ScrollWheelEvent, UTF16Selection, Window, div, point,
-    prelude::*, px, size,
+    MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollWheelEvent, UTF16Selection,
+    Window, div, point, prelude::*, px, size,
 };
 
 use crate::{
@@ -113,12 +113,79 @@ impl MarkdownEditor {
 
     fn on_mouse_down(
         &mut self,
-        _event: &MouseDownEvent,
+        event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle, cx);
         self.restart_blink();
+        let Some(offset) = self.offset_for_point(event.position, cx) else {
+            return;
+        };
+        match event.click_count {
+            2 => {
+                let run = {
+                    let buffer = self.buffer.read(cx);
+                    movement::run_at(buffer, offset)
+                };
+                self.selection = Selection::new(run.start, run.end);
+            }
+            3 => {
+                let (start, end) = {
+                    let buffer = self.buffer.read(cx);
+                    (
+                        movement::line_start(buffer, offset),
+                        movement::line_end(buffer, offset),
+                    )
+                };
+                self.selection = Selection::new(start, end);
+            }
+            _ => {
+                if event.modifiers.shift {
+                    self.selection.move_head(offset);
+                } else {
+                    self.selection.collapse(offset);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        let Some(offset) = self.offset_for_point(event.position, cx) else {
+            return;
+        };
+        self.selection.move_head(offset);
+        self.restart_blink();
+        cx.notify();
+    }
+
+    /// Hit-tests a window position to a byte offset: the shaped line containing
+    /// the y coordinate, then the grapheme boundary closest to x.
+    fn offset_for_point(&self, position: Point<Pixels>, cx: &mut Context<Self>) -> Option<usize> {
+        let buffer = self.buffer.read(cx);
+        let bounds = self.layout.bounds()?;
+        let content_y = position.y - bounds.origin.y + self.scroll.offset();
+        if content_y < Pixels::ZERO {
+            return Some(0);
+        }
+        let Some((line_ix, within_line)) = self.layout.line_at_y(content_y) else {
+            return Some(buffer.len_bytes());
+        };
+        let line_height = self.layout.line_height()?;
+        let x = position.x - bounds.origin.x;
+        let local = self.layout.with_line(line_ix, |line, _| {
+            snap_index(line.closest_index_for_position(point(x, within_line), line_height))
+        })?;
+        Some(buffer.line_start_byte(line_ix) + local)
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -420,16 +487,8 @@ impl EntityInputHandler for MarkdownEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let bounds = self.layout.bounds()?;
-        let content_y = position.y - bounds.origin.y + self.scroll.offset();
-        let (line_ix, within_line) = self.layout.line_at_y(content_y)?;
-        let line_height = self.layout.line_height()?;
-        let x = position.x - bounds.origin.x;
-        let local = self.layout.with_line(line_ix, |line, _| {
-            snap_index(line.closest_index_for_position(point(x, within_line), line_height))
-        })?;
-        let buffer = self.buffer.read(cx);
-        Some(buffer.byte_to_utf16(buffer.line_start_byte(line_ix) + local))
+        let offset = self.offset_for_point(position, cx)?;
+        Some(self.buffer.read(cx).byte_to_utf16(offset))
     }
 
     fn text_length_utf16(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
@@ -491,6 +550,7 @@ impl Render for MarkdownEditor {
             .text_color(self.theme.text)
             .track_focus(&self.focus_handle)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .child(EditorElement::new(

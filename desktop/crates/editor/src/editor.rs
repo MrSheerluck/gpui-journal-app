@@ -4,7 +4,7 @@ use gpui::{Context, Entity, Pixels, Render, ScrollWheelEvent, Window, div, prelu
 
 use crate::{
     buffer::Buffer,
-    input::{EditorElement, EditorScrollState},
+    input::{EditorElement, EditorLayout, EditorScrollState},
     theme::EditorTheme,
 };
 
@@ -12,6 +12,7 @@ pub struct MarkdownEditor {
     buffer: Entity<Buffer>,
     theme: EditorTheme,
     scroll: Rc<EditorScrollState>,
+    layout: EditorLayout,
 }
 
 impl MarkdownEditor {
@@ -20,6 +21,7 @@ impl MarkdownEditor {
             buffer,
             theme,
             scroll: Rc::new(EditorScrollState::default()),
+            layout: EditorLayout::default(),
         }
     }
 
@@ -51,6 +53,7 @@ impl Render for MarkdownEditor {
                 self.buffer.clone(),
                 self.theme.clone(),
                 self.scroll.clone(),
+                self.layout.clone(),
             ))
     }
 }

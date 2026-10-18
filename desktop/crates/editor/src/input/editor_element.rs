@@ -20,14 +20,21 @@ pub struct EditorElement {
     buffer: Entity<Buffer>,
     theme: EditorTheme,
     scroll: Rc<EditorScrollState>,
+    layout: EditorLayout,
 }
 
 impl EditorElement {
-    pub fn new(buffer: Entity<Buffer>, theme: EditorTheme, scroll: Rc<EditorScrollState>) -> Self {
+    pub fn new(
+        buffer: Entity<Buffer>,
+        theme: EditorTheme,
+        scroll: Rc<EditorScrollState>,
+        layout: EditorLayout,
+    ) -> Self {
         Self {
             buffer,
             theme,
             scroll,
+            layout,
         }
     }
 }
@@ -67,8 +74,8 @@ impl Element for EditorElement {
                 .to_pixels(font_size.into(), window.rem_size()),
         );
 
-        let state = EditorLayout::default();
-        let measure_state = state.clone();
+        let state = self.layout.clone();
+        let measure_state = self.layout.clone();
         let buffer = self.buffer.clone();
         let layout_id = window.request_measured_layout(
             Style {

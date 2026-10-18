@@ -123,6 +123,14 @@ impl MarkdownEditor {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+        if matches!(keystroke.key.as_str(), "backspace" | "delete") {
+            let backward = keystroke.key == "backspace";
+            let alt = keystroke.modifiers.alt;
+            let platform = keystroke.modifiers.platform;
+            self.delete_input(backward, alt, platform, cx);
+            cx.stop_propagation();
+            return;
+        }
         let extend = keystroke.modifiers.shift;
         let backward = matches!(keystroke.key.as_str(), "left" | "up" | "home");
         let target = {
@@ -150,7 +158,21 @@ impl MarkdownEditor {
         } else {
             self.selection.collapse(target);
         }
+        cx.stop_propagation();
         cx.notify();
+    }
+
+    /// Backspace/delete: removes the selection, or one grapheme/word/line
+    /// before (backspace) or after (delete) the caret.
+    fn delete_input(&mut self, backward: bool, word: bool, line: bool, cx: &mut Context<Self>) {
+        let range = {
+            let buffer = self.buffer.read(cx);
+            deletion_range(buffer, self.selection, backward, word, line)
+        };
+        if let Some(range) = range {
+            self.restart_blink();
+            self.apply_input_edit(range, "", None, false, cx);
+        }
     }
 
     /// The byte offset a navigation key should move the caret to: grapheme and
@@ -265,6 +287,36 @@ fn utf16_to_byte_in(text: &str, utf16_offset: usize) -> usize {
         utf16 = next;
     }
     text.len()
+}
+
+/// The byte range backspace/delete should remove: the selection when one
+/// exists, otherwise one grapheme, word or line on the requested side of the
+/// caret. `None` when there is nothing to delete.
+fn deletion_range(
+    buffer: &Buffer,
+    selection: Selection,
+    backward: bool,
+    word: bool,
+    line: bool,
+) -> Option<Range<usize>> {
+    if !selection.is_caret() {
+        return Some(selection.start()..selection.end());
+    }
+    let head = selection.head();
+    let target = match (backward, line, word) {
+        (true, true, _) => movement::line_start(buffer, head),
+        (true, _, true) => movement::word_left(buffer, head),
+        (true, _, _) => movement::left(buffer, head),
+        (false, true, _) => movement::line_end(buffer, head),
+        (false, _, true) => movement::word_right(buffer, head),
+        (false, _, _) => movement::right(buffer, head),
+    };
+    let (start, end) = if backward {
+        (target, head)
+    } else {
+        (head, target)
+    };
+    (start != end).then_some(start..end)
 }
 
 impl EntityInputHandler for MarkdownEditor {
@@ -452,7 +504,9 @@ impl Render for MarkdownEditor {
 
 #[cfg(test)]
 mod tests {
-    use super::utf16_to_byte_in;
+    use super::{deletion_range, utf16_to_byte_in};
+    use crate::buffer::Buffer;
+    use crate::input::Selection;
 
     #[test]
     fn utf16_offsets_inside_text_round_down() {
@@ -463,5 +517,95 @@ mod tests {
         assert_eq!(utf16_to_byte_in("a🎉", 4), 5);
         assert_eq!(utf16_to_byte_in("héllo", 1), 1);
         assert_eq!(utf16_to_byte_in("héllo", 2), 3);
+    }
+
+    fn caret(offset: usize) -> Selection {
+        Selection::caret(offset)
+    }
+
+    #[test]
+    fn backspace_removes_one_grapheme() {
+        let buffer = Buffer::from_text("a🎉b");
+        assert_eq!(
+            deletion_range(&buffer, caret(5), true, false, false),
+            Some(1..5)
+        );
+        assert_eq!(
+            deletion_range(&buffer, caret(1), true, false, false),
+            Some(0..1)
+        );
+        assert_eq!(deletion_range(&buffer, caret(0), true, false, false), None);
+    }
+
+    #[test]
+    fn delete_removes_one_grapheme_forward() {
+        let buffer = Buffer::from_text("a🎉b");
+        assert_eq!(
+            deletion_range(&buffer, caret(1), false, false, false),
+            Some(1..5)
+        );
+        assert_eq!(
+            deletion_range(&buffer, caret(5), false, false, false),
+            Some(5..6)
+        );
+        assert_eq!(deletion_range(&buffer, caret(6), false, false, false), None);
+    }
+
+    #[test]
+    fn word_deletion_skips_like_word_movement() {
+        let buffer = Buffer::from_text("foo bar baz");
+        assert_eq!(
+            deletion_range(&buffer, caret(7), true, true, false),
+            Some(4..7)
+        );
+        assert_eq!(
+            deletion_range(&buffer, caret(4), true, true, false),
+            Some(0..4)
+        );
+        assert_eq!(
+            deletion_range(&buffer, caret(3), false, true, false),
+            Some(3..7)
+        );
+    }
+
+    #[test]
+    fn line_deletion_uses_line_bounds() {
+        let buffer = Buffer::from_text("first\nsecond");
+        assert_eq!(
+            deletion_range(&buffer, caret(10), true, false, true),
+            Some(6..10)
+        );
+        assert_eq!(
+            deletion_range(&buffer, caret(6), false, false, true),
+            Some(6..12)
+        );
+        assert_eq!(deletion_range(&buffer, caret(0), true, false, true), None);
+    }
+
+    #[test]
+    fn deletion_prefers_the_selection() {
+        let buffer = Buffer::from_text("hello world");
+        let selection = Selection::new(11, 6);
+        assert_eq!(
+            deletion_range(&buffer, selection, true, false, false),
+            Some(6..11)
+        );
+        assert_eq!(
+            deletion_range(&buffer, selection, false, true, true),
+            Some(6..11)
+        );
+    }
+
+    #[test]
+    fn deletion_crosses_line_boundaries() {
+        let buffer = Buffer::from_text("ab\ncd");
+        assert_eq!(
+            deletion_range(&buffer, caret(3), true, false, false),
+            Some(2..3)
+        );
+        assert_eq!(
+            deletion_range(&buffer, caret(2), false, false, false),
+            Some(2..3)
+        );
     }
 }

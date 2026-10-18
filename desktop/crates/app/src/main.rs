@@ -233,7 +233,8 @@ impl DainikiApp {
     }
 
     fn help_menu(&self) -> Popover {
-        const SHORTCUTS: [(&str, &str); 14] = [
+        const SHORTCUTS: [(&str, &str); 15] = [
+            ("Command menu", "type /"),
             ("Bold / Italic", "⌘B / ⌘I"),
             ("Strikethrough / Highlight", "⌘⇧X / ⌘⇧H"),
             ("Inline code", "⌘`"),

@@ -54,9 +54,9 @@ fn main() {
 }
 ```
 
-One more paragraph so the sample reliably overflows a 640 pt window. Editing is
-still caret-and-keyboard only: deletion, undo and mouse selection arrive in
-later steps.
+One more paragraph so the sample reliably overflows a 640 pt window. Type / on
+any blank spot to format without writing Markdown: headings, lists, quotes,
+code, links — all keyboard-driven.
 ";
 
 struct Workbench {

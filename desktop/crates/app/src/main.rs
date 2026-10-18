@@ -33,7 +33,14 @@ use gpui_kit::*;
 
 actions!(
     dainiki,
-    [Save, ToggleEditing, ToggleJumpToDate, PreviousDay, NextDay]
+    [
+        Save,
+        ToggleEditing,
+        ToggleJumpToDate,
+        PreviousDay,
+        NextDay,
+        FocusSearch
+    ]
 );
 
 /// Autosave runs this long after the last keystroke.
@@ -76,12 +83,16 @@ struct JournalSession {
     jump_input: Entity<InputState>,
     jump_open: bool,
     jump_error: Option<String>,
+    /// The search bar: input and open state.
+    search_input: Entity<InputState>,
+    search_open: bool,
     /// Set by the jump input's Enter event; processed in render, which has a
     /// window to activate a day with.
     pending_submit: Cell<bool>,
     /// A date the next rendered frame should reveal in the stream.
     pending_reveal: Cell<Option<NaiveDate>>,
     _jump_events: Subscription,
+    _search_events: Subscription,
 }
 
 /// What the stream is narrowed to: a tag, a search query, or both.
@@ -183,6 +194,16 @@ impl DainikiApp {
                 cx.notify();
             }
         });
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search entries…"));
+        let search_events = cx.subscribe(&search_input, |app, input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                let query = input.read(cx).value().to_string();
+                if let Some(session) = app.session_mut() {
+                    session.filter.query = query;
+                }
+                cx.notify();
+            }
+        });
         tracing::info!(root = %root.display(), path = %active.path.display(), "journal opened");
         self.screen = Screen::Journal(Box::new(JournalSession {
             root: root.to_path_buf(),
@@ -195,9 +216,12 @@ impl DainikiApp {
             jump_input,
             jump_open: false,
             jump_error: None,
+            search_input,
+            search_open: false,
             pending_submit: Cell::new(false),
             pending_reveal: Cell::new(None),
             _jump_events: jump_events,
+            _search_events: search_events,
         }));
         cx.notify();
 
@@ -472,10 +496,37 @@ impl DainikiApp {
         cx.notify();
     }
 
-    /// Back to the full stream.
-    fn clear_filter(&mut self, cx: &mut Context<Self>) {
+    /// Back to the full stream, clearing tag and search together.
+    fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(session) = self.session_mut() {
             session.filter = Filter::default();
+            session
+                .search_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        cx.notify();
+    }
+
+    // -- search -------------------------------------------------------------
+
+    /// Opens the search bar (or focuses it when it is already open).
+    fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut() {
+            session.search_open = true;
+            let focus = session.search_input.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+    }
+
+    /// Clears the query and closes the search bar.
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut() {
+            session.search_open = false;
+            session.filter.query.clear();
+            session
+                .search_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
         }
         cx.notify();
     }
@@ -814,6 +865,7 @@ impl JournalSession {
 
         let active_editor = self.active.as_ref().map(|active| active.editor.clone());
         let day_count = dates.len();
+        let shown_days = dates.len().saturating_sub(1);
         let item_this = this.clone();
         let stream_list = list(self.stream.clone(), move |ix, _window, cx| {
             if ix == day_count {
@@ -859,6 +911,53 @@ impl JournalSession {
         });
 
         let mut main = div().flex_1().min_h_0().flex().flex_col();
+
+        // The search row, opened from the pill or cmd-F. Live filtering as
+        // you type; the count shows what survived.
+        if self.search_open {
+            let close_this = this.clone();
+            let matches = if self.filter.is_active() {
+                shown_days
+            } else {
+                0
+            };
+            main = main.child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .bg(brand::surface_container_low())
+                    .border_b_1()
+                    .border_color(brand::outline_variant().opacity(0.6))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .max_w(px(672.))
+                            .mx_auto()
+                            .child(div().w(px(360.)).child(Input::new(&self.search_input)))
+                            .when(self.filter.is_active(), |el| {
+                                el.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(brand::outline())
+                                        .child(format!("{matches} days match")),
+                                )
+                            })
+                            .child(div().flex_1())
+                            .child(
+                                Button::new("search-close")
+                                    .label("Clear")
+                                    .compact()
+                                    .on_click(move |_, window, cx| {
+                                        close_this
+                                            .update(cx, |app, cx| app.close_search(window, cx))
+                                            .ok();
+                                    }),
+                            ),
+                    ),
+            );
+        }
 
         // The date-jump panel: available in reading mode too, so a day is
         // always one keystroke away.
@@ -984,7 +1083,7 @@ impl JournalSession {
             .size_full()
             .flex()
             .flex_col()
-            .child(TitleBar::new().child(self.window_title()))
+            .child(self.title_bar(&this))
             .child(
                 div()
                     .flex_1()
@@ -994,6 +1093,84 @@ impl JournalSession {
                     .child(self.sidebar(&this, cx))
                     .child(main),
             )
+    }
+
+    /// The title bar: the wordmark, and the search pill on the right. The
+    /// pill is a styled control rather than a real input because the title
+    /// bar is a window-drag region; it opens the search row instead.
+    fn title_bar(&self, this: &WeakEntity<DainikiApp>) -> impl IntoElement {
+        let name = self
+            .root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.root.display().to_string());
+        let dirty = self.active.as_ref().is_some_and(|active| active.dirty);
+
+        let search_this = this.clone();
+        let pill = h_flex()
+            .id("search-pill")
+            .gap_2()
+            .items_center()
+            .justify_between()
+            .w(px(220.))
+            .px_2()
+            .py_1()
+            .rounded_full()
+            .bg(brand::surface_container_low())
+            .border_1()
+            .border_color(brand::surface_container())
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                search_this
+                    .update(cx, |app, cx| app.on_focus_search(&FocusSearch, window, cx))
+                    .ok();
+            })
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(brand::on_surface_variant().opacity(0.8))
+                    .child(if self.filter.query.trim().is_empty() {
+                        "Search entries…".to_string()
+                    } else {
+                        self.filter.query.clone()
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(brand::on_surface_variant().opacity(0.8))
+                    .child("⌘F"),
+            );
+
+        TitleBar::new()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(8.))
+                            .h(px(8.))
+                            .rounded_full()
+                            .bg(brand::primary()),
+                    )
+                    .child(
+                        div()
+                            .font_family(brand::SERIF_FAMILY)
+                            .text_size(px(15.))
+                            .child("Dainiki"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(brand::outline())
+                            .child(name),
+                    )
+                    .when(dirty, |el| {
+                        el.child(div().text_color(brand::secondary()).child("•"))
+                    }),
+            )
+            .child(pill)
     }
 
     /// The left rail: Timeline, Tags, and the bottom block.
@@ -1052,9 +1229,9 @@ impl JournalSession {
                                 el.bg(brand::surface_container_high())
                                     .font_weight(FontWeight::MEDIUM)
                             })
-                            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                                 timeline_this
-                                    .update(cx, |app, cx| app.clear_filter(cx))
+                                    .update(cx, |app, cx| app.clear_filter(window, cx))
                                     .ok();
                             })
                             .child(div().text_sm().child("Timeline"))
@@ -1177,23 +1354,6 @@ impl JournalSession {
         for (date, text) in &self.days {
             for tag in journal::tags_in(text) {
                 self.tags.entry(tag).or_default().insert(*date);
-            }
-        }
-    }
-
-    fn window_title(&self) -> String {
-        match &self.active {
-            Some(active) => {
-                let dirty = if active.dirty { " •" } else { "" };
-                format!("Dainiki — {}{dirty}", active.path.display())
-            }
-            None => {
-                let name = self
-                    .root
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| self.root.display().to_string());
-                format!("Dainiki — {name}")
             }
         }
     }
@@ -1376,7 +1536,7 @@ impl ActiveDay {
     }
 
     fn help_menu(&self) -> Popover {
-        const SHORTCUTS: [(&str, &str); 17] = [
+        const SHORTCUTS: [(&str, &str); 18] = [
             ("Command menu", "type /"),
             ("Bold / Italic", "⌘B / ⌘I"),
             ("Strikethrough / Highlight", "⌘⇧X / ⌘⇧H"),
@@ -1392,6 +1552,7 @@ impl ActiveDay {
             ("Save", "⌘S"),
             ("Finish editing", "⌘E"),
             ("Jump to a date", "⌘T"),
+            ("Search entries", "⌘F"),
             ("Previous / next day", "⌘⇧[ / ⌘⇧]"),
             ("Reveal markup", "click into a construct"),
         ];
@@ -1602,6 +1763,7 @@ impl Render for DainikiApp {
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_toggle_editing))
             .on_action(cx.listener(Self::on_toggle_jump))
+            .on_action(cx.listener(Self::on_focus_search))
             .on_action(cx.listener(Self::on_previous_day))
             .on_action(cx.listener(Self::on_next_day))
             .child(screen)
@@ -1615,6 +1777,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-s", Save, None),
         KeyBinding::new("cmd-e", ToggleEditing, None),
         KeyBinding::new("cmd-t", ToggleJumpToDate, None),
+        KeyBinding::new("cmd-f", FocusSearch, None),
         KeyBinding::new("cmd-shift-[", PreviousDay, None),
         KeyBinding::new("cmd-shift-]", NextDay, None),
     ]);
@@ -2217,6 +2380,75 @@ mod tests {
             let Screen::Journal(session) = &app.screen else {
                 panic!("expected an open journal session");
             };
+            assert!(!session.filter.is_active());
+            assert_eq!(session.stream.item_count(), 4);
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn search_filters_the_stream(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let yesterday = today.pred_opt().expect("yesterday");
+        let other = yesterday.pred_opt().expect("the day before");
+        seed_day(&journal, yesterday, "# dawn\n\nThe bamboo path at dawn.\n");
+        seed_day(
+            &journal,
+            other,
+            "# work\n\nRefined the render loop today.\n",
+        );
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // cmd-F opens and focuses the search bar; typing filters live.
+        cx.simulate_keystrokes("cmd-f");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_input("bamboo");
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert!(session.search_open);
+            assert_eq!(session.filter.query, "bamboo");
+            assert_eq!(
+                session.stream.item_count(),
+                3,
+                "today + the bamboo day + the edge"
+            );
+        });
+
+        // Clearing returns the whole stream.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.close_search(window, cx));
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert!(!session.search_open);
             assert!(!session.filter.is_active());
             assert_eq!(session.stream.item_count(), 4);
         });

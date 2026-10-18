@@ -978,10 +978,16 @@ impl JournalSession {
                     }
                 });
                 let inner = if let Some(text) = text {
-                    div().child(markdown(text)).into_any_element()
+                    div()
+                        .font_family(brand::SERIF_FAMILY)
+                        .text_size(px(15.2))
+                        .line_height(px(24.7))
+                        .child(markdown(text))
+                        .into_any_element()
                 } else {
                     div()
                         .font_family(brand::SERIF_FAMILY)
+                        .text_size(px(12.))
                         .italic()
                         .text_color(brand::on_surface_variant().opacity(0.4))
                         .child("Add thoughts for this day…")

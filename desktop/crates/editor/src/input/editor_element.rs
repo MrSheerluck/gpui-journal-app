@@ -550,6 +550,13 @@ impl EditorLayout {
     }
 }
 
+struct EditorLayoutInner {
+    lines: Vec<WrappedLine>,
+    line_height: Pixels,
+    content_height: Pixels,
+    bounds: Option<Bounds<Pixels>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::reveal_offset;
@@ -586,11 +593,4 @@ mod tests {
             px(-10.)
         );
     }
-}
-
-struct EditorLayoutInner {
-    lines: Vec<WrappedLine>,
-    line_height: Pixels,
-    content_height: Pixels,
-    bounds: Option<Bounds<Pixels>>,
 }

@@ -3,6 +3,7 @@
 //! App chrome and standard UI use gpui-kit components wherever one fits
 //! (ADR-0006); the editor crate stays GPUI-primitives-only.
 
+mod brand;
 mod config;
 mod journal;
 mod persistence;
@@ -21,10 +22,8 @@ use gpui_kit::component::Disableable;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::button::{Button, ButtonVariants, Toggle, ToggleGroup};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::label::Label;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::scroll::{ScrollableElement, ScrollbarAxis};
-use gpui_kit::component::separator::Separator;
 use gpui_kit::component::text::markdown;
 use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::{h_flex, v_flex};
@@ -370,14 +369,57 @@ impl DainikiApp {
                     .flex_1()
                     .items_center()
                     .justify_center()
-                    .gap_3()
+                    .gap_6()
+                    .px_8()
                     .bg(self.theme.background)
-                    .child(div().text_2xl().child("Welcome to Dainiki"))
-                    .child(div().max_w(px(440.)).text_sm().child(
-                        "Your journal is a folder of plain Markdown files you own — \
-                                 offline, no account, no lock-in. Create one, or open a folder \
-                                 you already have.",
-                    ))
+                    .child(
+                        // The landing-page badge.
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .px_3()
+                            .py_1()
+                            .rounded_full()
+                            .bg(brand::surface_container_high())
+                            .text_color(brand::on_surface_variant())
+                            .child(
+                                div()
+                                    .w(px(6.))
+                                    .h(px(6.))
+                                    .rounded_full()
+                                    .bg(brand::primary()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .child("BUILT IN RUST & GPUI · ZERO CLOUD LOCK-IN"),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .items_center()
+                            .gap_4()
+                            .max_w(px(620.))
+                            .child(
+                                div()
+                                    .font_family(brand::SERIF_FAMILY)
+                                    .text_size(px(36.))
+                                    .line_height(rems(1.25))
+                                    .text_color(brand::on_surface())
+                                    .text_center()
+                                    .child("A quiet, continuous river for your thoughts."),
+                            )
+                            .child(
+                                div()
+                                    .text_center()
+                                    .text_color(brand::on_surface_variant())
+                                    .child(
+                                        "Dainiki is a private, local-first daily journal. \
+                                         No cards, no document switching — just your life in an \
+                                         unbroken, beautifully typeset stream.",
+                                    ),
+                            ),
+                    )
                     .child(
                         h_flex()
                             .gap_2()
@@ -405,8 +447,23 @@ impl DainikiApp {
                                     }),
                             ),
                     )
+                    .child(
+                        div()
+                            .text_xs()
+                            .max_w(px(460.))
+                            .text_center()
+                            .text_color(brand::outline())
+                            .child(
+                                "Your journal is a folder of plain Markdown files you own — \
+                                 offline, no account, no lock-in.",
+                            ),
+                    )
                     .children(notice.as_ref().map(|notice| {
-                        div().mt_2().max_w(px(440.)).text_sm().child(notice.clone())
+                        div()
+                            .max_w(px(460.))
+                            .text_center()
+                            .text_sm()
+                            .child(notice.clone())
                     })),
             )
     }
@@ -432,8 +489,40 @@ impl JournalSession {
 
         let mut stream = v_flex().gap_8();
         for date in dates {
-            let header = Separator::horizontal().label(day_label(date, today));
-            let body: AnyElement = if date == today {
+            let is_today = date == today;
+            let mut header = h_flex().items_center().gap_3();
+            if is_today {
+                header = header.child(
+                    div()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_full()
+                        .bg(brand::primary_fixed())
+                        .text_xs()
+                        .text_color(brand::on_primary_fixed())
+                        .child("TODAY"),
+                );
+            }
+            let header = header
+                .child(
+                    div()
+                        .font_family(brand::SERIF_FAMILY)
+                        .text_xl()
+                        .text_color(if is_today {
+                            brand::on_surface()
+                        } else {
+                            brand::on_surface_variant()
+                        })
+                        .child(day_label(date)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .h(px(1.))
+                        .bg(brand::outline_variant().opacity(0.55)),
+                );
+
+            let body: AnyElement = if is_today {
                 if self.preview {
                     let text = self.editor.read(cx).content(cx);
                     div().child(markdown(text)).into_any_element()
@@ -447,10 +536,13 @@ impl JournalSession {
                 div().child(markdown(text.clone())).into_any_element()
             } else {
                 div()
-                    .child(Label::new("No entry yet").secondary("— write it later"))
+                    .font_family(brand::SERIF_FAMILY)
+                    .italic()
+                    .text_color(brand::outline())
+                    .child("Nothing written this day.")
                     .into_any_element()
             };
-            stream = stream.child(v_flex().gap_3().child(header).child(body));
+            stream = stream.child(v_flex().gap_4().child(header).child(body));
         }
 
         div()
@@ -459,20 +551,27 @@ impl JournalSession {
             .flex_col()
             .child(TitleBar::new().child(self.window_title()))
             .child(
-                div().w_full().px_3().py_1().child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            Toolbar::new("editor-toolbar")
-                                .child(self.inline_toolbar(cx))
-                                .child(self.block_toolbar(cx)),
-                        )
-                        .child(self.insert_menu())
-                        .child(settings)
-                        .child(self.preview_toggle())
-                        .child(self.help_menu()),
-                ),
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .bg(brand::surface_container_low())
+                    .border_b_1()
+                    .border_color(brand::outline_variant().opacity(0.6))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Toolbar::new("editor-toolbar")
+                                    .child(self.inline_toolbar(cx))
+                                    .child(self.block_toolbar(cx)),
+                            )
+                            .child(self.insert_menu())
+                            .child(settings)
+                            .child(self.preview_toggle())
+                            .child(self.help_menu()),
+                    ),
             )
             .child(
                 div().flex_1().min_h_0().bg(theme.background).child(
@@ -721,14 +820,9 @@ impl JournalSession {
     }
 }
 
-/// "Today · Monday, 19 October 2026" for today; the plain date otherwise.
-fn day_label(date: NaiveDate, today: NaiveDate) -> String {
-    let formatted = date.format("%A, %-d %B %Y").to_string();
-    if date == today {
-        format!("Today · {formatted}")
-    } else {
-        formatted
-    }
+/// "Monday, 19 October 2026".
+fn day_label(date: NaiveDate) -> String {
+    date.format("%A, %-d %B %Y").to_string()
 }
 
 /// Copies an image into the journal's `assets/` folder under a fresh name,
@@ -806,6 +900,7 @@ fn main() {
 
     gpui_kit::application().run(move |cx: &mut App| {
         gpui_kit::init(cx);
+        brand::apply_component_theme(cx);
         cx.bind_keys([
             KeyBinding::new("cmd-s", Save, None),
             KeyBinding::new("cmd-e", TogglePreview, None),
@@ -850,7 +945,7 @@ fn open_app_window(cx: &mut App, config: config::Config, root: Option<PathBuf>) 
     };
 
     gpui_kit::open_window(options, cx, move |window, cx| {
-        let theme = EditorTheme::default();
+        let theme = brand::editor_theme();
         cx.new(|cx| {
             let mut app = DainikiApp::new(theme, config);
             if let Some(root) = root {
@@ -879,13 +974,15 @@ mod tests {
     // NOTE: no `use super::*` here. The crate root glob-imports `gpui_kit::*`,
     // which re-exports gpui's `test` proc macro; globbing it in would shadow
     // the builtin `#[test]` inside the generated harness and recurse forever.
-    use super::{DainikiApp, EditorTheme, Screen, config, day_label, journal, resolve_cli_root};
+    use super::{DainikiApp, Screen, brand, config, day_label, journal, resolve_cli_root};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-    /// The component library needs its theme global before any view renders.
+    /// The component library needs its theme global before any view renders;
+    /// production also applies the brand palette.
     fn init(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
+        cx.update(brand::apply_component_theme);
     }
 
     fn scratch_dir() -> PathBuf {
@@ -932,7 +1029,7 @@ mod tests {
     async fn the_app_starts_on_the_welcome_screen(cx: &mut TestAppContext) {
         init(cx);
         let (app, cx) = cx.add_window_view(|_window, _cx| {
-            DainikiApp::new(EditorTheme::default(), config::Config::default())
+            DainikiApp::new(brand::editor_theme(), config::Config::default())
         });
         cx.update(|window, cx| {
             let _ = window.draw(cx);
@@ -944,11 +1041,9 @@ mod tests {
     }
 
     #[test]
-    fn day_labels_name_the_day_and_mark_today() {
-        let today = NaiveDate::from_ymd_opt(2026, 10, 19).expect("date");
+    fn day_labels_name_the_day() {
         let earlier = NaiveDate::from_ymd_opt(2026, 10, 5).expect("date");
-        assert_eq!(day_label(earlier, today), "Monday, 5 October 2026");
-        assert_eq!(day_label(today, today), "Today · Monday, 19 October 2026");
+        assert_eq!(day_label(earlier), "Monday, 5 October 2026");
     }
 
     #[gpui::test]
@@ -973,7 +1068,7 @@ mod tests {
         let (app, cx) = cx.add_window_view({
             let dir = dir.clone();
             move |window, cx| {
-                let mut app = DainikiApp::new(EditorTheme::default(), config::Config::default());
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
                 app.enter_journal(dir, window, cx);
                 app
             }
@@ -1028,7 +1123,7 @@ mod tests {
         let (app, cx) = cx.add_window_view({
             let dir = dir.clone();
             move |window, cx| {
-                let mut app = DainikiApp::new(EditorTheme::default(), config::Config::default());
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
                 app.enter_journal(dir, window, cx);
                 app
             }
@@ -1063,7 +1158,7 @@ mod tests {
         let (app, cx) = cx.add_window_view({
             let root = not_a_folder.clone();
             move |window, cx| {
-                let mut app = DainikiApp::new(EditorTheme::default(), config::Config::default());
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
                 app.enter_journal(root, window, cx);
                 app
             }

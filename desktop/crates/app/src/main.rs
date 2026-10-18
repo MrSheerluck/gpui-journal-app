@@ -31,6 +31,8 @@ use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+#[cfg(not(test))]
+use notify::Watcher as _;
 
 actions!(
     dainiki,
@@ -94,6 +96,11 @@ struct JournalSession {
     pending_delete: Option<NaiveDate>,
     /// A message shown in the status banner (save or trash failures).
     status: Option<String>,
+    /// Watches the journal folder; external edits land through it.
+    _watcher: Option<notify::RecommendedWatcher>,
+    /// The open day changed on disk while clean: reload it in the next frame
+    /// (which has a window to rebuild the editor with).
+    pending_reload: Cell<Option<NaiveDate>>,
     /// The month the sidebar calendar shows, `(year, month)`.
     calendar_month: (i32, u32),
     /// Set by the jump input's Enter event; processed in render, which has a
@@ -194,6 +201,8 @@ impl DainikiApp {
     ) -> io::Result<()> {
         let today = Local::now().date_naive();
         let active = self.open_day(root, today, window, cx)?;
+
+        let watcher = start_watcher(root, cx);
         let jump_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("YYYY-MM-DD, or “today”"));
         let jump_events = cx.subscribe(&jump_input, |app, _input, event: &InputEvent, cx| {
@@ -231,6 +240,8 @@ impl DainikiApp {
             settings_open: false,
             pending_delete: None,
             status: None,
+            _watcher: watcher,
+            pending_reload: Cell::new(None),
             calendar_month: (today.year(), today.month()),
             pending_submit: Cell::new(false),
             pending_reveal: Cell::new(None),
@@ -626,6 +637,85 @@ impl DainikiApp {
             session.status = None;
         }
         cx.notify();
+    }
+
+    // -- external changes ---------------------------------------------------
+
+    /// Rebuilds the open day's editor from disk after an external change,
+    /// without flushing: the editor was clean, so the disk copy is the newer
+    /// one and the editor's copy is discarded.
+    fn reload_active_day(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut()
+            && session
+                .active
+                .as_ref()
+                .is_some_and(|active| active.date == date)
+        {
+            session.active = None;
+        }
+        self.activate_day(date, window, cx);
+    }
+
+    /// Reconciles paths that changed on disk (from the watcher). Content is
+    /// compared before anything changes, so our own saves are no-ops. A
+    /// changed open day reloads only while it is clean; a dirty editor is
+    /// protected by the save-time conflict copy instead.
+    fn reconcile_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let Some(session) = self.session_mut() else {
+            return;
+        };
+        let journal = journal::Journal::new(&session.root);
+        let changed: BTreeSet<NaiveDate> = paths
+            .iter()
+            .filter_map(|path| journal.date_for_path(path))
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        let changed_count = changed.len();
+
+        let mut dirty = false;
+        let mut reload = None;
+        for date in changed {
+            if let Some(active) = session.active.as_ref()
+                && active.date == date
+            {
+                if !active.dirty {
+                    let current = active.editor.read(cx).content(cx);
+                    let disk = std::fs::read_to_string(journal.entry_path(date)).ok();
+                    if disk.as_deref() != Some(current.as_str()) {
+                        reload = Some(date);
+                    }
+                }
+                continue;
+            }
+            let disk = std::fs::read_to_string(journal.entry_path(date))
+                .ok()
+                .filter(|text| !text.trim().is_empty());
+            let stored = session.days.get(&date).cloned();
+            if disk != stored {
+                match disk {
+                    Some(text) => {
+                        session.days.insert(date, text);
+                    }
+                    None => {
+                        session.days.remove(&date);
+                    }
+                }
+                dirty = true;
+            }
+        }
+
+        if dirty {
+            session.rebuild_tags();
+        }
+        if let Some(date) = reload {
+            session.pending_reload.set(Some(date));
+        }
+        if dirty || reload.is_some() {
+            tracing::info!(changed = changed_count, "reconciled external changes");
+            cx.notify();
+        }
     }
 
     fn on_previous_day(&mut self, _: &PreviousDay, window: &mut Window, cx: &mut Context<Self>) {
@@ -2360,6 +2450,68 @@ fn kbd_chip(label: &'static str) -> AnyElement {
         .into_any_element()
 }
 
+/// Watches the journal folder: edits made elsewhere (another editor, a sync
+/// client) land in the reconcile channel. Our own atomic writes are
+/// idempotent there — the reconcile compares content before changing
+/// anything. Returns the watcher so it lives as long as the session.
+#[cfg(not(test))]
+fn start_watcher(root: &Path, cx: &mut Context<DainikiApp>) -> Option<notify::RecommendedWatcher> {
+    let (tx, rx) = async_channel::unbounded::<PathBuf>();
+    let watcher = match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let Ok(event) = event else { return };
+        if matches!(
+            event.kind,
+            notify::EventKind::Create(_)
+                | notify::EventKind::Modify(_)
+                | notify::EventKind::Remove(_)
+        ) {
+            for path in event.paths {
+                let _ = tx.try_send(path);
+            }
+        }
+    }) {
+        Ok(mut watcher) => {
+            if let Err(error) = watcher.watch(root, notify::RecursiveMode::Recursive) {
+                tracing::warn!(root = %root.display(), error = %error, "could not watch the journal folder");
+                None
+            } else {
+                Some(watcher)
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "could not start the journal watcher");
+            None
+        }
+    };
+    cx.spawn(async move |this, cx| {
+        while let Ok(first) = rx.recv().await {
+            let mut paths = vec![first];
+            // Coalesce the burst a save produces.
+            cx.background_executor()
+                .timer(Duration::from_millis(250))
+                .await;
+            while let Ok(more) = rx.try_recv() {
+                paths.push(more);
+            }
+            this.update(cx, |app, cx| app.reconcile_paths(paths, cx))
+                .ok();
+        }
+    })
+    .detach();
+    watcher
+}
+
+/// Tests do not start the OS watcher: it runs on its own thread, which the
+/// deterministic test scheduler rejects as non-deterministic activity. The
+/// reconcile logic is exercised directly instead.
+#[cfg(test)]
+fn start_watcher(
+    _root: &Path,
+    _cx: &mut Context<DainikiApp>,
+) -> Option<notify::RecommendedWatcher> {
+    None
+}
+
 /// The title bar every screen shares: the logo, the wordmark, and whatever
 /// sits on either side.
 fn brand_title_bar(left_extra: Option<AnyElement>, right: Option<AnyElement>) -> TitleBar {
@@ -2462,6 +2614,14 @@ impl Render for DainikiApp {
                 session.pending_submit.set(false);
             }
             self.jump_from_input(window, cx);
+        }
+        // An external change to the open day reloads it here, where a window
+        // exists to rebuild the editor.
+        if let Some(date) = self
+            .session()
+            .and_then(|session| session.pending_reload.take())
+        {
+            self.reload_active_day(date, window, cx);
         }
         let this = cx.weak_entity();
         let screen = match &self.screen {
@@ -3218,6 +3378,93 @@ mod tests {
             assert!(!session.search_open);
             assert!(!session.filter.is_active());
             assert_eq!(session.stream.item_count(), 4);
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn external_changes_reconcile_into_the_stream(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let yesterday = today.pred_opt().expect("yesterday");
+        let before_yesterday = yesterday.pred_opt().expect("the day before");
+        seed_day(&journal, yesterday, "# travel\n\n#travel day\n");
+        seed_day(&journal, before_yesterday, "# old words\n");
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // Another editor rewrites yesterday.
+        let yesterday_path = journal.entry_path(yesterday);
+        fs::write(&yesterday_path, "# changed outside\n\nNow with #nature\n").expect("write");
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| {
+                app.reconcile_paths(vec![yesterday_path.clone()], cx)
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert_eq!(
+                session.days.get(&yesterday).map(String::as_str),
+                Some("# changed outside\n\nNow with #nature\n")
+            );
+            assert!(
+                session.tags.contains_key("nature"),
+                "tags follow the change"
+            );
+        });
+
+        // The day before is deleted outside.
+        let removed = journal.entry_path(before_yesterday);
+        fs::remove_file(&removed).expect("remove");
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| app.reconcile_paths(vec![removed.clone()], cx));
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert!(!session.days.contains_key(&before_yesterday));
+        });
+
+        // Today (open and clean) changes on disk: the editor reloads from
+        // the disk copy rather than flushing its stale one over it.
+        let today_path = journal.entry_path(today);
+        fs::write(&today_path, "# written elsewhere\n").expect("write");
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| {
+                app.reconcile_paths(vec![today_path.clone()], cx)
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            let active = session.active.as_ref().expect("today stays open");
+            assert_eq!(active.date, today);
+            assert_eq!(active.editor.read(cx).content(cx), "# written elsewhere\n");
         });
         fs::remove_dir_all(&dir).ok();
     }

@@ -69,6 +69,36 @@ impl Journal {
         }
     }
 
+    /// The date a path inside the journal maps to, when it matches the
+    /// `YYYY/MM/YYYY-MM-DD.md` layout.
+    pub fn date_for_path(&self, path: &Path) -> Option<NaiveDate> {
+        let relative = path.strip_prefix(&self.root).ok()?;
+        let mut components = relative.components();
+        let year = components
+            .next()?
+            .as_os_str()
+            .to_str()?
+            .parse::<i32>()
+            .ok()?;
+        let month = components
+            .next()?
+            .as_os_str()
+            .to_str()?
+            .parse::<u32>()
+            .ok()?;
+        let file = components.next()?.as_os_str().to_str()?;
+        if components.next().is_some() {
+            return None;
+        }
+        let stem = file.strip_suffix(".md")?;
+        let date = NaiveDate::parse_from_str(stem, "%Y-%m-%d").ok()?;
+        if date.year() == year && date.month() == month {
+            Some(date)
+        } else {
+            None
+        }
+    }
+
     /// Every entry date on disk, newest first. Anything outside the
     /// `YYYY/MM/YYYY-MM-DD.md` layout is ignored; an unreadable root is
     /// simply an empty journal.
@@ -216,7 +246,7 @@ pub fn stream_dates(
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use chrono::NaiveDate;
@@ -350,6 +380,31 @@ mod tests {
         let journal = Journal::new(dir.join("nope"));
         assert_eq!(journal.entry_dates(), Vec::<NaiveDate>::new());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn paths_map_back_to_dates() {
+        let journal = Journal::new("/journals/dainiki");
+        assert_eq!(
+            journal.date_for_path(Path::new("/journals/dainiki/2026/10/2026-10-18.md")),
+            Some(date(2026, 10, 18))
+        );
+        assert_eq!(
+            journal.date_for_path(Path::new("/journals/dainiki/2026/10/2026-11-02.md")),
+            None,
+            "the date must match its folders"
+        );
+        assert_eq!(
+            journal.date_for_path(Path::new(
+                "/journals/dainiki/2026/10/.2026-10-18.md.dainiki.tmp"
+            )),
+            None
+        );
+        assert_eq!(
+            journal.date_for_path(Path::new("/journals/elsewhere/2026/10/2026-10-18.md")),
+            None
+        );
+        assert_eq!(journal.date_for_path(Path::new("/journals/dainiki")), None);
     }
 
     #[test]

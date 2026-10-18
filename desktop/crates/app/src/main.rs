@@ -842,7 +842,8 @@ mod tests {
         let (app, cx) = cx.add_window_view(|_window, _cx| {
             DainikiApp::new(EditorTheme::default(), config::Config::default())
         });
-        cx.update(|_window, cx| {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
             assert!(matches!(
                 app.read(cx).screen,
                 Screen::Welcome { notice: None }
@@ -867,7 +868,8 @@ mod tests {
                 app
             }
         });
-        cx.update(|_window, cx| {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
             let app = app.read(cx);
             let Screen::Journal(session) = &app.screen else {
                 panic!("expected an open journal session");
@@ -896,7 +898,8 @@ mod tests {
                 app
             }
         });
-        cx.update(|_window, cx| {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
             assert!(matches!(
                 app.read(cx).screen,
                 Screen::Welcome { notice: Some(_) }

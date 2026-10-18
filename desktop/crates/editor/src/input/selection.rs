@@ -20,6 +20,16 @@ impl Selection {
         Self { anchor, head }
     }
 
+    /// Builds a selection from low/high offsets where `reversed` decides
+    /// whether the head sits at the low or the high end.
+    pub fn new_ordered(low: usize, high: usize, reversed: bool) -> Self {
+        if reversed {
+            Self::new(high, low)
+        } else {
+            Self::new(low, high)
+        }
+    }
+
     pub fn anchor(&self) -> usize {
         self.anchor
     }

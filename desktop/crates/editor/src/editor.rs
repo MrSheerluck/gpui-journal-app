@@ -13,13 +13,14 @@ use gpui::{
 
 use crate::{
     buffer::Buffer,
+    commands::{self, BlockFormat, Edit as CommandEdit, InlineFormat},
     display::{DisplayPlan, WidgetKind},
     input::{
         EditorElement, EditorLayout, EditorScrollState, Selection,
         history::{Edit, History, MergeKind},
         movement,
     },
-    markdown::{ConstructKind, MarkdownIndex},
+    markdown::{Construct, ConstructKind, MarkdownIndex},
     theme::EditorTheme,
 };
 
@@ -571,6 +572,61 @@ impl MarkdownEditor {
                     cx.stop_propagation();
                     return;
                 }
+                "b" if !keystroke.modifiers.shift => {
+                    self.format_inline(InlineFormat::Bold, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "i" if !keystroke.modifiers.shift => {
+                    self.format_inline(InlineFormat::Italic, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "x" if keystroke.modifiers.shift => {
+                    self.format_inline(InlineFormat::Strike, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "h" if keystroke.modifiers.shift => {
+                    self.format_inline(InlineFormat::Highlight, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "`" => {
+                    self.format_inline(InlineFormat::Code, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "1" if !keystroke.modifiers.shift => {
+                    self.toggle_block_command(BlockFormat::Heading(1), cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "2" if !keystroke.modifiers.shift => {
+                    self.toggle_block_command(BlockFormat::Heading(2), cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "3" if !keystroke.modifiers.shift => {
+                    self.toggle_block_command(BlockFormat::Heading(3), cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "7" if keystroke.modifiers.shift => {
+                    self.toggle_block_command(BlockFormat::Ordered, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "8" if keystroke.modifiers.shift => {
+                    self.toggle_block_command(BlockFormat::Bullet, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "9" if keystroke.modifiers.shift => {
+                    self.toggle_block_command(BlockFormat::Task, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -612,6 +668,77 @@ impl MarkdownEditor {
         }
         cx.stop_propagation();
         cx.notify();
+    }
+
+    /// Applies one command edit as a single undo step and restores the
+    /// selection the command computed.
+    fn apply_command(&mut self, command: CommandEdit, cx: &mut Context<Self>) {
+        let selection_before = self.selection;
+        let removed = self.buffer.update(cx, |buffer, _| {
+            buffer.replace(command.range.clone(), &command.new_text)
+        });
+        self.selection = command.new_selection;
+        self.history.record(
+            Edit {
+                range: command.range,
+                removed,
+                inserted: command.new_text,
+                selection_before,
+                selection_after: self.selection,
+                kind: MergeKind::None,
+            },
+            MergeKind::None,
+        );
+        self.revision += 1;
+        self.restart_blink();
+        cx.emit(EditorEvent::Edited);
+        cx.notify();
+    }
+
+    /// Toggles an inline format: first unwraps a parsed construct that
+    /// contains the selection, then falls back to the pure text command.
+    fn format_inline(&mut self, format: InlineFormat, cx: &mut Context<Self>) {
+        let text = self.content(cx);
+        if let Some(construct) = self.containing_construct(format)
+            && construct.markers.len() >= 2
+        {
+            let open = construct.markers[0].clone();
+            let close = construct.markers[construct.markers.len() - 1].clone();
+            let command = commands::unwrap_delimiters(&text, self.selection, open, close);
+            self.apply_command(command, cx);
+            return;
+        }
+        if let Some(command) = commands::toggle_inline(&text, self.selection, format) {
+            self.apply_command(command, cx);
+        }
+    }
+
+    /// The parsed construct of the matching kind that strictly contains the
+    /// selection, if any.
+    fn containing_construct(&self, format: InlineFormat) -> Option<Construct> {
+        let kind = match format {
+            InlineFormat::Bold => Some(ConstructKind::Strong),
+            InlineFormat::Italic => Some(ConstructKind::Emphasis),
+            InlineFormat::Strike => Some(ConstructKind::Strikethrough),
+            InlineFormat::Highlight => Some(ConstructKind::Highlight),
+            InlineFormat::Code => Some(ConstructKind::CodeSpan),
+        }?;
+        self.index
+            .constructs()
+            .iter()
+            .find(|construct| {
+                construct.kind == kind
+                    && construct.range.start < self.selection.start()
+                    && self.selection.end() < construct.range.end
+            })
+            .cloned()
+    }
+
+    fn toggle_block_command(&mut self, format: BlockFormat, cx: &mut Context<Self>) {
+        let text = self.content(cx);
+        if let Some(command) = commands::toggle_block(&text, self.selection, format) {
+            self.apply_command(command, cx);
+        }
     }
 
     /// Backspace/delete: removes the selection, or one grapheme/word/line
@@ -1172,6 +1299,50 @@ mod interaction_tests {
                 6,
                 "click on the second line landed elsewhere"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn bold_shortcut_wraps_unwraps_and_undos_in_one_step(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "hello");
+        cx.simulate_keystrokes("cmd-a cmd-b");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "**hello**");
+        });
+
+        cx.simulate_keystrokes("cmd-z");
+        cx.update(|_, app| {
+            assert_eq!(
+                editor.read(app).content(app),
+                "hello",
+                "command was not one undo step"
+            );
+        });
+        cx.simulate_keystrokes("cmd-shift-z");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "**hello**");
+        });
+
+        // The parsed construct intercepts a second toggle and unwraps.
+        cx.update(|window, cx| {
+            window.draw(cx);
+        });
+        cx.simulate_keystrokes("cmd-b");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "hello", "unwrapped");
+        });
+    }
+
+    #[gpui::test]
+    async fn heading_shortcut_toggles_the_line(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "title\nbody");
+        cx.simulate_keystrokes("cmd-1");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "# title\nbody");
+        });
+        cx.simulate_keystrokes("cmd-1");
+        cx.update(|_, app| {
+            assert_eq!(editor.read(app).content(app), "title\nbody");
         });
     }
 

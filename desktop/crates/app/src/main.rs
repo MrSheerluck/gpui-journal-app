@@ -90,6 +90,10 @@ struct JournalSession {
     search_open: bool,
     /// The settings panel's open state.
     settings_open: bool,
+    /// A day whose delete is awaiting confirmation.
+    pending_delete: Option<NaiveDate>,
+    /// A message shown in the status banner (save or trash failures).
+    status: Option<String>,
     /// The month the sidebar calendar shows, `(year, month)`.
     calendar_month: (i32, u32),
     /// Set by the jump input's Enter event; processed in render, which has a
@@ -225,6 +229,8 @@ impl DainikiApp {
             search_input,
             search_open: false,
             settings_open: false,
+            pending_delete: None,
+            status: None,
             calendar_month: (today.year(), today.month()),
             pending_submit: Cell::new(false),
             pending_reveal: Cell::new(None),
@@ -566,6 +572,60 @@ impl DainikiApp {
         cx: &mut Context<Self>,
     ) {
         self.toggle_settings(cx);
+    }
+
+    // -- deleting a day -----------------------------------------------------
+
+    /// Asks for confirmation before moving a day's file to the OS trash.
+    fn request_delete(&mut self, date: NaiveDate, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut() {
+            session.pending_delete = Some(date);
+        }
+        cx.notify();
+    }
+
+    fn cancel_delete(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut() {
+            session.pending_delete = None;
+        }
+        cx.notify();
+    }
+
+    /// Moves the day's file to the OS trash (recoverable), then drops it from
+    /// the session. Deleting the open day first finishes editing it.
+    fn confirm_delete(&mut self, date: NaiveDate, cx: &mut Context<Self>) {
+        if self
+            .session()
+            .and_then(|session| session.active.as_ref())
+            .is_some_and(|active| active.date == date)
+        {
+            self.stop_editing(cx);
+        }
+        let Some(session) = self.session_mut() else {
+            return;
+        };
+        let path = journal::Journal::new(&session.root).entry_path(date);
+        if path.exists()
+            && let Err(error) = trash::delete(&path)
+        {
+            tracing::error!(path = %path.display(), error = %error, "could not move the entry to Trash");
+            session.status = Some(format!(
+                "Could not move {} to Trash — {error}",
+                path.display()
+            ));
+            session.pending_delete = None;
+            cx.notify();
+            return;
+        }
+        session.apply_deleted_day(date);
+        cx.notify();
+    }
+
+    fn dismiss_status(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut() {
+            session.status = None;
+        }
+        cx.notify();
     }
 
     fn on_previous_day(&mut self, _: &PreviousDay, window: &mut Window, cx: &mut Context<Self>) {
@@ -959,6 +1019,94 @@ impl JournalSession {
             }
             let date = dates[ix];
             let is_active = Some(date) == active_date;
+            let is_today = date == today;
+
+            // The header's right side: a confirm row while a delete is
+            // pending, otherwise the click hint plus the trash control.
+            let pending_delete = item_this.upgrade().and_then(|app| {
+                let app = app.read(cx);
+                match &app.screen {
+                    Screen::Journal(session) => session.pending_delete,
+                    Screen::Welcome { .. } => None,
+                }
+            });
+            let right: AnyElement = if pending_delete == Some(date) {
+                let delete_this = item_this.clone();
+                let cancel_this = item_this.clone();
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(brand::secondary())
+                            .child("Move to Trash?"),
+                    )
+                    .child(
+                        Button::new("confirm-delete")
+                            .label("Move to Trash")
+                            .danger()
+                            .compact()
+                            .on_click(move |_, _window, cx| {
+                                delete_this
+                                    .update(cx, |app, cx| app.confirm_delete(date, cx))
+                                    .ok();
+                            }),
+                    )
+                    .child(
+                        Button::new("cancel-delete")
+                            .label("Cancel")
+                            .compact()
+                            .on_click(move |_, _window, cx| {
+                                cancel_this.update(cx, |app, cx| app.cancel_delete(cx)).ok();
+                            }),
+                    )
+                    .into_any_element()
+            } else {
+                let delete_this = item_this.clone();
+                let hint = (!is_active).then(|| {
+                    let (icon, label) = if is_today {
+                        (IconName::NotebookPen, "Click to write")
+                    } else {
+                        (IconName::Pencil, "Click to edit")
+                    };
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Icon::new(icon)
+                                .size(px(13.))
+                                .text_color(brand::on_surface_variant().opacity(0.5)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(brand::on_surface_variant().opacity(0.5))
+                                .child(label),
+                        )
+                        .into_any_element()
+                });
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .children(hint)
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("delete-{date}").into()))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                                delete_this
+                                    .update(cx, |app, cx| app.request_delete(date, cx))
+                                    .ok();
+                            })
+                            .child(
+                                Icon::new(IconName::Trash)
+                                    .size(px(13.))
+                                    .text_color(brand::on_surface_variant().opacity(0.4)),
+                            ),
+                    )
+                    .into_any_element()
+            };
             let body: AnyElement = if is_active {
                 let editor = active_editor
                     .as_ref()
@@ -1013,7 +1161,7 @@ impl JournalSession {
                     v_flex()
                         .flex_1()
                         .min_w_0()
-                        .child(day_header(date, today, is_active))
+                        .child(day_header(date, today, right))
                         .child(body),
                 );
 
@@ -1034,6 +1182,44 @@ impl JournalSession {
         });
 
         let mut main = div().flex_1().min_h_0().flex().flex_col();
+
+        // Failures that matter (save, trash) surface here instead of only in
+        // the log.
+        if let Some(status) = &self.status {
+            let dismiss_this = this.clone();
+            let message = status.clone();
+            main = main.child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .bg(brand::surface_container_high())
+                    .border_b_1()
+                    .border_color(brand::outline_variant().opacity(0.6))
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(brand::on_surface())
+                                    .child(message),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                Button::new("status-dismiss")
+                                    .label("Dismiss")
+                                    .compact()
+                                    .on_click(move |_, _window, cx| {
+                                        dismiss_this
+                                            .update(cx, |app, cx| app.dismiss_status(cx))
+                                            .ok();
+                                    }),
+                            ),
+                    ),
+            );
+        }
 
         // The search row, opened from the pill or cmd-F. Live filtering as
         // you type; the count shows what survived.
@@ -1766,6 +1952,13 @@ impl JournalSession {
             }
         }
     }
+
+    /// Removes a day from the session after its file has left the disk.
+    fn apply_deleted_day(&mut self, date: NaiveDate) {
+        self.days.remove(&date);
+        self.pending_delete = None;
+        self.rebuild_tags();
+    }
 }
 
 /// Reads every past day with content, off the UI thread. Days with an empty
@@ -1792,9 +1985,9 @@ fn read_days(root: &Path, today: NaiveDate) -> BTreeMap<NaiveDate, String> {
 }
 
 /// One stream item's date header, following the landing's showcase: the
-/// pulsing dot and "Today — Thursday, October 15" heading, with a click hint
-/// on days that are not open in the editor.
-fn day_header(date: NaiveDate, today: NaiveDate, is_active: bool) -> AnyElement {
+/// pulsing dot and "Today — Thursday, October 15" heading, with `right` on
+/// the far side (the click hint and delete control, or a confirm row).
+fn day_header(date: NaiveDate, today: NaiveDate, right: AnyElement) -> AnyElement {
     let is_today = date == today;
     h_flex()
         .items_center()
@@ -1823,29 +2016,7 @@ fn day_header(date: NaiveDate, today: NaiveDate, is_active: bool) -> AnyElement 
                         .child(day_heading(date, today)),
                 ),
         )
-        .when(!is_active, |el| {
-            let (icon, label) = if is_today {
-                (IconName::NotebookPen, "Click to write")
-            } else {
-                (IconName::Pencil, "Click to edit")
-            };
-            el.child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(
-                        Icon::new(icon)
-                            .size(px(13.))
-                            .text_color(brand::on_surface_variant().opacity(0.5)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(brand::on_surface_variant().opacity(0.5))
-                            .child(label),
-                    ),
-            )
-        })
+        .child(right)
         .into_any_element()
 }
 
@@ -3047,6 +3218,84 @@ mod tests {
             assert!(!session.search_open);
             assert!(!session.filter.is_active());
             assert_eq!(session.stream.item_count(), 4);
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn deleting_a_day_asks_then_removes_it(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let yesterday = today.pred_opt().expect("yesterday");
+        seed_day(&journal, yesterday, "# travel\n\n#travel day\n");
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // The first click only asks.
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| app.request_delete(yesterday, cx));
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert_eq!(session.pending_delete, Some(yesterday));
+        });
+
+        // Cancel clears it.
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| app.cancel_delete(cx));
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert_eq!(session.pending_delete, None);
+            assert!(session.days.contains_key(&yesterday));
+        });
+
+        // The state transition after the file leaves the disk (the trash move
+        // itself is one syscall, kept out of tests so they never write to the
+        // user's Trash).
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| {
+                if let Some(session) = app.session_mut() {
+                    session.apply_deleted_day(yesterday);
+                }
+                cx.notify();
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let Screen::Journal(session) = &app.screen else {
+                panic!("expected an open journal session");
+            };
+            assert!(!session.days.contains_key(&yesterday));
+            assert!(
+                !session.tags.contains_key("travel"),
+                "the tag index forgets the deleted day"
+            );
+            assert_eq!(session.stream.item_count(), 2, "today and the edge");
         });
         fs::remove_dir_all(&dir).ok();
     }

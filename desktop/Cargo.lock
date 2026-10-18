@@ -1094,6 +1094,7 @@ dependencies = [
  "ropey",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
 ]
 
 [[package]]

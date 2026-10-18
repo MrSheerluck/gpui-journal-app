@@ -20,9 +20,10 @@ Keep scrolling: the offset is owned by the editor view, not by a GPUI scroll
 container, and the element skips lines outside the viewport when painting. The
 thin indicator on the right tracks your position through the document.
 
-Scrolling past the fold is the point of A3: wheel ticks move by whole lines,
-trackpad gestures move by exact pixels and continue with OS momentum after your
-fingers lift.
+Type into it: click to focus, then type. Arrows move the caret (option steps by
+word, command by line, command-up/down jumps to the document bounds), shift
+extends the selection, and Enter inserts a newline. IME composition renders an
+underline until you commit it.
 
 - Unicode shaping works too: héllo - 日本語 - emoji 🎉
 - This second item exists mainly to make the list rhythm visible.
@@ -34,9 +35,9 @@ stays fully visible above it:
 
     cargo run -p dainiki-editor --example workbench -- ~/journal/2026-10-17.md
 
-One more paragraph so the sample reliably overflows a 640 pt window. In later
-steps this file grows a caret, selection, and inline constructs; for now the
-only way to move through it is the scroll offset you are exercising.
+One more paragraph so the sample reliably overflows a 640 pt window. Editing is
+still caret-and-keyboard only: deletion, undo and mouse selection arrive in
+later steps.
 ";
 
 struct Workbench {

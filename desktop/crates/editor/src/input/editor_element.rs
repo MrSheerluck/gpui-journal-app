@@ -8,11 +8,8 @@ use gpui::{
 
 use crate::{
     buffer::Buffer,
-    input::{
-        Selection,
-        scroll::{EditorScrollState, clamp_offset},
-    },
-    theme::EditorTheme,
+    editor::MarkdownEditor,
+    input::scroll::{EditorScrollState, clamp_offset},
 };
 
 const THUMB_WIDTH: f32 = 6.;
@@ -20,30 +17,24 @@ const THUMB_MIN_HEIGHT: f32 = 24.;
 const THUMB_MARGIN: f32 = 4.;
 
 pub struct EditorElement {
+    view: Entity<MarkdownEditor>,
     buffer: Entity<Buffer>,
-    theme: EditorTheme,
     scroll: Rc<EditorScrollState>,
     layout: EditorLayout,
-    selection: Selection,
-    show_caret: bool,
 }
 
 impl EditorElement {
     pub fn new(
+        view: Entity<MarkdownEditor>,
         buffer: Entity<Buffer>,
-        theme: EditorTheme,
         scroll: Rc<EditorScrollState>,
         layout: EditorLayout,
-        selection: Selection,
-        show_caret: bool,
     ) -> Self {
         Self {
+            view,
             buffer,
-            theme,
             scroll,
             layout,
-            selection,
-            show_caret,
         }
     }
 }
@@ -196,12 +187,21 @@ impl Element for EditorElement {
             0.0
         };
 
-        let show_selection = !self.selection.is_caret();
-        let selection = (self.selection.start(), self.selection.end());
-        let show_caret = self.show_caret && !show_selection;
+        let (theme, selection_state, caret_visible, focus_handle) = {
+            let view = self.view.read(cx);
+            (
+                view.theme().clone(),
+                view.selection(),
+                view.caret_visible(),
+                view.focus_handle().clone(),
+            )
+        };
+        let show_selection = !selection_state.is_caret();
+        let selection = (selection_state.start(), selection_state.end());
+        let show_caret = caret_visible && !show_selection && focus_handle.is_focused(window);
         let caret = if show_caret {
             let buffer = self.buffer.read(cx);
-            Some(buffer.offset_to_line(self.selection.head()))
+            Some(buffer.offset_to_line(selection_state.head()))
         } else {
             None
         };
@@ -227,7 +227,7 @@ impl Element for EditorElement {
                             inner.line_height,
                             line_range,
                             selection,
-                            self.theme.selection,
+                            theme.selection,
                             window,
                         );
                     }
@@ -249,7 +249,7 @@ impl Element for EditorElement {
                             line_origin,
                             inner.line_height,
                             caret_local,
-                            self.theme.caret,
+                            theme.caret,
                             window,
                         );
                     }
@@ -276,7 +276,7 @@ impl Element for EditorElement {
                     height: px(thumb_height),
                 },
             };
-            window.paint_quad(fill(thumb, self.theme.scrollbar).corner_radii(THUMB_WIDTH / 2.));
+            window.paint_quad(fill(thumb, theme.scrollbar).corner_radii(THUMB_WIDTH / 2.));
         }
     }
 }

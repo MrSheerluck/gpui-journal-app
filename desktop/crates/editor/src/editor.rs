@@ -75,6 +75,18 @@ impl MarkdownEditor {
         &self.focus_handle
     }
 
+    pub(crate) fn theme(&self) -> &EditorTheme {
+        &self.theme
+    }
+
+    pub(crate) fn selection(&self) -> Selection {
+        self.selection
+    }
+
+    pub(crate) fn caret_visible(&self) -> bool {
+        self.caret_visible
+    }
+
     pub fn scroll_by(&mut self, delta: Pixels, cx: &mut Context<Self>) {
         if self.scroll.scroll_by(delta) {
             cx.notify();
@@ -240,7 +252,6 @@ impl Render for MarkdownEditor {
             self.focused = focused;
             self.restart_blink();
         }
-        let show_caret = self.focused && self.caret_visible;
         div()
             .size_full()
             .overflow_hidden()
@@ -250,12 +261,10 @@ impl Render for MarkdownEditor {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .child(EditorElement::new(
+                cx.entity(),
                 self.buffer.clone(),
-                self.theme.clone(),
                 self.scroll.clone(),
                 self.layout.clone(),
-                self.selection,
-                show_caret,
             ))
     }
 }

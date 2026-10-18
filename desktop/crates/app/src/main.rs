@@ -2049,7 +2049,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use chrono::{Local, NaiveDate};
+    use chrono::{Datelike, Local, NaiveDate};
     use gpui::{ScrollDelta, ScrollWheelEvent, TestAppContext, point, px};
 
     // NOTE: no `use super::*` here. The crate root glob-imports `gpui_kit::*`,

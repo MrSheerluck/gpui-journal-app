@@ -90,7 +90,7 @@ impl MarkdownIndex {
         };
         let root = tree.root_node();
         let mut constructs = Vec::new();
-        self.walk_blocks(root, &mut constructs);
+        self.walk_blocks(root, text, &mut constructs);
         let inline_nodes = collect_kind_nodes(root, "inline");
         for inline in inline_nodes {
             let start = inline.start_byte();
@@ -121,10 +121,37 @@ impl MarkdownIndex {
     }
 
     /// Block-level constructs: headings, list and quote markers, fences, rules.
-    fn walk_blocks(&self, node: Node<'_>, out: &mut Vec<Construct>) {
+    fn walk_blocks(&self, node: Node<'_>, text: &str, out: &mut Vec<Construct>) {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             match child.kind() {
+                "setext_heading" => {
+                    let mut markers = Vec::new();
+                    collect_children(
+                        child,
+                        &["setext_h1_underline", "setext_h2_underline"],
+                        &mut markers,
+                    );
+                    let level = markers
+                        .first()
+                        .map(|marker| {
+                            if text[marker.clone()].starts_with('=') {
+                                1
+                            } else {
+                                2
+                            }
+                        })
+                        .unwrap_or(1);
+                    let mut inner = collect_descendant_kind_nodes(child, "inline");
+                    inner.truncate(1);
+                    trim_heading_inner(text, &mut inner);
+                    out.push(Construct {
+                        kind: ConstructKind::Heading { level },
+                        range: child.byte_range(),
+                        markers,
+                        inner,
+                    });
+                }
                 "atx_heading" => {
                     let level = atx_heading_level(child).unwrap_or(1);
                     let mut markers = Vec::new();
@@ -142,6 +169,7 @@ impl MarkdownIndex {
                     );
                     let mut inner = Vec::new();
                     collect_children(child, &["inline"], &mut inner);
+                    trim_heading_inner(text, &mut inner);
                     out.push(Construct {
                         kind: ConstructKind::Heading { level },
                         range: child.byte_range(),
@@ -203,7 +231,7 @@ impl MarkdownIndex {
                 }
                 _ => {}
             }
-            self.walk_blocks(child, out);
+            self.walk_blocks(child, text, out);
         }
     }
 
@@ -374,6 +402,26 @@ fn collect_kind_nodes<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> 
         found.extend(collect_kind_nodes(child, kind));
     }
     found
+}
+
+/// Inline nodes of `node` at any depth, as byte ranges.
+fn collect_descendant_kind_nodes(node: Node<'_>, kind: &str) -> Vec<Range<usize>> {
+    collect_kind_nodes(node, kind)
+        .into_iter()
+        .map(|node| node.byte_range())
+        .collect()
+}
+
+/// The grammar keeps a closed ATX heading's trailing `#` run inside the
+/// inline content; trim it (with its leading spaces) from the content range.
+fn trim_heading_inner(text: &str, inner: &mut [Range<usize>]) {
+    if let Some(range) = inner.first_mut() {
+        let content = &text[range.clone()];
+        let without_hashes = content.trim_end().trim_end_matches('#').trim_end();
+        if without_hashes.len() < content.len() {
+            range.end = range.start + without_hashes.len();
+        }
+    }
 }
 
 fn collect_children(node: Node<'_>, kinds: &[&str], out: &mut Vec<Range<usize>>) {

@@ -225,28 +225,19 @@ fn project_line(
                     continue;
                 }
                 line_style = Style::Heading { level };
-                let content_start = construct
-                    .inner
-                    .first()
-                    .map(|range| range.start)
-                    .unwrap_or(source.end)
-                    .min(source.end);
-                if source.start < content_start {
-                    pieces.push((source.start..content_start, Piece::Hide));
-                }
                 if let Some(content) = construct.inner.first() {
-                    let visible_end = content.end.min(source.end);
-                    if let Some(trailing) = construct
-                        .markers
-                        .iter()
-                        .find(|marker| marker.start >= visible_end)
-                    {
-                        let start = trailing.start.max(visible_end).max(source.start);
-                        let end = trailing.end.min(source.end);
-                        if start < end {
-                            pieces.push((start..end, Piece::Hide));
-                        }
+                    // Everything outside the content range is markup: the
+                    // leading marker plus gap, and the trailing marker.
+                    let content_start = content.start.min(source.end);
+                    if source.start < content_start {
+                        pieces.push((source.start..content_start, Piece::Hide));
                     }
+                    let tail_start = content.end.min(source.end).max(source.start);
+                    if tail_start < source.end {
+                        pieces.push((tail_start..source.end, Piece::Hide));
+                    }
+                } else {
+                    pieces.push((source.clone(), Piece::Hide));
                 }
             }
             ConstructKind::ListMarker => {
@@ -840,6 +831,48 @@ mod tests {
         let text = "text ![a](p.png) more\n";
         let plan = plan_for(text, Selection::caret(0));
         assert_eq!(plan.lines[0].text, "text [image: p.png] more");
+    }
+
+    #[test]
+    fn atx_trailing_markers_hide_with_their_gap() {
+        let text = "# Title #\n";
+        let plan = plan_for(text, Selection::caret(10));
+        assert_eq!(plan.lines[0].text, "Title");
+    }
+
+    #[test]
+    fn setext_headings_collapse_the_underline_line() {
+        let text = "Title\n=====\n\nbody\n";
+        let plan = plan_for(text, Selection::caret(15));
+        assert_eq!(plan.lines[0].text, "Title");
+        assert_eq!(plan.lines[0].style, Style::Heading { level: 1 });
+        assert_eq!(plan.lines[1].text, "");
+        assert!(
+            plan.lines[1]
+                .fragments
+                .iter()
+                .all(|fragment| fragment.kind != FragmentKind::Visible)
+        );
+
+        let second = "Sub\n---\n\nbody\n";
+        let plan = plan_for(second, Selection::caret(12));
+        assert_eq!(plan.lines[0].style, Style::Heading { level: 2 });
+    }
+
+    #[test]
+    fn escapes_and_unclosed_markers_stay_literal() {
+        let text = "a \\*b\\* c and **unclosed and [link\n";
+        let plan = plan_for(text, Selection::caret(0));
+        assert_eq!(plan.lines[0].text, text.trim_end());
+        assert!(plan.lines[0].runs.is_empty());
+    }
+
+    #[test]
+    fn lazy_quote_continuation_does_not_crash() {
+        let text = "> first\ncontinued\n";
+        let plan = plan_for(text, Selection::caret(16));
+        assert_eq!(plan.lines[0].style, Style::Quote);
+        assert_eq!(plan.lines[1].style, Style::Body);
     }
 
     #[test]

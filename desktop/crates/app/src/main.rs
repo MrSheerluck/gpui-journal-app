@@ -14,11 +14,12 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::component::button::{Button, Toggle, ToggleGroup};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::popover::Popover;
+use gpui_kit::component::text::markdown;
 use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::*;
 
-actions!(dainiki, [Save]);
+actions!(dainiki, [Save, TogglePreview]);
 
 /// Autosave runs this long after the last keystroke.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -39,6 +40,7 @@ struct DainikiApp {
     dirty: bool,
     save_task: Option<Task<()>>,
     link_input: Entity<InputState>,
+    preview: bool,
     _editor_events: Subscription,
     _editor_observer: Subscription,
 }
@@ -69,6 +71,7 @@ impl DainikiApp {
             dirty: false,
             save_task: None,
             link_input,
+            preview: false,
             _editor_events: events,
             _editor_observer: observer,
         }
@@ -104,6 +107,30 @@ impl DainikiApp {
 
     fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
         self.save_now(cx);
+    }
+
+    fn on_toggle_preview(
+        &mut self,
+        _: &TogglePreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.preview = !self.preview;
+        if !self.preview {
+            let focus = self.editor.read(cx).focus_handle().clone();
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+    }
+
+    fn preview_toggle(&self) -> Toggle {
+        Toggle::new("preview")
+            .label("Read")
+            .tooltip("Reading view — ⌘E")
+            .checked(self.preview)
+            .on_click(move |_checked, window, cx| {
+                window.dispatch_action(Box::new(TogglePreview), cx);
+            })
     }
 
     fn window_title(&self) -> String {
@@ -361,11 +388,24 @@ fn copy_image(source: &Path, assets: &Path) -> Result<(String, String), String> 
 
 impl Render for DainikiApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = if self.preview {
+            let text = self.editor.read(cx).content(cx);
+            div()
+                .id("reading-view")
+                .w_full()
+                .max_w(px(720.))
+                .overflow_y_scroll()
+                .child(markdown(text))
+                .into_any_element()
+        } else {
+            self.editor.clone().into_any_element()
+        };
         div()
             .size_full()
             .flex()
             .flex_col()
             .on_action(cx.listener(Self::on_save))
+            .on_action(cx.listener(Self::on_toggle_preview))
             .child(TitleBar::new().child(self.window_title()))
             .child(
                 div().w_full().px_3().py_1().child(
@@ -378,6 +418,7 @@ impl Render for DainikiApp {
                                 .child(self.block_toolbar(cx)),
                         )
                         .child(self.insert_menu())
+                        .child(self.preview_toggle())
                         .child(self.help_menu()),
                 ),
             )
@@ -388,7 +429,7 @@ impl Render for DainikiApp {
                     .bg(self.theme.background)
                     .px_10()
                     .py_6()
-                    .child(self.editor.clone()),
+                    .child(content),
             )
     }
 }
@@ -403,7 +444,10 @@ fn main() {
 
     gpui_kit::application().run(move |cx: &mut App| {
         gpui_kit::init(cx);
-        cx.bind_keys([KeyBinding::new("cmd-s", Save, None)]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-s", Save, None),
+            KeyBinding::new("cmd-e", TogglePreview, None),
+        ]);
         open_app_window(cx, path).expect("failed to open the Dainiki window");
         cx.activate(true);
     });

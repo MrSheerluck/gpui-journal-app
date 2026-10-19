@@ -318,15 +318,47 @@ fn project_line(
             }
             ConstructKind::QuoteMarker => {
                 if !line_revealed(&source, selection) {
-                    pieces.push((
-                        reveal_range,
-                        Piece::Glyph {
-                            text: "▎ ".to_string(),
-                            widget: WidgetKind::QuoteBar,
-                        },
-                    ));
                     if line_style == Style::Body {
                         line_style = Style::Quote;
+                    }
+                    let marker = &text[reveal_range.clone()];
+                    let barred = pieces.iter().any(|(_, piece)| {
+                        matches!(
+                            piece,
+                            Piece::Glyph {
+                                widget: WidgetKind::QuoteBar,
+                                ..
+                            }
+                        )
+                    });
+                    // One bar per line: a nested level — a second `>` on the
+                    // same line, whether it sits in its own marker node or in
+                    // one run like `> > ` — keeps its width as indentation, so
+                    // a nested quote reads as an indented quote instead of two
+                    // bars side by side.
+                    let bar_len = if barred {
+                        0
+                    } else {
+                        marker[1..]
+                            .find('>')
+                            .map(|second| 1 + second)
+                            .unwrap_or(marker.len())
+                    };
+                    let bar_end = reveal_range.start + bar_len;
+                    if bar_len > 0 {
+                        pieces.push((
+                            reveal_range.start..bar_end,
+                            Piece::Glyph {
+                                text: "▎ ".to_string(),
+                                widget: WidgetKind::QuoteBar,
+                            },
+                        ));
+                    }
+                    if bar_end < reveal_range.end {
+                        pieces.push((
+                            bar_end..reveal_range.end,
+                            Piece::Text(" ".repeat(reveal_range.end - bar_end)),
+                        ));
                     }
                 }
             }
@@ -1050,6 +1082,32 @@ mod tests {
         let second_marker = text.find("\n>\n").expect("the empty quote line") + 2;
         let plan = plan_for(text, Selection::caret(second_marker));
         assert_eq!(plan.lines[3].text, ">");
+    }
+
+    #[test]
+    fn nested_quote_levels_indent_instead_of_stacking_bars() {
+        // The two lines differ in shape on purpose: the first has a marker
+        // node per level, the second one run holding both (`> > `). Both
+        // render the same way — one bar, the nested level as indentation.
+        let text = "> > nested first\n> > nested second\n";
+        let plan = plan_for(text, Selection::caret(text.len()));
+        for line in &plan.lines[..2] {
+            assert_eq!(line.style, Style::Quote);
+            assert_eq!(
+                line.fragments
+                    .iter()
+                    .filter(|fragment| matches!(
+                        fragment.kind,
+                        FragmentKind::Widget(WidgetKind::QuoteBar)
+                    ))
+                    .count(),
+                1,
+                "one bar per line: {:?}",
+                line.text
+            );
+        }
+        assert_eq!(plan.lines[0].text, "▎   nested first");
+        assert_eq!(plan.lines[1].text, "▎   nested second");
     }
 
     #[test]

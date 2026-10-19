@@ -1568,7 +1568,10 @@ impl JournalSession {
             .iter()
             .any(|segment| matches!(segment, DaySegment::Media { .. }))
         {
-            return markdown(text.to_string()).into_any_element();
+            // No cards to place: one markdown run. It still goes through the
+            // rewrite pass — inline references read as links, `==swipes==` as
+            // marks — instead of the raw source.
+            return markdown(rewritten_text(text)).into_any_element();
         }
         let playback = self.media.peek();
         v_flex()
@@ -3266,7 +3269,7 @@ fn day_segments(text: &str) -> Vec<DaySegment> {
                 }
                 segments.push(DaySegment::Media { destination, kind });
             }
-            None => pending.push_str(&inline_media_links(line)),
+            None => pending.push_str(&highlight_marks(&inline_media_links(line))),
         }
     }
     if !pending.is_empty() {
@@ -3278,6 +3281,49 @@ fn day_segments(text: &str) -> Vec<DaySegment> {
 /// Rewrites inline `![alt](destination)` references into `[label](destination)`
 /// links: the reading view has no inline media cards, and a raw path reads as
 /// a bug. The label is the alt text, or the file name when there is none.
+/// The read-only copy of an entry that has no whole-line media: the same
+/// rewrite pass `day_segments` applies (inline references become links,
+/// `==swipes==` become marks), joined back into one markdown run.
+fn rewritten_text(text: &str) -> String {
+    let mut rewritten = String::with_capacity(text.len());
+    for segment in day_segments(text) {
+        if let DaySegment::Text(text) = segment {
+            rewritten.push_str(&text);
+        }
+    }
+    rewritten
+}
+
+/// `==text==` is the editor's highlighter. The reading view speaks inline
+/// HTML marks, so a read-only day paints the same phrase with a swipe behind
+/// it instead of showing the markers.
+fn highlight_marks(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut rest = line;
+    loop {
+        let Some(start) = rest.find("==") else {
+            output.push_str(rest);
+            return output;
+        };
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("==") else {
+            output.push_str(rest);
+            return output;
+        };
+        if end == 0 {
+            // `====`: an empty swipe, not a highlight.
+            output.push_str(&rest[..start + 4]);
+            rest = &after[2..];
+            continue;
+        }
+        output.push_str(&rest[..start]);
+        output.push_str("<mark>");
+        output.push_str(&after[..end]);
+        output.push_str("</mark>");
+        rest = &after[end + 2..];
+    }
+}
+
 fn inline_media_links(line: &str) -> String {
     let mut output = String::with_capacity(line.len());
     let mut rest = line;
@@ -4726,6 +4772,45 @@ mod tests {
             );
         });
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn highlights_become_marks_when_reading() {
+        use super::{day_segments, highlight_marks, rewritten_text};
+
+        assert_eq!(
+            highlight_marks("a ==swipe== b"),
+            "a <mark>swipe</mark> b",
+            "a highlight becomes a mark"
+        );
+        assert_eq!(
+            highlight_marks("==one== and ==two=="),
+            "<mark>one</mark> and <mark>two</mark>",
+            "each pair becomes its own mark"
+        );
+        assert_eq!(
+            highlight_marks("unclosed ==here"),
+            "unclosed ==here",
+            "a lone marker is left alone"
+        );
+        assert_eq!(highlight_marks("===="), "====", "an empty swipe is not one");
+        assert!(
+            matches!(
+                day_segments("say ==this== twice\n").first(),
+                Some(super::DaySegment::Text(text)) if text == "say <mark>this</mark> twice\n"
+            ),
+            "read-only days carry the swipe into the markdown view"
+        );
+        // A day without cards takes the joined rewrite, not the raw source.
+        assert_eq!(
+            rewritten_text("say ==this== twice\n"),
+            "say <mark>this</mark> twice\n"
+        );
+        assert_eq!(
+            rewritten_text("inline ![a](p.png) here\n"),
+            "inline [a](p.png) here\n",
+            "inline references read as links even without a card in the day"
+        );
     }
 
     #[test]

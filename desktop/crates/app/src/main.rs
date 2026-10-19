@@ -60,6 +60,10 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// While something plays, the player's state is pushed this often.
 const MEDIA_TICK: Duration = Duration::from_millis(100);
 
+/// The hover group every day header shares: its members show only while the
+/// header under the cursor asks them to.
+const DAY_HEADER_GROUP: &str = "day-header";
+
 /// The stream's viewport margins for caret keeping-visible: the chrome above
 /// (title bar, toolbar, panels) and a little air below.
 const STREAM_TOP_MARGIN: f32 = 120.;
@@ -1916,10 +1920,11 @@ impl JournalSession {
             }
             let date = dates[ix];
             let is_active = Some(date) == active_date;
-            let is_today = date == today;
 
             // The header's right side: a confirm row while a delete is
-            // pending, otherwise the click hint plus the trash control.
+            // pending, otherwise nothing until the header is hovered — the
+            // per-entry hint and trash icons made every day look like a
+            // toolbar.
             let pending_delete = item_this.upgrade().and_then(|app| {
                 let app = app.read(cx);
                 match &app.screen {
@@ -1960,49 +1965,9 @@ impl JournalSession {
                     )
                     .into_any_element()
             } else {
-                let delete_this = item_this.clone();
-                let hint = (!is_active).then(|| {
-                    let (icon, label) = if is_today {
-                        (IconName::NotebookPen, "Click to write")
-                    } else {
-                        (IconName::Pencil, "Click to edit")
-                    };
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .child(
-                            Icon::new(icon)
-                                .size(px(13.))
-                                .text_color(brand::on_surface_variant().opacity(0.5)),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(brand::on_surface_variant().opacity(0.5))
-                                .child(label),
-                        )
-                        .into_any_element()
-                });
-                h_flex()
-                    .gap_3()
-                    .items_center()
-                    .children(hint)
-                    .child(
-                        div()
-                            .id(ElementId::Name(format!("delete-{date}").into()))
-                            .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                                delete_this
-                                    .update(cx, |app, cx| app.request_delete(date, cx))
-                                    .ok();
-                            })
-                            .child(
-                                Icon::new(IconName::Trash)
-                                    .size(px(13.))
-                                    .text_color(brand::on_surface_variant().opacity(0.4)),
-                            ),
-                    )
-                    .into_any_element()
+                // Reading or editing: the delete control waits for the cursor
+                // instead of sitting on every entry.
+                delete_control(date, item_this.clone())
             };
             let body: AnyElement = if is_active {
                 let editor = active_editor
@@ -2791,6 +2756,10 @@ fn read_days(root: &Path, today: NaiveDate) -> BTreeMap<NaiveDate, String> {
 fn day_header(date: NaiveDate, today: NaiveDate, right: AnyElement) -> AnyElement {
     let is_today = date == today;
     h_flex()
+        // Hovering the heading reveals the entry's delete control. Every
+        // entry shares the name; each header is its own group, so only the
+        // hovered one lights up.
+        .group(DAY_HEADER_GROUP)
         .items_center()
         .justify_between()
         .mb_2()
@@ -2818,6 +2787,25 @@ fn day_header(date: NaiveDate, today: NaiveDate, right: AnyElement) -> AnyElemen
                 ),
         )
         .child(right)
+        .into_any_element()
+}
+
+/// The trash control at a day header's far side. It stays invisible until the
+/// header is hovered, so the reading view is dates and text, not chrome.
+fn delete_control(date: NaiveDate, app: WeakEntity<DainikiApp>) -> AnyElement {
+    div()
+        .id(ElementId::Name(format!("delete-{date}").into()))
+        .opacity(0.)
+        .group_hover(DAY_HEADER_GROUP, |style| style.opacity(1.))
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+            app.update(cx, |app, cx| app.request_delete(date, cx)).ok();
+        })
+        .child(
+            Icon::new(IconName::Trash)
+                .size(px(13.))
+                .text_color(brand::on_surface_variant().opacity(0.4)),
+        )
         .into_any_element()
 }
 

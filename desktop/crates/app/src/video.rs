@@ -49,6 +49,19 @@ impl Pump {
         })
     }
 
+    /// Decodes just the first frame of a video, for a card's poster. The
+    /// decoder is dropped as soon as that frame arrives.
+    pub async fn first_frame(path: &std::path::Path) -> Result<VideoFrame, String> {
+        let pump = Pump::start(path)?;
+        let frames = pump.frames();
+        let frame = frames
+            .recv()
+            .await
+            .map_err(|_| "the decoder stopped before its first frame".to_string())?;
+        drop(pump);
+        frame
+    }
+
     /// Frames and setup failures, in order.
     pub fn frames(&self) -> async_channel::Receiver<Result<VideoFrame, String>> {
         self.frames.clone()

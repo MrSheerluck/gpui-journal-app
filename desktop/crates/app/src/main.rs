@@ -776,24 +776,33 @@ impl DainikiApp {
     }
 
     /// Restarts the debounce window; the previous pending save is dropped.
-    /// Starts decoding every image a day's text references, once each, so the
-    /// app knows when a read-only card settles and can re-measure the day.
-    fn ensure_day_images(&mut self, date: NaiveDate, text: &str, cx: &mut Context<Self>) {
+    /// Starts decoding every image — and every video's poster — a day's text
+    /// references, once each, so the app knows when a card settles and can
+    /// re-measure the day.
+    fn ensure_day_media(&mut self, date: NaiveDate, text: &str, cx: &mut Context<Self>) {
         let Some(session) = self.session() else {
             return;
         };
         let root = session.root.clone();
-        let destinations: Vec<String> = day_segments(text)
+        let destinations: Vec<(MediaKind, String)> = day_segments(text)
             .into_iter()
             .filter_map(|segment| match segment {
-                DaySegment::Media {
-                    kind: MediaKind::Image,
-                    destination,
-                } => Some(destination),
+                DaySegment::Media { kind, destination }
+                    if matches!(kind, MediaKind::Image | MediaKind::Video) =>
+                {
+                    Some((kind, destination))
+                }
                 _ => None,
             })
             .collect();
-        for destination in destinations {
+        for (kind, destination) in destinations {
+            #[cfg(test)]
+            if kind == MediaKind::Video {
+                // The platform decoder runs a real thread, and the test
+                // scheduler (rightly) refuses to have one active during a
+                // test. Images exercise the same load-settle-remeasure path.
+                continue;
+            }
             let cleaned = destination_path(&destination);
             let resolved = journal::Journal::new(&root)
                 .entry_path(date)
@@ -815,20 +824,53 @@ impl DainikiApp {
                     .background_executor()
                     .spawn({
                         let resolved = resolved.clone();
-                        async move { dainiki_editor::decode_image(&resolved) }
+                        async move {
+                            match kind {
+                                MediaKind::Video => video::Pump::first_frame(&resolved)
+                                    .await
+                                    .and_then(|frame| {
+                                        frame.into_render_image().ok_or_else(|| {
+                                            "the video frame could not be rendered".to_string()
+                                        })
+                                    }),
+                                _ => dainiki_editor::decode_image(&resolved),
+                            }
+                        }
                     })
                     .await;
                 let state = match decoded {
                     Ok(image) => MediaImageState::Loaded(image),
                     Err(error) => {
-                        tracing::warn!(path = %resolved.display(), error = %error, "failed to load image");
+                        tracing::warn!(path = %resolved.display(), error = %error, "failed to decode media");
                         MediaImageState::Failed
                     }
                 };
                 app.update(cx, |app, cx| {
+                    let poster = match &state {
+                        MediaImageState::Loaded(image) if kind == MediaKind::Video => {
+                            Some(image.clone())
+                        }
+                        _ => None,
+                    };
                     if let Some(session) = app.session() {
-                        session.media_images.borrow_mut().insert(resolved, state);
+                        session
+                            .media_images
+                            .borrow_mut()
+                            .insert(resolved, state.clone());
                         session.media_settled.set(session.media_settled.get() + 1);
+                    }
+                    if let Some(poster) = poster
+                        && let Some(editor) = app
+                            .session()
+                            .and_then(|session| session.active.as_ref())
+                            .map(|active| active.editor.clone())
+                    {
+                        // The live preview shows the same poster the reading
+                        // view does; its media revision re-measures the day.
+                        let destination = destination.clone();
+                        editor.update(cx, |editor, cx| {
+                            editor.set_media_frame(&destination, poster, cx)
+                        });
                     }
                     app.repaint(cx);
                 })
@@ -1886,22 +1928,30 @@ impl JournalSession {
 
         match kind {
             MediaKind::Video => {
-                let framed = self
+                let playing_frame = self
                     .latest_frame
                     .as_ref()
-                    .filter(|(current, _, _)| current == destination);
-                let area: AnyElement = if let Some((_, frame, _)) = framed {
-                    // The picture is shown whole, letterboxed into the card,
-                    // never cropped to a fixed box — a screen recording of a
-                    // different shape used to look stretched.
+                    .filter(|(current, _, _)| current == destination)
+                    .map(|(_, frame, _)| frame.clone());
+                // Before anything plays, the card shows the poster decoded by
+                // the app, so a video is never a blank frame.
+                let poster = match self.media_images.borrow().get(&resolved) {
+                    Some(MediaImageState::Loaded(image)) => Some(image.clone()),
+                    _ => None,
+                };
+                let picture = playing_frame.or(poster);
+                let area: AnyElement = if let Some(frame) = picture {
+                    // The box takes the picture's own shape: no fixed 16:9
+                    // frame, no letterbox bands, no crop.
                     let size = frame.size(0);
                     let scale = scale_factor.max(1.);
                     let natural_width = (size.width.0 as f32 / scale).max(1.);
                     let natural_height = (size.height.0 as f32 / scale).max(1.);
-                    let height = (560. * natural_height / natural_width).clamp(160., 360.);
+                    let aspect = (natural_width / natural_height).clamp(0.34, 2.6);
                     div()
                         .w_full()
-                        .h(px(height))
+                        .aspect_ratio(aspect)
+                        .max_h(px(360.))
                         .relative()
                         .bg(brand::surface_container_lowest())
                         .child(
@@ -2300,7 +2350,7 @@ impl JournalSession {
                     // heights, and a card that grows would paint over the
                     // text below it).
                     item_this
-                        .update(cx, |app, cx| app.ensure_day_images(date, &text, cx))
+                        .update(cx, |app, cx| app.ensure_day_media(date, &text, cx))
                         .ok();
                     div()
                         .font_family(brand::SERIF_FAMILY)
@@ -3939,6 +3989,15 @@ impl Render for DainikiApp {
             .and_then(|session| session.pending_reload.take())
         {
             self.reload_active_day(date, window, cx);
+        }
+        // The open day's media decodes too: the editor draws its cards, and a
+        // video should show a poster before anything plays.
+        if let Some((date, text)) = self
+            .session()
+            .and_then(|session| session.active.as_ref())
+            .map(|active| (active.date, active.editor.read(cx).content(cx)))
+        {
+            self.ensure_day_media(date, &text, cx);
         }
         // The rollover timer asks for a new day past midnight.
         if self

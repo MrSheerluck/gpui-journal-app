@@ -839,7 +839,10 @@ fn paint_media_line(
         }
         MediaKind::Video | MediaKind::Audio => {
             let (card_height, radius, button_radius) = match kind {
-                MediaKind::Video => ((line_height - px(8.)).max(px(120.)), 10., px(22.)),
+                // The video card is exactly the height the layout reserved for
+                // it, which follows the frame's shape: the picture fills it
+                // with no letterbox bands.
+                MediaKind::Video => (line_height.max(px(120.)), 10., px(22.)),
                 _ => ((line_height - px(8.)).clamp(px(64.), px(84.)), 8., px(17.)),
             };
             let width = bounds.size.width.min(px(560.));

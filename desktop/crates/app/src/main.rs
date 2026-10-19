@@ -10,7 +10,7 @@ mod media;
 mod persistence;
 mod video;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -109,6 +109,11 @@ struct JournalSession {
     /// Set when the open day's caret should be scrolled into view on the next
     /// frame (typing, or a freshly opened day whose caret sits at the end).
     reveal_caret: Cell<bool>,
+    /// The days the stream's items currently stand for (newest first); the
+    /// closing edge is one extra item after them.
+    stream_dates: RefCell<Vec<NaiveDate>>,
+    /// How many items the stream holds, as the app last set it up.
+    stream_items: Cell<usize>,
     /// The session's "today", captured at open; a timer rolls it over past
     /// midnight.
     today: NaiveDate,
@@ -326,6 +331,8 @@ impl DainikiApp {
             jump_error: None,
             search_palette,
             reveal_caret: Cell::new(true),
+            stream_dates: RefCell::new(Vec::new()),
+            stream_items: Cell::new(0),
             today,
             pending_rollover: Cell::new(false),
             pending_delete: None,
@@ -1737,6 +1744,80 @@ impl JournalSession {
         }
     }
 
+    /// Brings the list's items in step with the rendered days, keeping the
+    /// scroll anchor. Items are the days (newest first) followed by the
+    /// closing edge. A splice (not a reset) means the opening scan landing —
+    /// or a new day file appearing — does not yank the reader to the top.
+    fn sync_stream_items(&self, dates: &[NaiveDate]) {
+        let new_total = dates.len() + 1;
+        let previous = self.stream_dates.borrow();
+        let actual = self.stream.item_count();
+        if actual != self.stream_items.get() {
+            // Something else moved the list; rebuild it from its real size.
+            self.stream.splice(0..actual, new_total);
+            self.stream_dates.replace(dates.to_vec());
+            self.stream_items.set(new_total);
+            return;
+        }
+        if previous.as_slice() == dates {
+            return;
+        }
+        // The edge is the item after the days, and the list starts out empty,
+        // before there is one: it shows up as `None`, so it matches only
+        // itself and never a day.
+        let at = |days: &[NaiveDate], ix: usize| days.get(ix).copied();
+        let old_total = self.stream_items.get();
+        let mut prefix = 0;
+        while prefix < old_total && prefix < new_total && at(&previous, prefix) == at(dates, prefix)
+        {
+            prefix += 1;
+        }
+        let mut suffix = 0;
+        while suffix < old_total - prefix
+            && suffix < new_total - prefix
+            && at(&previous, old_total - 1 - suffix) == at(dates, new_total - 1 - suffix)
+        {
+            suffix += 1;
+        }
+        let replaced = prefix..old_total - suffix;
+        let introduced = new_total - prefix - suffix;
+        drop(previous);
+        if replaced.start != replaced.end || introduced != 0 {
+            self.stream.splice(replaced, introduced);
+        }
+        self.stream_dates.replace(dates.to_vec());
+        self.stream_items.set(new_total);
+    }
+
+    /// Scrolls the stream so the open day's caret sits in the viewport.
+    ///
+    /// The editor grows to its content and cannot scroll itself, so the
+    /// timeline has to. Call this after the item sync in the same frame: a
+    /// splice keeps the scroll anchor, but a reset would drop it, and the
+    /// caret rect from the last layout is only trustworthy while the scroll
+    /// position stands. Before the first layout there is no rect at all; the
+    /// app's render keeps a frame coming until there is one.
+    fn reveal_caret(&self, window: &Window, cx: &App) {
+        if !self.reveal_caret.get() {
+            return;
+        }
+        let Some(active) = self.active.as_ref() else {
+            self.reveal_caret.set(false);
+            return;
+        };
+        let Some(rect) = active.editor.read(cx).caret_window_rect() else {
+            return;
+        };
+        self.reveal_caret.set(false);
+        let viewport_bottom = window.viewport_size().height - px(STREAM_BOTTOM_MARGIN);
+        if rect.origin.y + rect.size.height > viewport_bottom {
+            self.stream
+                .scroll_by(rect.origin.y + rect.size.height - viewport_bottom);
+        } else if rect.origin.y < px(STREAM_TOP_MARGIN) {
+            self.stream.scroll_by(rect.origin.y - px(STREAM_TOP_MARGIN));
+        }
+    }
+
     fn view(
         &self,
         theme: &EditorTheme,
@@ -1786,30 +1867,18 @@ impl JournalSession {
 
         // The list renders one item per day plus the closing edge. Keep its
         // item count in step with the day set.
-        if self.stream.item_count() != dates.len() + 1 {
-            self.stream.reset(dates.len() + 1);
-        }
+        // The list renders one item per day plus the closing edge. Bring the
+        // item set in step with the day set while keeping the scroll anchor:
+        // the opening scan lands a frame or two in, and a naive reset would
+        // drop the reader (and the caret reveal just made) back to the top.
+        self.sync_stream_items(&dates);
 
         // The open entry grows to its content height inside the list; the
         // timeline is the only scroller. Keep the caret visible while typing
-        // by moving the stream itself.
-        // Before the first layout the caret rect is unknown; keep the flag so
-        // the reveal happens on a later frame rather than being lost.
-        if self.reveal_caret.get()
-            && let Some(rect) = self
-                .active
-                .as_ref()
-                .and_then(|active| active.editor.read(cx).caret_window_rect())
-        {
-            self.reveal_caret.set(false);
-            let viewport_bottom = window.viewport_size().height - px(STREAM_BOTTOM_MARGIN);
-            if rect.origin.y + rect.size.height > viewport_bottom {
-                self.stream
-                    .scroll_by(rect.origin.y + rect.size.height - viewport_bottom);
-            } else if rect.origin.y < px(STREAM_TOP_MARGIN) {
-                self.stream.scroll_by(rect.origin.y - px(STREAM_TOP_MARGIN));
-            }
-        }
+        // by moving the stream itself. This runs after the item-count sync
+        // above: a reset drops the scroll position, so revealing after it in
+        // the same frame is what makes the reveal stick.
+        self.reveal_caret(window, cx);
 
         // A day that swapped between editor and render changed height; the
         // list must remeasure it (preserving the scroll anchor).
@@ -3495,6 +3564,17 @@ fn media_reference(entry_path: &Path, journal_root: &Path, file_name: &str) -> S
 
 impl Render for DainikiApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A caret reveal is pending but the editor has no layout to measure
+        // it against yet (the opening frame): keep a frame coming, or the
+        // reveal would wait forever on an idle window.
+        if self
+            .session()
+            .filter(|session| session.reveal_caret.get())
+            .and_then(|session| session.active.as_ref())
+            .is_some_and(|active| active.editor.read(cx).caret_window_rect().is_none())
+        {
+            cx.notify();
+        }
         // The jump input's Enter event lands here, where a window exists to
         // open the day with.
         if self
@@ -5297,6 +5377,11 @@ mod tests {
         let dir = scratch_dir();
         let journal = journal::Journal::new(&dir);
         let today = Local::now().date_naive();
+        let yesterday = today.pred_opt().expect("yesterday");
+        // Yesterday makes the stream's item count settle a frame late (the
+        // opening scan discovers it), resetting the list's scroll position
+        // after the first reveal — the reveal must survive that.
+        seed_day(&journal, yesterday, "# yesterday\n\nwords\n");
         let long: String = (0..200).map(|ix| format!("line {ix}\n")).collect();
         seed_day(&journal, today, &long);
 
@@ -5324,6 +5409,98 @@ mod tests {
             assert!(
                 top.offset_in_item > px(0.),
                 "the stream scrolled down into the entry to show the caret"
+            );
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn discovered_days_keep_the_scroll_position(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        // Enough days for the stream to scroll.
+        for days_back in 1..=8 {
+            let date = today
+                .checked_sub_signed(chrono::Duration::days(days_back))
+                .expect("a past day");
+            seed_day(
+                &journal,
+                date,
+                &format!("# day {days_back}\n\nwords {days_back}\n"),
+            );
+        }
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
+
+        // Read a little further down the timeline.
+        for _ in 0..2 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(700.), px(400.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-150.))),
+                ..Default::default()
+            });
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
+        let before = cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let session = app.session().expect("an open session");
+            let top = session.stream.logical_scroll_top();
+            (
+                (top.item_ix, top.offset_in_item),
+                session.stream.item_count(),
+            )
+        });
+        assert!(
+            before.0.0 > 0 || before.0.1 > px(0.),
+            "the wheel moved the stream, got {:?}",
+            before.0
+        );
+
+        // A day beyond the ones already seen appears (an editor from another
+        // tool wrote it): the stream grows below, the reader stays put.
+        let older = today
+            .checked_sub_signed(chrono::Duration::days(30))
+            .expect("an older day");
+        let older_path = journal.entry_path(older);
+        seed_day(&journal, older, "# old, discovered late\n\nwords\n");
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| app.reconcile_paths(vec![older_path], cx));
+        });
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let session = app.session().expect("an open session");
+            assert!(
+                session.stream.item_count() > before.1,
+                "the discovered day (and the days between) joined the stream: {} -> {}",
+                before.1,
+                session.stream.item_count()
+            );
+            let top = session.stream.logical_scroll_top();
+            assert_eq!(
+                (top.item_ix, top.offset_in_item),
+                before.0,
+                "the reader keeps their place when days appear"
             );
         });
         fs::remove_dir_all(&dir).ok();

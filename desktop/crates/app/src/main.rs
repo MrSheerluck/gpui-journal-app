@@ -1912,7 +1912,12 @@ impl JournalSession {
 
         // The hero's waveform: deterministic ticks, the played stretch in the
         // accent, the rest in outline. Decorative, but the fill is real.
-        let mut wave = h_flex().items_center().gap(px(2.)).h(px(22.));
+        // Thin ticks spread across the whole track, the reading card's look.
+        let mut wave = h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .h(px(22.));
         const TICKS: usize = 40;
         let seed: usize = destination.bytes().map(|byte| byte as usize).sum();
         for tick in 0..TICKS {

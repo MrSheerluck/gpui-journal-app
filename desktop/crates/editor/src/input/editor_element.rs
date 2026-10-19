@@ -993,16 +993,18 @@ fn paint_media_line(
                     let left = track.origin.x + px(8.);
                     let right = track.origin.x + track.size.width - px(8.);
                     let width = (right - left).max(px(1.));
-                    let pitch = width / TICKS as f32;
-                    let tick_width = (pitch - px(2.)).max(px(1.));
+                    // Thin lines spread across the track, as the reading
+                    // card draws them — not fat bars packed to the left.
+                    let tick_width = px(2.);
+                    let step = ((width - tick_width) / (TICKS - 1) as f32).max(px(0.));
                     let center_y = track.origin.y + track.size.height / 2.;
                     let seed: usize = path.bytes().map(|byte| byte as usize).sum();
                     for tick in 0..TICKS {
                         let at = tick as f32 / (TICKS - 1) as f32;
                         let amplitude = 0.3 + 0.7 * (((seed + tick * 7) % 11) as f32 / 10.);
-                        let height = px(5. + 13. * amplitude);
+                        let height = px(5. + 15. * amplitude);
                         let bar = Bounds {
-                            origin: point(left + pitch * tick as f32, center_y - height / 2.),
+                            origin: point(left + step * tick as f32, center_y - height / 2.),
                             size: gpui::size(tick_width, height),
                         };
                         let color = if at <= fraction {

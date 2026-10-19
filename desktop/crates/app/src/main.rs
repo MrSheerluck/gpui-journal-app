@@ -109,6 +109,9 @@ struct JournalSession {
     /// Which day the stream last rendered as the live editor, so a day that
     /// swapped between editor and render (a different height) is remeasured.
     active_rendered: Cell<Option<NaiveDate>>,
+    /// The open day's media revision as of the last layout: a decoded image
+    /// changes the height of its line, and the list caches item heights.
+    active_media: Cell<u64>,
     /// The date-jump panel: input, open state, and the last parse error.
     jump_input: Entity<InputState>,
     jump_open: bool,
@@ -340,6 +343,7 @@ impl DainikiApp {
             filter: Filter::default(),
             stream: ListState::new(0, ListAlignment::Top, px(600.)),
             active_rendered: Cell::new(None),
+            active_media: Cell::new(0),
             jump_input,
             jump_open: false,
             jump_error: None,
@@ -1947,6 +1951,23 @@ impl JournalSession {
                 self.stream.remeasure_items(ix..ix + 1);
             }
             self.active_rendered.set(active_date);
+        }
+
+        // A settled image load changes the height of the open day's media
+        // line; without a remeasure the list keeps the placeholder's height
+        // and the card paints over the text below it.
+        let media_revision = self
+            .active
+            .as_ref()
+            .map(|active| active.editor.read(cx).media_revision())
+            .unwrap_or_default();
+        if media_revision != self.active_media.get() {
+            if let Some(date) = active_date
+                && let Some(ix) = dates.iter().position(|day| *day == date)
+            {
+                self.stream.remeasure_items(ix..ix + 1);
+            }
+            self.active_media.set(media_revision);
         }
 
         // A jump asked for this day to be revealed; do it on the frame that

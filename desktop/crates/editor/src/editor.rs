@@ -503,7 +503,7 @@ impl MarkdownEditor {
                     .background_executor()
                     .spawn({
                         let path = path.clone();
-                        async move { load_render_image(&path) }
+                        async move { decode_image(&path) }
                     })
                     .await;
                 let state = match decoded {
@@ -1450,7 +1450,10 @@ struct PointHit {
 }
 
 /// Reads and decodes an image file into a renderer-ready image.
-fn load_render_image(path: &std::path::Path) -> Result<Arc<RenderImage>, String> {
+///
+/// Hosts that draw their own cards share this so the channel order (BGRA)
+/// lives in one place.
+pub fn decode_image(path: &std::path::Path) -> Result<Arc<RenderImage>, String> {
     let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
     let decoded = image::load_from_memory(&bytes).map_err(|error| error.to_string())?;
     // `RenderImage` holds BGRA; decoding to RGBA swaps red and blue on screen
@@ -1976,7 +1979,7 @@ mod interaction_tests {
         let rgba = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
         rgba.save(&path).expect("write png");
 
-        let loaded = super::load_render_image(&path).expect("decode");
+        let loaded = super::decode_image(&path).expect("decode");
         let bytes = loaded.as_bytes(0).expect("frame bytes");
         assert_eq!(
             &bytes[..4],

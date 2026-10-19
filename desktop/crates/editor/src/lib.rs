@@ -50,6 +50,6 @@ mod editor;
 
 pub use buffer::Buffer;
 pub use display::{MediaKind, destination_path, media_kind};
-pub use editor::{EditorEvent, MarkdownEditor, MediaPlaybackState};
+pub use editor::{EditorEvent, MarkdownEditor, MediaPlaybackState, decode_image};
 pub use input::EditorElement;
 pub use theme::EditorTheme;

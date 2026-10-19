@@ -11,7 +11,7 @@ mod persistence;
 mod video;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -112,6 +112,15 @@ struct JournalSession {
     /// The open day's media revision as of the last layout: a decoded image
     /// changes the height of its line, and the list caches item heights.
     active_media: Cell<u64>,
+    /// Read-only days' images, decoded by the app itself so it knows when a
+    /// card settles — gpui's own loader would grow the card after the item's
+    /// height had already been cached.
+    media_images: RefCell<HashMap<PathBuf, MediaImageState>>,
+    /// Bumped whenever a read-only image settles; the days the list has laid
+    /// out are re-measured then.
+    media_settled: Cell<u64>,
+    /// The settle count as of the last re-measure.
+    media_measured: Cell<u64>,
     /// The date-jump panel: input, open state, and the last parse error.
     jump_input: Entity<InputState>,
     jump_open: bool,
@@ -178,6 +187,16 @@ impl Filter {
     fn is_active(&self) -> bool {
         self.tag.is_some()
     }
+}
+
+/// A read-only day's image, as the app tracks it: gpui's loader grows the
+/// card only after the item's height has been cached, so the app decodes for
+/// itself and re-measures once a card settles.
+#[derive(Clone)]
+enum MediaImageState {
+    Loading,
+    Loaded(Arc<RenderImage>),
+    Failed,
 }
 
 /// The day currently open in the editor, with its autosave state.
@@ -344,6 +363,9 @@ impl DainikiApp {
             stream: ListState::new(0, ListAlignment::Top, px(600.)),
             active_rendered: Cell::new(None),
             active_media: Cell::new(0),
+            media_images: RefCell::new(HashMap::new()),
+            media_settled: Cell::new(0),
+            media_measured: Cell::new(0),
             jump_input,
             jump_open: false,
             jump_error: None,
@@ -751,6 +773,68 @@ impl DainikiApp {
     }
 
     /// Restarts the debounce window; the previous pending save is dropped.
+    /// Starts decoding every image a day's text references, once each, so the
+    /// app knows when a read-only card settles and can re-measure the day.
+    fn ensure_day_images(&mut self, date: NaiveDate, text: &str, cx: &mut Context<Self>) {
+        let Some(session) = self.session() else {
+            return;
+        };
+        let root = session.root.clone();
+        let destinations: Vec<String> = day_segments(text)
+            .into_iter()
+            .filter_map(|segment| match segment {
+                DaySegment::Media {
+                    kind: MediaKind::Image,
+                    destination,
+                } => Some(destination),
+                _ => None,
+            })
+            .collect();
+        for destination in destinations {
+            let cleaned = destination_path(&destination);
+            let resolved = journal::Journal::new(&root)
+                .entry_path(date)
+                .parent()
+                .map(|directory| directory.join(&cleaned))
+                .unwrap_or_else(|| PathBuf::from(&cleaned));
+            {
+                let session = self.session().expect("the session was just here");
+                if session.media_images.borrow().contains_key(&resolved) {
+                    continue;
+                }
+                session
+                    .media_images
+                    .borrow_mut()
+                    .insert(resolved.clone(), MediaImageState::Loading);
+            }
+            cx.spawn(async move |app, cx| {
+                let decoded = cx
+                    .background_executor()
+                    .spawn({
+                        let resolved = resolved.clone();
+                        async move { dainiki_editor::decode_image(&resolved) }
+                    })
+                    .await;
+                let state = match decoded {
+                    Ok(image) => MediaImageState::Loaded(image),
+                    Err(error) => {
+                        tracing::warn!(path = %resolved.display(), error = %error, "failed to load image");
+                        MediaImageState::Failed
+                    }
+                };
+                app.update(cx, |app, cx| {
+                    if let Some(session) = app.session() {
+                        session.media_images.borrow_mut().insert(resolved, state);
+                        session.media_settled.set(session.media_settled.get() + 1);
+                    }
+                    app.repaint(cx);
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
         let Some(active) = self
             .session_mut()
@@ -1566,7 +1650,13 @@ impl JournalSession {
 
     /// A read-only day's body: markdown runs with media cards where whole-line
     /// media references sit. Days without media keep the single text view.
-    fn day_body(&self, date: NaiveDate, text: &str, this: &WeakEntity<DainikiApp>) -> AnyElement {
+    fn day_body(
+        &self,
+        date: NaiveDate,
+        text: &str,
+        scale_factor: f32,
+        this: &WeakEntity<DainikiApp>,
+    ) -> AnyElement {
         let segments = day_segments(text);
         if !segments
             .iter()
@@ -1581,21 +1671,28 @@ impl JournalSession {
         v_flex()
             .children(segments.into_iter().map(|segment| match segment {
                 DaySegment::Text(text) => markdown(text).into_any_element(),
-                DaySegment::Media { kind, destination } => {
-                    self.media_card(date, kind, &destination, playback.as_ref(), this)
-                }
+                DaySegment::Media { kind, destination } => self.media_card(
+                    date,
+                    kind,
+                    &destination,
+                    playback.as_ref(),
+                    scale_factor,
+                    this,
+                ),
             }))
             .into_any_element()
     }
 
     /// A media card in a read-only day: an image at its natural size, or a
     /// player row/card whose click toggles playback in the app's player.
+    #[allow(clippy::too_many_arguments)]
     fn media_card(
         &self,
         date: NaiveDate,
         kind: MediaKind,
         destination: &str,
         playback: Option<&(String, MediaPlaybackState)>,
+        scale_factor: f32,
         this: &WeakEntity<DainikiApp>,
     ) -> AnyElement {
         let cleaned = destination_path(destination);
@@ -1611,12 +1708,45 @@ impl JournalSession {
         let name = cleaned.rsplit('/').next().unwrap_or(&cleaned).to_string();
 
         if kind == MediaKind::Image {
+            let state = self.media_images.borrow().get(&resolved).cloned();
+            let card: AnyElement = match state {
+                Some(MediaImageState::Loaded(image)) => {
+                    let size = image.size(0);
+                    let scale = scale_factor.max(1.);
+                    let natural_width = (size.width.0 as f32 / scale).max(1.);
+                    let natural_height = (size.height.0 as f32 / scale).max(1.);
+                    let fit = (560. / natural_width).min(360. / natural_height).min(1.);
+                    img(image)
+                        .w(px(natural_width * fit))
+                        .h(px(natural_height * fit))
+                        .rounded_lg()
+                        .into_any_element()
+                }
+                Some(MediaImageState::Failed) => div()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(brand::surface_container())
+                    .text_size(px(13.))
+                    .text_color(brand::secondary())
+                    .child(format!("▢ {name} — this image format cannot be displayed"))
+                    .into_any_element(),
+                _ => div()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(brand::surface_container())
+                    .text_size(px(13.))
+                    .text_color(brand::secondary())
+                    .child(format!("▢ {name}"))
+                    .into_any_element(),
+            };
             return div()
                 .debug_selector({
                     let destination = destination.to_string();
                     move || format!("media-card-{destination}")
                 })
-                .child(img(resolved).max_w(px(560.)).max_h(px(360.)).rounded_lg())
+                .child(card)
                 .into_any_element();
         }
 
@@ -1953,6 +2083,19 @@ impl JournalSession {
             self.active_rendered.set(active_date);
         }
 
+        // A settled image in a read-only day changes that item's height. The
+        // list caches heights, so re-measure the days it laid out last frame
+        // (the stream's viewport and its overdraw); without this the card
+        // paints over the text below it.
+        if self.media_settled.get() != self.media_measured.get() {
+            for ix in 0..dates.len() {
+                if self.stream.bounds_for_item(ix).is_some() {
+                    self.stream.remeasure_items(ix..ix + 1);
+                }
+            }
+            self.media_measured.set(self.media_settled.get());
+        }
+
         // A settled image load changes the height of the open day's media
         // line; without a remeasure the list keeps the placeholder's height
         // and the card paints over the text below it.
@@ -1989,7 +2132,7 @@ impl JournalSession {
         let active_editor = self.active.as_ref().map(|active| active.editor.clone());
         let day_count = dates.len();
         let item_this = this.clone();
-        let stream_list = list(self.stream.clone(), move |ix, _window, cx| {
+        let stream_list = list(self.stream.clone(), move |ix, window, cx| {
             if ix == day_count {
                 return stream_edge(oldest_label.clone());
             }
@@ -2062,6 +2205,13 @@ impl JournalSession {
                     }
                 });
                 let inner = if let Some(text) = text {
+                    // Read-only cards decode through the app, so a settled
+                    // image can re-measure this day's item (the list caches
+                    // heights, and a card that grows would paint over the
+                    // text below it).
+                    item_this
+                        .update(cx, |app, cx| app.ensure_day_images(date, &text, cx))
+                        .ok();
                     div()
                         .font_family(brand::SERIF_FAMILY)
                         .text_size(px(15.2))
@@ -2069,9 +2219,12 @@ impl JournalSession {
                         .children(item_this.upgrade().and_then(|app| {
                             let app = app.read(cx);
                             match &app.screen {
-                                Screen::Journal(session) => {
-                                    Some(session.day_body(date, &text, &item_this))
-                                }
+                                Screen::Journal(session) => Some(session.day_body(
+                                    date,
+                                    &text,
+                                    window.scale_factor(),
+                                    &item_this,
+                                )),
                                 Screen::Welcome { .. } => None,
                             }
                         }))

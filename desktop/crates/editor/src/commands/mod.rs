@@ -578,6 +578,108 @@ mod tests {
         output
     }
 
+    /// True when the letters of every word in `before` three letters or
+    /// longer still run in order through `after`. Toggles may add, remove or
+    /// renumber markup — `#`, `- [ ]`, `1. `, `**` — but none may drop
+    /// written prose.
+    fn words_preserved(before: &str, after: &str) -> bool {
+        let written: Vec<char> = before
+            .split(|ch: char| !ch.is_alphabetic())
+            .filter(|word| word.chars().count() >= 3)
+            .flat_map(|word| word.chars())
+            .collect();
+        let mut survivors = after.chars().filter(|ch| ch.is_alphabetic());
+        written
+            .into_iter()
+            .all(|letter| survivors.any(|survivor| survivor == letter))
+    }
+
+    #[test]
+    fn toggles_never_drop_words() {
+        use super::{insert_code_fence, insert_rule};
+
+        let documents = [
+            "hello world\n",
+            "## Code\n\n```rust\nfn main() {}\n```\n\nafter\n",
+            "> a\n>\n> b\n",
+            "> **bold** and `code`\n",
+            "> > nested quote\n",
+            "- one\n- two\n",
+            "1. one\n2. two\n",
+            "- [ ] task\n- [x] done\n",
+            "a ==swipe== b\n",
+            "```\ncode only\n```\n",
+        ];
+        let inline = [
+            InlineFormat::Bold,
+            InlineFormat::Italic,
+            InlineFormat::Strike,
+            InlineFormat::Highlight,
+            InlineFormat::Code,
+        ];
+        let block = [
+            BlockFormat::Heading(1),
+            BlockFormat::Heading(2),
+            BlockFormat::Heading(3),
+            BlockFormat::Bullet,
+            BlockFormat::Ordered,
+            BlockFormat::Task,
+            BlockFormat::Quote,
+        ];
+        for text in documents {
+            let line_starts: Vec<usize> = std::iter::once(0)
+                .chain(text.match_indices('\n').map(|(ix, _)| ix + 1))
+                .filter(|ix| *ix <= text.len())
+                .collect();
+            for start in line_starts.iter().copied() {
+                let ends = [
+                    start,
+                    (start + 1).min(text.len()),
+                    (start + 4).min(text.len()),
+                    text.len(),
+                ];
+                for end in ends {
+                    if !text.is_char_boundary(start) || !text.is_char_boundary(end) || end < start {
+                        continue;
+                    }
+                    let selection = Selection::new(start, end.max(start));
+                    for format in inline {
+                        if let Some(edit) = toggle_inline(text, selection, format) {
+                            assert!(
+                                words_preserved(text, &apply(text, &edit)),
+                                "{format:?} over {selection:?} in {text:?} dropped words: {:?}",
+                                apply(text, &edit)
+                            );
+                        }
+                    }
+                    for format in block {
+                        if let Some(edit) = toggle_block(text, selection, format) {
+                            assert!(
+                                words_preserved(text, &apply(text, &edit)),
+                                "{format:?} over {selection:?} in {text:?} dropped words: {:?}",
+                                apply(text, &edit)
+                            );
+                        }
+                    }
+                    if let Some(edit) = insert_code_fence(text, selection) {
+                        assert!(
+                            words_preserved(text, &apply(text, &edit)),
+                            "fence over {selection:?} in {text:?} dropped words: {:?}",
+                            apply(text, &edit)
+                        );
+                    }
+                    if let Some(edit) = insert_rule(text, selection) {
+                        assert!(
+                            words_preserved(text, &apply(text, &edit)),
+                            "rule over {selection:?} in {text:?} dropped words: {:?}",
+                            apply(text, &edit)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn bold_wraps_and_unwraps_by_selection() {
         let text = "hello world";

@@ -181,6 +181,7 @@ impl Element for EditorElement {
                     lines.push(LaidLine {
                         wrapped: line,
                         height: line_height,
+                        advance: line_size.height,
                     });
                 }
 
@@ -316,7 +317,7 @@ impl Element for EditorElement {
             {
                 let mut caret_top = Pixels::ZERO;
                 for line in &inner.lines[..plan_index] {
-                    caret_top += line.wrapped.size(line.height).height;
+                    caret_top += line.advance;
                 }
                 if let Some(segment) = laid
                     .wrapped
@@ -363,7 +364,8 @@ impl Element for EditorElement {
             let mut line_origin = point(bounds.origin.x, bounds.origin.y - offset);
             for (ix, laid) in inner.lines.iter().enumerate() {
                 let height = laid.height;
-                let line_bottom = line_origin.y + height;
+                let advance = laid.advance;
+                let line_bottom = line_origin.y + advance;
                 if line_bottom > cull.origin.y && line_origin.y < cull_bottom {
                     if let Some(projected) = plan.lines.get(ix) {
                         if matches!(projected.style, LineStyle::Code { marker: false }) {
@@ -371,7 +373,7 @@ impl Element for EditorElement {
                                 origin: line_origin,
                                 size: Size {
                                     width: bounds.size.width,
-                                    height,
+                                    height: advance,
                                 },
                             };
                             window.paint_quad(fill(block, theme.code_block_background));
@@ -454,7 +456,7 @@ impl Element for EditorElement {
                         );
                     }
                 }
-                line_origin.y += height;
+                line_origin.y += advance;
             }
         });
 
@@ -1331,7 +1333,7 @@ impl EditorLayout {
         }
         let mut top = Pixels::ZERO;
         for line in &inner.lines[..ix] {
-            top += line.wrapped.size(line.height).height;
+            top += line.advance;
         }
         Some(top)
     }
@@ -1345,7 +1347,7 @@ impl EditorLayout {
         }
         let mut top = Pixels::ZERO;
         for (ix, line) in inner.lines.iter().enumerate() {
-            let height = line.wrapped.size(line.height).height;
+            let height = line.advance;
             if y < top + height {
                 return Some((ix, y - top));
             }
@@ -1357,7 +1359,13 @@ impl EditorLayout {
 
 struct LaidLine {
     wrapped: WrappedLine,
+    /// The base line height: the step between two visual rows of this line,
+    /// which is what the sub-line painters (caret, selection, widgets) take.
     height: Pixels,
+    /// The vertical space the line occupies, wrapped rows included. Layout and
+    /// paint both advance by this; using `height` for that put every wrapped
+    /// line's followers one row per extra row too high.
+    advance: Pixels,
 }
 
 struct EditorLayoutInner {

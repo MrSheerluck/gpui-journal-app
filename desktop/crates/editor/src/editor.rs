@@ -1713,6 +1713,33 @@ mod interaction_tests {
     }
 
     #[gpui::test]
+    async fn wrapped_lines_advance_by_every_row(cx: &mut TestAppContext) {
+        // A line wide enough to wrap in the test window, then a follower.
+        let long = "wrapping words ".repeat(40);
+        let (editor, cx) = setup(cx, &format!("{long}\ntail\n"));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_, app| {
+            let editor = editor.read(app);
+            let layout = &editor.layout;
+            let rows = layout
+                .with_line(0, |line, _| line.wrap_boundaries().len() + 1)
+                .unwrap_or(1);
+            assert!(rows > 1, "the first line wrapped ({rows} rows)");
+            let base = layout.body_line_height().expect("a measured layout");
+            let first = layout.line_top(0).expect("line 0");
+            let second = layout.line_top(1).expect("line 1");
+            assert_eq!(
+                second - first,
+                base * rows as f32,
+                "the follower clears every wrapped row: layout and paint both \
+                 advance by a line's full height, not its base height"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn typing_inserts_characters(cx: &mut TestAppContext) {
         let (editor, cx) = setup(cx, "");
         cx.simulate_input("hi");

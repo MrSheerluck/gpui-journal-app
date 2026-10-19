@@ -1245,7 +1245,17 @@ struct InlineFlags {
 /// and code; decoration fields carry strike-through and background chips.
 /// Overlapping runs (nesting) compose by flag union.
 fn shape_runs(line: &ProjectedLine, base: &TextStyle, theme: &EditorTheme) -> Vec<TextRun> {
-    if line.runs.is_empty() {
+    // A widget's glyph is a width placeholder only: the bullet, bar or
+    // checkbox is painted as a quad on top of it. Keeping the placeholder's
+    // ink invisible means a cover that misses by a pixel can never show two
+    // bullets, two quote bars or a stray checkbox in the text.
+    let placeholders: Vec<Range<usize>> = line
+        .fragments
+        .iter()
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Widget(_)))
+        .map(|fragment| fragment.display.clone())
+        .collect();
+    if line.runs.is_empty() && placeholders.is_empty() {
         return vec![base.to_run(line.text.len())];
     }
     let len = line.text.len();
@@ -1253,6 +1263,10 @@ fn shape_runs(line: &ProjectedLine, base: &TextStyle, theme: &EditorTheme) -> Ve
     for run in &line.runs {
         points.push(run.display.start.min(len));
         points.push(run.display.end.min(len));
+    }
+    for placeholder in &placeholders {
+        points.push(placeholder.start.min(len));
+        points.push(placeholder.end.min(len));
     }
     points.sort_unstable();
     points.dedup();
@@ -1276,7 +1290,13 @@ fn shape_runs(line: &ProjectedLine, base: &TextStyle, theme: &EditorTheme) -> Ve
                 }
             }
         }
+        let placeholder = placeholders
+            .iter()
+            .any(|range| range.start <= start && end <= range.end);
         let mut style = base.clone();
+        if placeholder {
+            style.color = base.color.opacity(0.);
+        }
         if flags.strong {
             style.font_weight = FontWeight::BOLD;
         }

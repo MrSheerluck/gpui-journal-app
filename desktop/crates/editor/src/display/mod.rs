@@ -628,6 +628,39 @@ mod tests {
     }
 
     #[test]
+    fn every_quote_shape_collapses_to_exactly_one_bar() {
+        // One bar per line whatever the shape: the plain marker, a marker
+        // with no trailing space, a nested run (`>>`, `> > >`), an indented
+        // quote, a quote in a list, and the two-marker-node form.
+        let cases = [
+            ("> plain quote\n", "▎ plain quote"),
+            (">plain no space\n", "▎ plain no space"),
+            (">> no space nested\n", "▎   no space nested"),
+            ("> > > triple\n", "▎     triple"),
+            ("  > indented\n", "▎   indented"),
+            ("* > star list quote\n", "• ▎ star list quote"),
+            ("1. > ordered quote\n", "1. ▎ ordered quote"),
+            ("> quote\n> > nested\n", "▎ quote"),
+        ];
+        for (text, expected_first) in cases {
+            let plan = plan_for(text, Selection::caret(text.len()));
+            let line = &plan.lines[0];
+            assert_eq!(line.text, expected_first, "for {text:?}");
+            assert_eq!(
+                line.fragments
+                    .iter()
+                    .filter(|fragment| matches!(
+                        fragment.kind,
+                        FragmentKind::Widget(WidgetKind::QuoteBar)
+                    ))
+                    .count(),
+                1,
+                "one bar on the first line of {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn line_ranges_match_the_buffer() {
         let text = "# One\n\nsecond\r\nthird\n";
         let plan = plan_for(text, Selection::default());

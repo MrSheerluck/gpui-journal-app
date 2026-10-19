@@ -364,6 +364,42 @@ pub fn insert_image(selection: Selection, alt: &str, path: &str) -> Edit {
     }
 }
 
+/// Inserts a media reference on its own paragraph, replacing any selection.
+///
+/// Attachments render as cards only when the reference is a whole line, so
+/// this adds the paragraph breaks an inline insert would miss: a leading
+/// blank line when the caret is mid-text, a single break when it sits at the
+/// start of a line, and a trailing newline when text follows.
+pub fn insert_media(text: &str, selection: Selection, alt: &str, path: &str) -> Edit {
+    let (start, end) = (selection.start(), selection.end());
+    let reference = format!("![{alt}]({path})");
+    let before = &text[..start];
+    let after = &text[end..];
+
+    let mut new_text = String::new();
+    if !before.is_empty() {
+        if before.ends_with("\n\n") {
+            // Already at the start of a fresh paragraph.
+        } else if before.ends_with('\n') {
+            new_text.push('\n');
+        } else {
+            new_text.push_str("\n\n");
+        }
+    }
+    new_text.push_str(&reference);
+    // The reference needs its own line; text that follows already starts one.
+    if after.is_empty() || !after.starts_with('\n') {
+        new_text.push('\n');
+    }
+
+    let caret = start + new_text.len();
+    Edit {
+        range: start..end,
+        new_text,
+        new_selection: Selection::caret(caret),
+    }
+}
+
 /// Items offered by the slash menu. Every item applies without the user
 /// typing any Markdown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -542,6 +578,108 @@ mod tests {
         output
     }
 
+    /// True when the letters of every word in `before` three letters or
+    /// longer still run in order through `after`. Toggles may add, remove or
+    /// renumber markup — `#`, `- [ ]`, `1. `, `**` — but none may drop
+    /// written prose.
+    fn words_preserved(before: &str, after: &str) -> bool {
+        let written: Vec<char> = before
+            .split(|ch: char| !ch.is_alphabetic())
+            .filter(|word| word.chars().count() >= 3)
+            .flat_map(|word| word.chars())
+            .collect();
+        let mut survivors = after.chars().filter(|ch| ch.is_alphabetic());
+        written
+            .into_iter()
+            .all(|letter| survivors.any(|survivor| survivor == letter))
+    }
+
+    #[test]
+    fn toggles_never_drop_words() {
+        use super::{insert_code_fence, insert_rule};
+
+        let documents = [
+            "hello world\n",
+            "## Code\n\n```rust\nfn main() {}\n```\n\nafter\n",
+            "> a\n>\n> b\n",
+            "> **bold** and `code`\n",
+            "> > nested quote\n",
+            "- one\n- two\n",
+            "1. one\n2. two\n",
+            "- [ ] task\n- [x] done\n",
+            "a ==swipe== b\n",
+            "```\ncode only\n```\n",
+        ];
+        let inline = [
+            InlineFormat::Bold,
+            InlineFormat::Italic,
+            InlineFormat::Strike,
+            InlineFormat::Highlight,
+            InlineFormat::Code,
+        ];
+        let block = [
+            BlockFormat::Heading(1),
+            BlockFormat::Heading(2),
+            BlockFormat::Heading(3),
+            BlockFormat::Bullet,
+            BlockFormat::Ordered,
+            BlockFormat::Task,
+            BlockFormat::Quote,
+        ];
+        for text in documents {
+            let line_starts: Vec<usize> = std::iter::once(0)
+                .chain(text.match_indices('\n').map(|(ix, _)| ix + 1))
+                .filter(|ix| *ix <= text.len())
+                .collect();
+            for start in line_starts.iter().copied() {
+                let ends = [
+                    start,
+                    (start + 1).min(text.len()),
+                    (start + 4).min(text.len()),
+                    text.len(),
+                ];
+                for end in ends {
+                    if !text.is_char_boundary(start) || !text.is_char_boundary(end) || end < start {
+                        continue;
+                    }
+                    let selection = Selection::new(start, end.max(start));
+                    for format in inline {
+                        if let Some(edit) = toggle_inline(text, selection, format) {
+                            assert!(
+                                words_preserved(text, &apply(text, &edit)),
+                                "{format:?} over {selection:?} in {text:?} dropped words: {:?}",
+                                apply(text, &edit)
+                            );
+                        }
+                    }
+                    for format in block {
+                        if let Some(edit) = toggle_block(text, selection, format) {
+                            assert!(
+                                words_preserved(text, &apply(text, &edit)),
+                                "{format:?} over {selection:?} in {text:?} dropped words: {:?}",
+                                apply(text, &edit)
+                            );
+                        }
+                    }
+                    if let Some(edit) = insert_code_fence(text, selection) {
+                        assert!(
+                            words_preserved(text, &apply(text, &edit)),
+                            "fence over {selection:?} in {text:?} dropped words: {:?}",
+                            apply(text, &edit)
+                        );
+                    }
+                    if let Some(edit) = insert_rule(text, selection) {
+                        assert!(
+                            words_preserved(text, &apply(text, &edit)),
+                            "rule over {selection:?} in {text:?} dropped words: {:?}",
+                            apply(text, &edit)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn bold_wraps_and_unwraps_by_selection() {
         let text = "hello world";
@@ -677,6 +815,35 @@ mod tests {
 
         let edit = super::insert_image(Selection::caret(0), "shot", "assets/shot.png");
         assert_eq!(apply("", &edit), "![shot](assets/shot.png)");
+    }
+
+    #[test]
+    fn insert_media_places_the_reference_on_its_own_paragraph() {
+        // Empty document: the reference and a terminalline break.
+        let edit = super::insert_media("", Selection::caret(0), "a", "assets/a.mp3");
+        assert_eq!(apply("", &edit), "![a](assets/a.mp3)\n");
+        assert_eq!(edit.new_selection, Selection::caret(19));
+
+        // Mid-text: a paragraph break on both sides.
+        let text = "hello";
+        let edit = super::insert_media(text, Selection::caret(5), "a", "assets/a.mp3");
+        assert_eq!(apply(text, &edit), "hello\n\n![a](assets/a.mp3)\n");
+
+        // Already after a blank line: no extra leading break.
+        let text = "hello\n\n";
+        let edit = super::insert_media(text, Selection::caret(7), "a", "assets/a.mp3");
+        assert_eq!(apply(text, &edit), "hello\n\n![a](assets/a.mp3)\n");
+
+        // At the start of a line with content below: one break before, one
+        // newline after.
+        let text = "hello\nworld";
+        let edit = super::insert_media(text, Selection::caret(6), "a", "assets/a.mp3");
+        assert_eq!(apply(text, &edit), "hello\n\n![a](assets/a.mp3)\nworld");
+
+        // Replacing a selection keeps the reference block-level.
+        let text = "one two three";
+        let edit = super::insert_media(text, Selection::new(4, 7), "a", "assets/a.mp3");
+        assert_eq!(apply(text, &edit), "one \n\n![a](assets/a.mp3)\n three");
     }
 
     #[test]

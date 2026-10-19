@@ -44,5 +44,17 @@ Feel free to open an issue to report a problem or propose an improvement. We'll 
 
 Thank you for helping us improve Dainiki.
 
+## Development
+
+The desktop workspace lives in `desktop/`. Run the app against a journal folder:
+
+```sh
+cd desktop && cargo run --release -- /path/to/journal
+```
+
+Dogfood from a release build: debug builds spend roughly ten times longer in layout
+and paint, which shows up as choppy scrolling on long journals
+(`docs/benchmarks/journal-stream.md`).
+
 ## License
 MIT

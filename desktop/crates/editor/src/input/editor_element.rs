@@ -1,16 +1,21 @@
 use std::ops::Range;
+use std::sync::Arc;
 use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
     App, AvailableSpace, Bounds, DefiniteLength, DispatchPhase, Element, ElementId,
     ElementInputHandler, Entity, FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, LayoutId, Length, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size,
-    StrikethroughStyle, Style, TextAlign, TextRun, TextStyle, Window, WrappedLine, fill, point, px,
+    IntoElement, LayoutId, Length, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
+    SharedString, Size, StrikethroughStyle, Style, TextAlign, TextRun, TextStyle, Window,
+    WrappedLine, fill, point, px,
 };
 
 use crate::{
-    display::{Fragment, FragmentKind, InlineStyle, ProjectedLine, Style as LineStyle, WidgetKind},
-    editor::{ImageState, MarkdownEditor},
+    display::{
+        Fragment, FragmentKind, InlineStyle, MediaKind, ProjectedLine, Style as LineStyle,
+        WidgetKind,
+    },
+    editor::{ImageState, MarkdownEditor, MediaPlaybackState},
     input::scroll::{EditorScrollState, clamp_offset},
     theme::EditorTheme,
 };
@@ -64,7 +69,7 @@ impl Element for EditorElement {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let text_style = window.text_style();
         let base_font_size = text_style.font_size.to_pixels(window.rem_size());
@@ -77,11 +82,17 @@ impl Element for EditorElement {
         let state = self.layout.clone();
         let measure_state = self.layout.clone();
         let view = self.view.clone();
+        let fit_content = self.view.read(cx).is_fit_content();
         let layout_id = window.request_measured_layout(
             Style {
                 size: Size {
                     width: Length::Auto,
-                    height: Length::Definite(DefiniteLength::Fraction(1.0)),
+                    height: if fit_content {
+                        // Grow to the content: the host's viewport scrolls.
+                        Length::Auto
+                    } else {
+                        Length::Definite(DefiniteLength::Fraction(1.0))
+                    },
                 },
                 ..Default::default()
             },
@@ -91,9 +102,14 @@ impl Element for EditorElement {
                     _ => None,
                 });
 
-                let (plan, theme, images) = {
+                let (plan, theme, images, frames) = {
                     let view = view.read(cx);
-                    (view.plan(), view.theme().clone(), view.image_metrics())
+                    (
+                        view.plan(),
+                        view.theme().clone(),
+                        view.image_metrics(),
+                        view.media_frames(),
+                    )
                 };
 
                 let mut lines = Vec::with_capacity(plan.lines.len());
@@ -105,22 +121,45 @@ impl Element for EditorElement {
                     };
                     let font_size = base_font_size * scale;
                     let mut line_height = base_line_height * scale;
-                    if let Some(path) = line_image(&projected.fragments) {
-                        let natural = match images.get(&path) {
-                            Some(ImageState::Loaded(image)) => {
-                                let size = image.size(0);
-                                let scale_factor = window.scale_factor();
-                                Some((
-                                    size.width.0 as f32 / scale_factor,
-                                    size.height.0 as f32 / scale_factor,
-                                ))
+                    if let Some((kind, path)) = line_media(&projected.fragments) {
+                        let target = match kind {
+                            MediaKind::Image => {
+                                let natural = match images.get(&path) {
+                                    Some(ImageState::Loaded(image)) => {
+                                        let size = image.size(0);
+                                        let scale_factor = window.scale_factor();
+                                        Some((
+                                            size.width.0 as f32 / scale_factor,
+                                            size.height.0 as f32 / scale_factor,
+                                        ))
+                                    }
+                                    _ => None,
+                                };
+                                let natural_min = base_line_height.as_f32() * 2.;
+                                match natural {
+                                    Some((_, height)) => px(height.min(360.).max(natural_min)),
+                                    None => px(120.),
+                                }
                             }
-                            _ => None,
-                        };
-                        let natural_min = base_line_height.as_f32() * 2.;
-                        let target = match natural {
-                            Some((_, height)) => px(height.min(360.).max(natural_min)),
-                            None => px(120.),
+                            MediaKind::Audio => px(98.),
+                            MediaKind::Video => {
+                                let width = wrap_width.unwrap_or(px(480.));
+                                // A frame, once decoded, decides the card's
+                                // shape: the picture is shown whole, never
+                                // cropped or stretched into a fixed box.
+                                let shape = frames.get(&path).map(|frame| frame.size(0));
+                                match shape {
+                                    Some(size) if size.width.0 > 0 => {
+                                        let scale = window.scale_factor();
+                                        let frame_width = size.width.0 as f32 / scale;
+                                        let frame_height = size.height.0 as f32 / scale;
+                                        px((width.as_f32() * frame_height / frame_width)
+                                            .clamp(140., 360.))
+                                    }
+                                    _ => (width * (9. / 16.)).clamp(px(140.), px(320.)),
+                                }
+                            }
+                            MediaKind::File => px(28.),
                         };
                         line_height = line_height.max(target);
                     }
@@ -160,6 +199,7 @@ impl Element for EditorElement {
                     lines.push(LaidLine {
                         wrapped: line,
                         height: line_height,
+                        advance: line_size.height,
                     });
                 }
 
@@ -172,10 +212,16 @@ impl Element for EditorElement {
 
                 let fill = Size {
                     width: wrap_width,
-                    height: known_dimensions.height.or(match available_space.height {
-                        AvailableSpace::Definite(height) => Some(height),
-                        _ => None,
-                    }),
+                    height: if fit_content {
+                        // The content height is the element's height; there is
+                        // no inner viewport to fill.
+                        Some(content_size.height)
+                    } else {
+                        known_dimensions.height.or(match available_space.height {
+                            AvailableSpace::Definite(height) => Some(height),
+                            _ => None,
+                        })
+                    },
                 };
                 Size {
                     width: fill.width.unwrap_or(content_size.width),
@@ -233,7 +279,10 @@ impl Element for EditorElement {
             marked_range,
             plan,
             images,
+            media_states,
+            media_frames,
             reveal_pending,
+            hover_task,
         ) = {
             let view = self.view.read(cx);
             (
@@ -244,7 +293,10 @@ impl Element for EditorElement {
                 view.marked_range(),
                 view.plan(),
                 view.image_metrics(),
+                view.media_states(),
+                view.media_frames(),
                 view.reveal_pending(),
+                view.hover_task(),
             )
         };
         window.handle_input(
@@ -283,7 +335,7 @@ impl Element for EditorElement {
             {
                 let mut caret_top = Pixels::ZERO;
                 for line in &inner.lines[..plan_index] {
-                    caret_top += line.wrapped.size(line.height).height;
+                    caret_top += line.advance;
                 }
                 if let Some(segment) = laid
                     .wrapped
@@ -303,7 +355,6 @@ impl Element for EditorElement {
             self.view.update(cx, |view, _| view.clear_reveal());
         }
 
-        let viewport_bottom = bounds.origin.y + bounds.size.height;
         let max_offset = (inner.content_height - bounds.size.height).max(Pixels::ZERO);
         let offset = clamp_offset(self.scroll.offset(), max_offset);
         let scroll_progress = if max_offset > Pixels::ZERO {
@@ -311,6 +362,17 @@ impl Element for EditorElement {
         } else {
             0.0
         };
+
+        // A fit-content editor is taller than the window: cull its lines
+        // against the real clip, not its own bounds.
+        let fit_content = self.view.read(cx).is_fit_content();
+        let cull = if fit_content {
+            let clip = window.content_mask();
+            clip.bounds
+        } else {
+            bounds
+        };
+        let cull_bottom = cull.origin.y + cull.size.height;
 
         let show_selection = !selection_state.is_caret();
         let selection = (selection_state.start(), selection_state.end());
@@ -320,27 +382,31 @@ impl Element for EditorElement {
             let mut line_origin = point(bounds.origin.x, bounds.origin.y - offset);
             for (ix, laid) in inner.lines.iter().enumerate() {
                 let height = laid.height;
-                let line_bottom = line_origin.y + height;
-                if line_bottom > bounds.origin.y && line_origin.y < viewport_bottom {
+                let advance = laid.advance;
+                let line_bottom = line_origin.y + advance;
+                if line_bottom > cull.origin.y && line_origin.y < cull_bottom {
                     if let Some(projected) = plan.lines.get(ix) {
                         if matches!(projected.style, LineStyle::Code { marker: false }) {
                             let block = Bounds {
                                 origin: line_origin,
                                 size: Size {
                                     width: bounds.size.width,
-                                    height,
+                                    height: advance,
                                 },
                             };
                             window.paint_quad(fill(block, theme.code_block_background));
                         }
-                        if let Some(path) = line_image(&projected.fragments) {
-                            paint_image_line(
+                        if let Some((kind, path)) = line_media(&projected.fragments) {
+                            paint_media_line(
                                 &laid.wrapped,
                                 line_origin,
                                 height,
                                 projected,
+                                kind,
                                 &path,
                                 &images,
+                                media_states.get(&path),
+                                media_frames.get(&path),
                                 bounds,
                                 &theme,
                                 window,
@@ -374,26 +440,33 @@ impl Element for EditorElement {
                             }
                         }
                     }
+                    if let Err(error) = laid.wrapped.paint_background(
+                        line_origin,
+                        height,
+                        align,
+                        Some(bounds),
+                        window,
+                        cx,
+                    ) {
+                        tracing::warn!(error = %error, "failed to paint a line's background");
+                    }
                     if let Err(error) =
                         laid.wrapped
                             .paint(line_origin, height, align, Some(bounds), window, cx)
                     {
                         tracing::warn!(error = %error, "failed to paint a line");
                     }
-                    if let Some(projected) = plan.lines.get(ix)
-                        && projected
-                            .fragments
-                            .iter()
-                            .any(|fragment| fragment.kind == FragmentKind::Widget(WidgetKind::Rule))
-                    {
-                        let rule = Bounds {
-                            origin: point(bounds.origin.x, line_origin.y + height / 2.),
-                            size: Size {
-                                width: bounds.size.width,
-                                height: px(1.),
-                            },
-                        };
-                        window.paint_quad(fill(rule, theme.text.opacity(0.25)));
+                    if let Some(projected) = plan.lines.get(ix) {
+                        paint_widgets(
+                            &laid.wrapped,
+                            line_origin,
+                            height,
+                            projected,
+                            bounds,
+                            &theme,
+                            hover_task.as_ref(),
+                            window,
+                        );
                     }
                     if show_caret
                         && let Some(source) = caret_source
@@ -411,7 +484,7 @@ impl Element for EditorElement {
                         );
                     }
                 }
-                line_origin.y += height;
+                line_origin.y += advance;
             }
         });
 
@@ -476,6 +549,8 @@ fn paint_slash_menu(
                 row.origin.x + px(10.),
                 row.origin.y + (row_height - px(14.)) / 2.,
             ),
+            px(12.),
+            theme.text.opacity(0.6),
             theme,
             window,
             cx,
@@ -483,24 +558,203 @@ fn paint_slash_menu(
     }
 }
 
-/// The image destination referenced by a line's widget, if any.
-fn line_image(fragments: &[Fragment]) -> Option<String> {
+/// The media widget on a line, if any: its kind and destination.
+fn line_media(fragments: &[Fragment]) -> Option<(MediaKind, String)> {
     fragments.iter().find_map(|fragment| match &fragment.kind {
-        FragmentKind::Widget(WidgetKind::Image { path }) => Some(path.clone()),
+        FragmentKind::Widget(WidgetKind::Media { kind, path }) => Some((*kind, path.clone())),
         _ => None,
     })
 }
 
-/// Paints a whole-line image at its natural size (clamped to the content
-/// width and 360 pt height), or a placeholder while loading/failed.
-#[allow(clippy::too_many_arguments)]
-fn paint_image_line(
+/// The file name at the end of a destination (brackets and percent-escapes
+/// resolved).
+fn file_name(path: &str) -> String {
+    let cleaned = crate::display::destination_path(path);
+    cleaned.rsplit('/').next().unwrap_or(&cleaned).to_string()
+}
+
+/// Where a widget fragment sits on its line, and the horizontal centre of the
+/// glyph it replaces.
+struct WidgetGeometry {
+    /// The widget's full footprint in window coordinates.
+    cover: Bounds<Pixels>,
+    /// The centre of the fragment's first character.
+    glyph_center_x: Pixels,
+}
+
+/// Measures a widget fragment: the glyph stand-in keeps the layout width, so
+/// the painting covers that same box. Widgets never span wrapped segments.
+fn widget_geometry(
     line: &WrappedLine,
     origin: Point<Pixels>,
     line_height: Pixels,
     projected: &ProjectedLine,
+    fragment: &Fragment,
+) -> Option<WidgetGeometry> {
+    let text = projected.text.get(fragment.display.clone())?;
+    let first = text.chars().next()?;
+    let start = line.position_for_index(fragment.display.start, line_height)?;
+    let after_first =
+        line.position_for_index(fragment.display.start + first.len_utf8(), line_height)?;
+    let end = line.position_for_index(fragment.display.end, line_height)?;
+    if start.y != end.y {
+        return None;
+    }
+    Some(WidgetGeometry {
+        cover: Bounds {
+            origin: point(origin.x + start.x, origin.y + start.y),
+            size: Size {
+                width: end.x - start.x,
+                height: line_height,
+            },
+        },
+        glyph_center_x: origin.x + (start.x + after_first.x) / 2.,
+    })
+}
+
+/// Paints the rendered stand-ins for collapsed markup: bullet dots, quote
+/// bars, task checkboxes and rules. Each widget first covers the glyph that
+/// reserves its layout width, so this must run after the line's text.
+#[allow(clippy::too_many_arguments)]
+fn paint_widgets(
+    line: &WrappedLine,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    projected: &ProjectedLine,
+    bounds: Bounds<Pixels>,
+    theme: &EditorTheme,
+    hover_task: Option<&Range<usize>>,
+    window: &mut Window,
+) {
+    for fragment in &projected.fragments {
+        let FragmentKind::Widget(kind) = &fragment.kind else {
+            continue;
+        };
+        match kind {
+            WidgetKind::Bullet => {
+                let Some(geometry) =
+                    widget_geometry(line, origin, line_height, projected, fragment)
+                else {
+                    continue;
+                };
+                window.paint_quad(fill(geometry.cover, theme.background));
+                let radius = (line_height.as_f32() * 0.105).clamp(2., 3.4);
+                let side = px(radius * 2.);
+                let dot = Bounds {
+                    origin: point(
+                        geometry.glyph_center_x - px(radius),
+                        geometry.cover.origin.y + (line_height - side) / 2.,
+                    ),
+                    size: Size {
+                        width: side,
+                        height: side,
+                    },
+                };
+                window.paint_quad(fill(dot, theme.bullet).corner_radii(px(radius)));
+            }
+            WidgetKind::QuoteBar => {
+                let Some(geometry) =
+                    widget_geometry(line, origin, line_height, projected, fragment)
+                else {
+                    continue;
+                };
+                window.paint_quad(fill(geometry.cover, theme.background));
+                let width = px((line_height.as_f32() * 0.12).clamp(2.5, 3.5));
+                let height = px(line_height.as_f32() * 0.66);
+                let bar = Bounds {
+                    origin: point(
+                        geometry.glyph_center_x - width / 2.,
+                        geometry.cover.origin.y + (line_height - height) / 2.,
+                    ),
+                    size: Size { width, height },
+                };
+                window.paint_quad(fill(bar, theme.quote_bar).corner_radii(width / 2.));
+            }
+            WidgetKind::Task { checked } => {
+                let Some(geometry) =
+                    widget_geometry(line, origin, line_height, projected, fragment)
+                else {
+                    continue;
+                };
+                window.paint_quad(fill(geometry.cover, theme.background));
+                let side = px((line_height.as_f32() * 0.6).clamp(11., 15.5));
+                let task_box = Bounds {
+                    origin: point(
+                        geometry.glyph_center_x - side / 2.,
+                        geometry.cover.origin.y + (line_height - side) / 2.,
+                    ),
+                    size: Size {
+                        width: side,
+                        height: side,
+                    },
+                };
+                let hovered = hover_task == Some(&fragment.source);
+                let background = if *checked {
+                    theme.checkbox_checked_background
+                } else if hovered {
+                    theme.checkbox_hover_background
+                } else {
+                    theme.checkbox_background
+                };
+                let mut quad = fill(task_box, background).corner_radii(side * 0.28);
+                if !*checked {
+                    quad = quad.border_widths(1.25).border_color(theme.checkbox_border);
+                }
+                window.paint_quad(quad);
+                if *checked {
+                    paint_check_mark(task_box, theme.checkbox_check, window);
+                }
+            }
+            WidgetKind::Rule => {
+                let rule = Bounds {
+                    origin: point(bounds.origin.x, origin.y + line_height / 2.),
+                    size: Size {
+                        width: bounds.size.width,
+                        height: px(1.),
+                    },
+                };
+                window.paint_quad(fill(rule, theme.rule));
+            }
+            WidgetKind::Media { .. } => {
+                // Painted by `paint_media_line`.
+            }
+        }
+    }
+}
+
+/// The check mark inside a checked task box: a two-segment stroke.
+fn paint_check_mark(task_box: Bounds<Pixels>, color: Hsla, window: &mut Window) {
+    let side = task_box.size.width.as_f32();
+    let at = |fx: f32, fy: f32| {
+        point(
+            task_box.origin.x + px(side * fx),
+            task_box.origin.y + px(side * fy),
+        )
+    };
+    let mut builder = PathBuilder::stroke(px((side * 0.13).clamp(1.4, 2.2)));
+    builder.move_to(at(0.26, 0.53));
+    builder.line_to(at(0.44, 0.70));
+    builder.line_to(at(0.76, 0.32));
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
+}
+
+/// Paints a whole-line media widget: an image at its natural size (clamped),
+/// a video card (with the latest frame when one has arrived), an audio row,
+/// or a file chip. A loading or failed image shows a placeholder box labeled
+/// with the file name.
+#[allow(clippy::too_many_arguments)]
+fn paint_media_line(
+    line: &WrappedLine,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    projected: &ProjectedLine,
+    kind: MediaKind,
     path: &str,
     images: &std::collections::HashMap<String, ImageState>,
+    playback: Option<&MediaPlaybackState>,
+    frame: Option<&Arc<gpui::RenderImage>>,
     bounds: Bounds<Pixels>,
     theme: &EditorTheme,
     window: &mut Window,
@@ -510,11 +764,9 @@ fn paint_image_line(
         .fragments
         .iter()
         .find_map(|fragment| match &fragment.kind {
-            FragmentKind::Widget(WidgetKind::Image { path: widget_path })
-                if widget_path == path =>
-            {
-                Some(fragment.display.start)
-            }
+            FragmentKind::Widget(WidgetKind::Media {
+                path: widget_path, ..
+            }) if widget_path == path => Some(fragment.display.start),
             _ => None,
         });
     let Some(display) = display else {
@@ -526,64 +778,424 @@ fn paint_image_line(
     let x = origin.x + position.x;
     let y = origin.y + position.y;
 
-    if let Some(ImageState::Loaded(image)) = images.get(path) {
-        let scale_factor = window.scale_factor();
-        let size = image.size(0);
-        let natural_width = size.width.0 as f32 / scale_factor;
-        let natural_height = size.height.0 as f32 / scale_factor;
-        if natural_width <= 0. || natural_height <= 0. {
-            return;
-        }
-        let fit = (bounds.size.width.as_f32() / natural_width)
-            .min(360. / natural_height)
-            .min(1.0);
-        let target = gpui::size(px(natural_width * fit), px(natural_height * fit));
-        let rect = Bounds {
-            origin: point(x, y),
-            size: target,
-        };
-        if let Err(error) = window.paint_image(rect, rect, px(4.).into(), image.clone(), 0, false) {
-            tracing::warn!(error = %error, "failed to paint image");
-        }
-        return;
-    }
+    match kind {
+        MediaKind::Image => {
+            if let Some(ImageState::Loaded(image)) = images.get(path) {
+                let scale_factor = window.scale_factor();
+                let size = image.size(0);
+                let natural_width = size.width.0 as f32 / scale_factor;
+                let natural_height = size.height.0 as f32 / scale_factor;
+                if natural_width <= 0. || natural_height <= 0. {
+                    return;
+                }
+                let fit = (bounds.size.width.as_f32() / natural_width)
+                    .min(360. / natural_height)
+                    .min(1.0);
+                let target = gpui::size(px(natural_width * fit), px(natural_height * fit));
+                let rect = Bounds {
+                    origin: point(x, y),
+                    size: target,
+                };
+                if let Err(error) =
+                    window.paint_image(rect, rect, px(4.).into(), image.clone(), 0, false)
+                {
+                    tracing::warn!(error = %error, "failed to paint image");
+                }
+                return;
+            }
 
-    // Loading or failed: a placeholder box labeled with the file name.
-    let label = format!("▢ {path}");
-    let rect = Bounds {
-        origin: point(x, y),
-        size: gpui::size(
-            bounds.size.width.min(px(320.)),
-            (line_height - px(8.)).max(px(24.)),
-        ),
+            // Loading or failed: a placeholder box. A failed decode names the
+            // file and says so, instead of looking like unrendered markup.
+            let label = match images.get(path) {
+                Some(ImageState::Failed) => {
+                    format!(
+                        "▢ {} — this image format cannot be displayed",
+                        file_name(path)
+                    )
+                }
+                _ => format!("▢ {path}"),
+            };
+            let rect = Bounds {
+                origin: point(x, y),
+                size: gpui::size(
+                    bounds.size.width.min(px(320.)),
+                    (line_height - px(8.)).max(px(24.)),
+                ),
+            };
+            window.paint_quad(
+                fill(rect, theme.code_background)
+                    .corner_radii(6.)
+                    .border_widths(1.)
+                    .border_color(theme.media_border),
+            );
+            paint_label(
+                &label,
+                point(
+                    rect.origin.x + px(8.),
+                    rect.origin.y + (rect.size.height - px(14.)) / 2.,
+                ),
+                px(12.),
+                theme.text.opacity(0.6),
+                theme,
+                window,
+                cx,
+            );
+        }
+        MediaKind::Video | MediaKind::Audio => {
+            let (card_height, radius, button_radius) = match kind {
+                // The video card is exactly the height the layout reserved for
+                // it, which follows the frame's shape: the picture fills it
+                // with no letterbox bands.
+                MediaKind::Video => (line_height.max(px(120.)), 10., px(22.)),
+                _ => ((line_height - px(6.)).clamp(px(78.), px(98.)), 8., px(17.)),
+            };
+            let width = bounds.size.width.min(px(560.));
+            let card = Bounds {
+                origin: point(x, y + px(2.)),
+                size: gpui::size(width, card_height),
+            };
+            window.paint_quad(
+                fill(card, theme.media_background)
+                    .corner_radii(radius)
+                    .border_widths(1.)
+                    .border_color(theme.media_border),
+            );
+            // A video frame covers the whole card, cropped to fit. The file
+            // label steps aside once there is a picture.
+            let mut framed = false;
+            if kind == MediaKind::Video
+                && let Some(frame) = frame
+            {
+                let size = frame.size(0);
+                let scale_factor = window.scale_factor();
+                let natural_width = size.width.0 as f32 / scale_factor;
+                let natural_height = size.height.0 as f32 / scale_factor;
+                if natural_width > 0. && natural_height > 0. {
+                    // Shown whole, letterboxed in the card: `max` cropped the
+                    // picture to the box, which read as a stretched video.
+                    let fit = (card.size.width.as_f32() / natural_width)
+                        .min(card.size.height.as_f32() / natural_height);
+                    let target = gpui::size(px(natural_width * fit), px(natural_height * fit));
+                    let rect = Bounds {
+                        origin: point(
+                            card.origin.x + (card.size.width - target.width) / 2.,
+                            card.origin.y + (card.size.height - target.height) / 2.,
+                        ),
+                        size: target,
+                    };
+                    if let Err(error) =
+                        window.paint_image(rect, card, px(radius).into(), frame.clone(), 0, false)
+                    {
+                        tracing::warn!(error = %error, "failed to paint a video frame");
+                    } else {
+                        framed = true;
+                    }
+                }
+            }
+            let button_center = match kind {
+                MediaKind::Video => point(
+                    card.origin.x + card.size.width / 2.,
+                    card.origin.y + card.size.height / 2.,
+                ),
+                _ => point(
+                    card.origin.x + px(12.) + button_radius,
+                    card.origin.y + px(12.) + button_radius,
+                ),
+            };
+            let playing = playback.is_some_and(|state| state.playing);
+            let label_x = match kind {
+                MediaKind::Video => card.origin.x + px(12.),
+                _ => card.origin.x + px(12.) + button_radius * 2. + px(10.),
+            };
+            let clock = |milliseconds: u64| {
+                format!(
+                    "{:02}:{:02}",
+                    milliseconds / 60_000,
+                    (milliseconds / 1000) % 60
+                )
+            };
+            let time_label = (kind == MediaKind::Audio).then(|| match playback {
+                Some(state) => match state.duration_ms.filter(|duration| *duration > 0) {
+                    Some(duration) => format!("{} / {}", clock(state.position_ms), clock(duration)),
+                    None => clock(state.position_ms),
+                },
+                None => clock(0),
+            });
+            // The controls live in their own layer: gpui paints an image's
+            // sprite after the quads of the layer it was added to, so a
+            // button drawn right after a frame would disappear under it.
+            let square_button = kind == MediaKind::Video;
+            window.paint_layer(card, |window| {
+                if square_button {
+                    paint_video_button(button_center, playing, theme, window);
+                } else {
+                    paint_media_button(button_center, button_radius, playing, theme, window);
+                }
+                if !framed {
+                    let label = match playback.and_then(|state| state.error.as_deref()) {
+                        Some(error) => format!("{} — {error}", file_name(path)),
+                        None => file_name(path),
+                    };
+                    let label_y = if kind == MediaKind::Audio {
+                        card.origin.y + px(22.)
+                    } else {
+                        card.origin.y + card.size.height - px(22.)
+                    };
+                    let (label_size, label_color) = if kind == MediaKind::Audio {
+                        (px(14.), theme.text)
+                    } else {
+                        (px(12.), theme.text.opacity(0.6))
+                    };
+                    paint_label(
+                        &label,
+                        point(label_x, label_y),
+                        label_size,
+                        label_color,
+                        theme,
+                        window,
+                        cx,
+                    );
+                    if let Some(time) = time_label.as_deref() {
+                        paint_label_right(
+                            time,
+                            card.origin.x + card.size.width - px(14.),
+                            label_y,
+                            px(12.),
+                            theme.text.opacity(0.6),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            });
+            // The progress track and its elapsed portion, when known.
+            let fraction = playback
+                .and_then(|state| {
+                    state
+                        .duration_ms
+                        .filter(|duration| *duration > 0)
+                        .map(|duration| (state.position_ms as f32 / duration as f32).clamp(0., 1.))
+                })
+                .unwrap_or(0.);
+            window.paint_layer(card, |window| {
+                if kind == MediaKind::Audio {
+                    // The hero's waveform: a light rounded track holding
+                    // deterministic ticks, the played stretch in the accent.
+                    let track = Bounds {
+                        origin: point(
+                            card.origin.x + px(12.),
+                            card.origin.y + card.size.height - px(12.) - px(28.),
+                        ),
+                        size: gpui::size((card.size.width - px(24.)).max(px(1.)), px(28.)),
+                    };
+                    window.paint_quad(fill(track, theme.media_waveform_track).corner_radii(8.));
+                    const TICKS: usize = 40;
+                    let left = track.origin.x + px(8.);
+                    let right = track.origin.x + track.size.width - px(8.);
+                    let width = (right - left).max(px(1.));
+                    // Thin lines spread across the track, as the reading
+                    // card draws them — not fat bars packed to the left.
+                    let tick_width = px(2.);
+                    let step = ((width - tick_width) / (TICKS - 1) as f32).max(px(0.));
+                    let center_y = track.origin.y + track.size.height / 2.;
+                    let seed: usize = path.bytes().map(|byte| byte as usize).sum();
+                    for tick in 0..TICKS {
+                        let at = tick as f32 / (TICKS - 1) as f32;
+                        let amplitude = 0.3 + 0.7 * (((seed + tick * 7) % 11) as f32 / 10.);
+                        let height = px(5. + 15. * amplitude);
+                        let bar = Bounds {
+                            origin: point(left + step * tick as f32, center_y - height / 2.),
+                            size: gpui::size(tick_width, height),
+                        };
+                        let color = if at <= fraction {
+                            theme.media_progress
+                        } else {
+                            theme.media_track
+                        };
+                        window.paint_quad(fill(bar, color).corner_radii(tick_width / 2.));
+                    }
+                    return;
+                }
+                let track_bounds = Bounds {
+                    origin: point(card.origin.x, card.origin.y + card.size.height - px(3.)),
+                    size: gpui::size(card.size.width.max(px(0.)), px(3.)),
+                };
+                window.paint_quad(fill(track_bounds, theme.media_track).corner_radii(1.));
+                let elapsed = Bounds {
+                    origin: track_bounds.origin,
+                    size: gpui::size(track_bounds.size.width * fraction, track_bounds.size.height),
+                };
+                window.paint_quad(fill(elapsed, theme.media_progress).corner_radii(1.));
+            });
+        }
+        MediaKind::File => {
+            let label = format!("▢ {}", file_name(path));
+            let chip = Bounds {
+                origin: point(x, y + (line_height - px(24.)) / 2.),
+                size: gpui::size(bounds.size.width.min(px(320.)), px(24.)),
+            };
+            window.paint_quad(
+                fill(chip, theme.media_background)
+                    .corner_radii(6.)
+                    .border_widths(1.)
+                    .border_color(theme.media_border),
+            );
+            paint_label(
+                &label,
+                point(chip.origin.x + px(8.), chip.origin.y + px(5.)),
+                px(12.),
+                theme.text.opacity(0.6),
+                theme,
+                window,
+                cx,
+            );
+        }
+    }
+}
+
+/// A round media control with a play triangle (`playing == false`) or a pair
+/// of pause bars, filled in the editor's background colour so the chip reads
+/// on both light and dark themes.
+fn paint_media_button(
+    center: Point<Pixels>,
+    radius: Pixels,
+    playing: bool,
+    theme: &EditorTheme,
+    window: &mut Window,
+) {
+    let button = Bounds {
+        origin: point(center.x - radius, center.y - radius),
+        size: gpui::size(radius * 2., radius * 2.),
     };
-    window.paint_quad(fill(rect, theme.code_background).corner_radii(6.));
-    paint_label(
-        &label,
-        point(
-            rect.origin.x + px(8.),
-            rect.origin.y + (rect.size.height - px(14.)) / 2.,
-        ),
-        theme,
+    // The hero's transport: an accent disc with the glyph knocked out in the
+    // page colour, so it reads on both light and dark themes.
+    window.paint_quad(fill(button, theme.caret).corner_radii(radius));
+    if playing {
+        let bar_width = radius * 0.22;
+        let bar_height = radius * 0.9;
+        for offset in [-radius * 0.32, radius * 0.1] {
+            let bar = Bounds {
+                origin: point(center.x + offset, center.y - bar_height / 2.),
+                size: gpui::size(bar_width, bar_height),
+            };
+            window.paint_quad(fill(bar, theme.background).corner_radii(bar_width / 2.));
+        }
+    } else {
+        let mut builder = PathBuilder::fill();
+        builder.add_polygon(
+            &[
+                point(center.x - radius * 0.2, center.y - radius * 0.42),
+                point(center.x - radius * 0.2, center.y + radius * 0.42),
+                point(center.x + radius * 0.5, center.y),
+            ],
+            true,
+        );
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, theme.background);
+        }
+    }
+}
+
+/// The video player's control: a small translucent square with an accent
+/// glyph, as in the landing hero, instead of a disc over the picture.
+fn paint_video_button(
+    center: Point<Pixels>,
+    playing: bool,
+    theme: &EditorTheme,
+    window: &mut Window,
+) {
+    let side = px(30.);
+    let button = Bounds {
+        origin: point(center.x - side / 2., center.y - side / 2.),
+        size: gpui::size(side, side),
+    };
+    window.paint_quad(
+        fill(button, theme.background.opacity(0.92))
+            .corner_radii(8.)
+            .border_widths(1.)
+            .border_color(theme.media_border),
+    );
+    if playing {
+        let bar_width = px(3.);
+        let bar_height = px(12.);
+        for offset in [-px(3.5), px(0.5)] {
+            let bar = Bounds {
+                origin: point(center.x + offset, center.y - bar_height / 2.),
+                size: gpui::size(bar_width, bar_height),
+            };
+            window.paint_quad(fill(bar, theme.caret).corner_radii(px(1.5)));
+        }
+    } else {
+        let mut builder = PathBuilder::fill();
+        builder.add_polygon(
+            &[
+                point(center.x - px(3.5), center.y - px(6.)),
+                point(center.x - px(3.5), center.y + px(6.)),
+                point(center.x + px(6.5), center.y),
+            ],
+            true,
+        );
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, theme.caret);
+        }
+    }
+}
+
+/// Like [`paint_label`], but with its right edge at `right`.
+fn paint_label_right(
+    label: &str,
+    right: Pixels,
+    y: Pixels,
+    size: Pixels,
+    color: Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let mut style = window.text_style().clone();
+    style.font_size = size.into();
+    style.color = color;
+    let Ok(mut shaped) = window.text_system().shape_text(
+        SharedString::new(label),
+        size,
+        &[style.to_run(label.len())],
+        None,
+        None,
+    ) else {
+        return;
+    };
+    let Some(line) = shaped.pop() else {
+        return;
+    };
+    let width = line.width();
+    if let Err(error) = line.paint(
+        point(right - width, y),
+        window.pixel_snap(px(14.)),
+        TextAlign::Left,
+        None,
         window,
         cx,
-    );
+    ) {
+        tracing::warn!(error = %error, "failed to paint a label");
+    }
 }
 
 /// Paints one small dimmed line of text (labels, tooltips).
 fn paint_label(
     label: &str,
     origin: Point<Pixels>,
+    size: Pixels,
+    color: Hsla,
     theme: &EditorTheme,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let _ = theme;
     let mut style = window.text_style().clone();
-    style.font_size = px(12.).into();
-    style.color = theme.text.opacity(0.6);
+    style.font_size = size.into();
+    style.color = color;
     let Ok(mut shaped) = window.text_system().shape_text(
         SharedString::new(label),
-        px(12.),
+        size,
         &[style.to_run(label.len())],
         None,
         None,
@@ -827,7 +1439,17 @@ struct InlineFlags {
 /// and code; decoration fields carry strike-through and background chips.
 /// Overlapping runs (nesting) compose by flag union.
 fn shape_runs(line: &ProjectedLine, base: &TextStyle, theme: &EditorTheme) -> Vec<TextRun> {
-    if line.runs.is_empty() {
+    // A widget's glyph is a width placeholder only: the bullet, bar or
+    // checkbox is painted as a quad on top of it. Keeping the placeholder's
+    // ink invisible means a cover that misses by a pixel can never show two
+    // bullets, two quote bars or a stray checkbox in the text.
+    let placeholders: Vec<Range<usize>> = line
+        .fragments
+        .iter()
+        .filter(|fragment| matches!(fragment.kind, FragmentKind::Widget(_)))
+        .map(|fragment| fragment.display.clone())
+        .collect();
+    if line.runs.is_empty() && placeholders.is_empty() {
         return vec![base.to_run(line.text.len())];
     }
     let len = line.text.len();
@@ -835,6 +1457,10 @@ fn shape_runs(line: &ProjectedLine, base: &TextStyle, theme: &EditorTheme) -> Ve
     for run in &line.runs {
         points.push(run.display.start.min(len));
         points.push(run.display.end.min(len));
+    }
+    for placeholder in &placeholders {
+        points.push(placeholder.start.min(len));
+        points.push(placeholder.end.min(len));
     }
     points.sort_unstable();
     points.dedup();
@@ -858,7 +1484,13 @@ fn shape_runs(line: &ProjectedLine, base: &TextStyle, theme: &EditorTheme) -> Ve
                 }
             }
         }
+        let placeholder = placeholders
+            .iter()
+            .any(|range| range.start <= start && end <= range.end);
         let mut style = base.clone();
+        if placeholder {
+            style.color = base.color.opacity(0.);
+        }
         if flags.strong {
             style.font_weight = FontWeight::BOLD;
         }
@@ -925,7 +1557,7 @@ impl EditorLayout {
         }
         let mut top = Pixels::ZERO;
         for line in &inner.lines[..ix] {
-            top += line.wrapped.size(line.height).height;
+            top += line.advance;
         }
         Some(top)
     }
@@ -939,7 +1571,7 @@ impl EditorLayout {
         }
         let mut top = Pixels::ZERO;
         for (ix, line) in inner.lines.iter().enumerate() {
-            let height = line.wrapped.size(line.height).height;
+            let height = line.advance;
             if y < top + height {
                 return Some((ix, y - top));
             }
@@ -951,7 +1583,13 @@ impl EditorLayout {
 
 struct LaidLine {
     wrapped: WrappedLine,
+    /// The base line height: the step between two visual rows of this line,
+    /// which is what the sub-line painters (caret, selection, widgets) take.
     height: Pixels,
+    /// The vertical space the line occupies, wrapped rows included. Layout and
+    /// paint both advance by this; using `height` for that put every wrapped
+    /// line's followers one row per extra row too high.
+    advance: Pixels,
 }
 
 struct EditorLayoutInner {

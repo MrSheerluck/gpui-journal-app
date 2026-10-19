@@ -57,14 +57,65 @@ pub enum FragmentKind {
 /// Widgets that replace source markup while collapsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WidgetKind {
-    /// A `-`/`*`/`+` marker rendered as `•`.
+    /// A `-`/`*`/`+` marker rendered as a painted dot.
     Bullet,
-    /// A `[ ]`/`[x]` marker rendered as `☐`/`☑` and toggled by clicking.
+    /// A `>` marker rendered as a painted vertical bar.
+    QuoteBar,
+    /// A `[ ]`/`[x]` marker rendered as a painted checkbox and toggled by clicking.
     Task { checked: bool },
     /// A `---` rule rendered as a full-width painted line.
     Rule,
-    /// A whole-line `![alt](path)` rendered as the decoded image.
-    Image { path: String },
+    /// A whole-line `![alt](path)` rendered as the media it points at.
+    Media { kind: MediaKind, path: String },
+}
+
+/// What a media destination is, by its file extension. The classification is
+/// pure so the projection decides rendering and the host decides playback
+/// from the same answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Audio,
+    Video,
+    /// A whole-line reference the editor does not render inline: a file chip.
+    File,
+}
+
+/// The file a media destination names: CommonMark wraps destinations that
+/// contain spaces in angle brackets (`<assets/a b.png>`), and some writers
+/// percent-encode them instead; both name the same file on disk.
+pub fn destination_path(destination: &str) -> String {
+    let inner = destination
+        .trim()
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .unwrap_or(destination.trim());
+    if inner.contains("%20") {
+        inner.replace("%20", " ")
+    } else {
+        inner.to_string()
+    }
+}
+
+/// Classifies a media destination by extension, case-insensitively and
+/// ignoring URL query/fragment suffixes. Unknown extensions are `File`.
+pub fn media_kind(destination: &str) -> MediaKind {
+    let path = destination_path(destination);
+    let path = path.split(['?', '#']).next().unwrap_or(&path);
+    let extension = path
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "heic" | "avif" => {
+            MediaKind::Image
+        }
+        "mp3" | "m4a" | "aac" | "wav" | "aif" | "aiff" | "flac" | "ogg" | "oga" | "opus" => {
+            MediaKind::Audio
+        }
+        "mp4" | "mov" | "m4v" | "webm" | "avi" | "mkv" => MediaKind::Video,
+        _ => MediaKind::File,
+    }
 }
 
 /// One piece of a projected line. Fragments tile both the source range and
@@ -267,15 +318,47 @@ fn project_line(
             }
             ConstructKind::QuoteMarker => {
                 if !line_revealed(&source, selection) {
-                    pieces.push((
-                        reveal_range,
-                        Piece::Glyph {
-                            text: "▎ ".to_string(),
-                            widget: WidgetKind::Bullet,
-                        },
-                    ));
                     if line_style == Style::Body {
                         line_style = Style::Quote;
+                    }
+                    let marker = &text[reveal_range.clone()];
+                    let barred = pieces.iter().any(|(_, piece)| {
+                        matches!(
+                            piece,
+                            Piece::Glyph {
+                                widget: WidgetKind::QuoteBar,
+                                ..
+                            }
+                        )
+                    });
+                    // One bar per line: a nested level — a second `>` on the
+                    // same line, whether it sits in its own marker node or in
+                    // one run like `> > ` — keeps its width as indentation, so
+                    // a nested quote reads as an indented quote instead of two
+                    // bars side by side.
+                    let bar_len = if barred {
+                        0
+                    } else {
+                        marker[1..]
+                            .find('>')
+                            .map(|second| 1 + second)
+                            .unwrap_or(marker.len())
+                    };
+                    let bar_end = reveal_range.start + bar_len;
+                    if bar_len > 0 {
+                        pieces.push((
+                            reveal_range.start..bar_end,
+                            Piece::Glyph {
+                                text: "▎ ".to_string(),
+                                widget: WidgetKind::QuoteBar,
+                            },
+                        ));
+                    }
+                    if bar_end < reveal_range.end {
+                        pieces.push((
+                            bar_end..reveal_range.end,
+                            Piece::Text(" ".repeat(reveal_range.end - bar_end)),
+                        ));
                     }
                 }
             }
@@ -327,22 +410,32 @@ fn project_line(
             ConstructKind::Image => {
                 if !revealed(construct, selection) {
                     let destination = construct.inner.get(1).map(|range| &text[range.clone()]);
-                    let file_name = destination
-                        .and_then(|destination| destination.rsplit('/').next())
+                    let cleaned = destination.map(destination_path);
+                    let file_name = cleaned
+                        .as_deref()
+                        .and_then(|path| path.rsplit('/').next())
                         .unwrap_or("image");
                     let whole_line = is_whole_line(&construct.range, &source, text);
                     if whole_line {
+                        let path = destination.unwrap_or_default().to_string();
                         pieces.push((
                             reveal_range,
                             Piece::Glyph {
                                 text: " ".to_string(),
-                                widget: WidgetKind::Image {
-                                    path: destination.unwrap_or_default().to_string(),
+                                widget: WidgetKind::Media {
+                                    kind: media_kind(&path),
+                                    path,
                                 },
                             },
                         ));
                     } else {
-                        pieces.push((reveal_range, Piece::Text(format!("[image: {file_name}]"))));
+                        let label = match media_kind(destination.unwrap_or_default()) {
+                            MediaKind::Image => format!("[image: {file_name}]"),
+                            MediaKind::Audio => format!("[audio: {file_name}]"),
+                            MediaKind::Video => format!("[video: {file_name}]"),
+                            MediaKind::File => format!("[file: {file_name}]"),
+                        };
+                        pieces.push((reveal_range, Piece::Text(label)));
                     }
                 }
             }
@@ -532,6 +625,39 @@ mod tests {
         let mut index = MarkdownIndex::new();
         index.update(text);
         DisplayPlan::compute(text, &index, selection)
+    }
+
+    #[test]
+    fn every_quote_shape_collapses_to_exactly_one_bar() {
+        // One bar per line whatever the shape: the plain marker, a marker
+        // with no trailing space, a nested run (`>>`, `> > >`), an indented
+        // quote, a quote in a list, and the two-marker-node form.
+        let cases = [
+            ("> plain quote\n", "▎ plain quote"),
+            (">plain no space\n", "▎ plain no space"),
+            (">> no space nested\n", "▎   no space nested"),
+            ("> > > triple\n", "▎     triple"),
+            ("  > indented\n", "▎   indented"),
+            ("* > star list quote\n", "• ▎ star list quote"),
+            ("1. > ordered quote\n", "1. ▎ ordered quote"),
+            ("> quote\n> > nested\n", "▎ quote"),
+        ];
+        for (text, expected_first) in cases {
+            let plan = plan_for(text, Selection::caret(text.len()));
+            let line = &plan.lines[0];
+            assert_eq!(line.text, expected_first, "for {text:?}");
+            assert_eq!(
+                line.fragments
+                    .iter()
+                    .filter(|fragment| matches!(
+                        fragment.kind,
+                        FragmentKind::Widget(WidgetKind::QuoteBar)
+                    ))
+                    .count(),
+                1,
+                "one bar on the first line of {text:?}"
+            );
+        }
     }
 
     #[test]
@@ -751,7 +877,7 @@ mod tests {
         assert_eq!(plan.lines[0].style, Style::Quote);
         let (range, widget) = plan.lines[0].widget_at_display(0).expect("bar widget");
         assert_eq!(range, 0..2);
-        assert_eq!(widget, WidgetKind::Bullet);
+        assert_eq!(widget, WidgetKind::QuoteBar);
 
         let plan = plan_for(text, Selection::caret(3));
         assert_eq!(plan.lines[0].text, "> quoted line");
@@ -817,7 +943,8 @@ mod tests {
         let (_, widget) = line.widget_at_display(0).expect("image widget");
         assert_eq!(
             widget,
-            WidgetKind::Image {
+            WidgetKind::Media {
+                kind: super::MediaKind::Image,
                 path: "assets/x.png".into()
             }
         );
@@ -831,6 +958,94 @@ mod tests {
         let text = "text ![a](p.png) more\n";
         let plan = plan_for(text, Selection::caret(0));
         assert_eq!(plan.lines[0].text, "text [image: p.png] more");
+    }
+
+    #[test]
+    fn media_classification_follows_the_extension() {
+        use super::{MediaKind, media_kind};
+        assert_eq!(media_kind("assets/x.png"), MediaKind::Image);
+        assert_eq!(media_kind("assets/X.JPEG"), MediaKind::Image);
+        assert_eq!(media_kind("assets/x.png?v=2"), MediaKind::Image);
+        assert_eq!(media_kind("assets/take.mp3"), MediaKind::Audio);
+        assert_eq!(media_kind("assets/take.M4A"), MediaKind::Audio);
+        assert_eq!(media_kind("assets/clip.mp4"), MediaKind::Video);
+        assert_eq!(media_kind("assets/clip.MOV#t=3"), MediaKind::Video);
+        assert_eq!(media_kind("assets/notes.txt"), MediaKind::File);
+        assert_eq!(media_kind("assets/no_dot"), MediaKind::File);
+        assert_eq!(media_kind("assets/v1.2/x"), MediaKind::File);
+        // Spaced destinations: angle-bracketed and percent-encoded forms.
+        assert_eq!(
+            media_kind("<assets/Screen Shot 2026.png>"),
+            MediaKind::Image
+        );
+        assert_eq!(
+            media_kind("assets/Screen%20Recording.mov"),
+            MediaKind::Video
+        );
+    }
+
+    #[test]
+    fn destination_path_unwraps_brackets_and_escapes() {
+        use super::destination_path;
+        assert_eq!(destination_path("assets/a.png"), "assets/a.png");
+        assert_eq!(destination_path("<assets/a b.png>"), "assets/a b.png");
+        assert_eq!(destination_path("assets/a%20b.png"), "assets/a b.png");
+        assert_eq!(destination_path("  assets/a.png  "), "assets/a.png");
+        assert_eq!(destination_path("<assets/a b.png>"), "assets/a b.png");
+        assert_eq!(destination_path(""), "");
+    }
+
+    #[test]
+    fn bracketed_whole_line_media_becomes_a_widget() {
+        let text = "![Shot](<assets/a b.png>)\n";
+        let plan = plan_for(text, Selection::caret(30));
+        let line = &plan.lines[0];
+        let (_, widget) = line.widget_at_display(0).expect("media widget");
+        assert_eq!(
+            widget,
+            WidgetKind::Media {
+                kind: super::MediaKind::Image,
+                path: "<assets/a b.png>".into()
+            }
+        );
+        // Inline fallback label uses the cleaned file name.
+        let plan = plan_for("see ![s](<assets/a b.png>) here\n", Selection::caret(0));
+        assert_eq!(plan.lines[0].text, "see [image: a b.png] here");
+    }
+
+    #[test]
+    fn whole_line_media_carries_its_kind() {
+        let text = "![](assets/take.mp3)\n";
+        let plan = plan_for(text, Selection::caret(0));
+        let (_, widget) = plan.lines[0].widget_at_display(0).expect("media widget");
+        assert_eq!(
+            widget,
+            WidgetKind::Media {
+                kind: super::MediaKind::Audio,
+                path: "assets/take.mp3".into()
+            }
+        );
+
+        let text = "![](assets/clip.mp4)\n";
+        let plan = plan_for(text, Selection::caret(0));
+        let (_, widget) = plan.lines[0].widget_at_display(0).expect("media widget");
+        assert_eq!(
+            widget,
+            WidgetKind::Media {
+                kind: super::MediaKind::Video,
+                path: "assets/clip.mp4".into()
+            }
+        );
+    }
+
+    #[test]
+    fn inline_media_chips_name_their_kind() {
+        let plan = plan_for("a ![t](take.mp3) b\n", Selection::caret(0));
+        assert_eq!(plan.lines[0].text, "a [audio: take.mp3] b");
+        let plan = plan_for("a ![c](clip.mov) b\n", Selection::caret(0));
+        assert_eq!(plan.lines[0].text, "a [video: clip.mov] b");
+        let plan = plan_for("a ![n](notes.txt) b\n", Selection::caret(0));
+        assert_eq!(plan.lines[0].text, "a [file: notes.txt] b");
     }
 
     #[test]
@@ -873,6 +1088,59 @@ mod tests {
         let plan = plan_for(text, Selection::caret(16));
         assert_eq!(plan.lines[0].style, Style::Quote);
         assert_eq!(plan.lines[1].style, Style::Body);
+    }
+
+    #[test]
+    fn quote_continuations_collapse_their_markers() {
+        // The grammar hands the first line a `block_quote_marker` and every
+        // continuation line a `block_continuation`; both are the same `>` to
+        // a reader, so both collapse to the bar.
+        let text = "before\n\n> first\n>\n> third\n";
+        let caret = text.len();
+        let plan = plan_for(text, Selection::caret(caret));
+        for ix in [2, 3, 4] {
+            assert_eq!(
+                plan.lines[ix].style,
+                Style::Quote,
+                "line {ix} reads as a quote"
+            );
+            assert!(
+                !plan.lines[ix].text.contains('>'),
+                "line {ix} keeps no marker: {:?}",
+                plan.lines[ix].text
+            );
+        }
+
+        // With the caret on that line the source comes back, as everywhere.
+        let second_marker = text.find("\n>\n").expect("the empty quote line") + 2;
+        let plan = plan_for(text, Selection::caret(second_marker));
+        assert_eq!(plan.lines[3].text, ">");
+    }
+
+    #[test]
+    fn nested_quote_levels_indent_instead_of_stacking_bars() {
+        // The two lines differ in shape on purpose: the first has a marker
+        // node per level, the second one run holding both (`> > `). Both
+        // render the same way — one bar, the nested level as indentation.
+        let text = "> > nested first\n> > nested second\n";
+        let plan = plan_for(text, Selection::caret(text.len()));
+        for line in &plan.lines[..2] {
+            assert_eq!(line.style, Style::Quote);
+            assert_eq!(
+                line.fragments
+                    .iter()
+                    .filter(|fragment| matches!(
+                        fragment.kind,
+                        FragmentKind::Widget(WidgetKind::QuoteBar)
+                    ))
+                    .count(),
+                1,
+                "one bar per line: {:?}",
+                line.text
+            );
+        }
+        assert_eq!(plan.lines[0].text, "▎   nested first");
+        assert_eq!(plan.lines[1].text, "▎   nested second");
     }
 
     #[test]

@@ -30,6 +30,12 @@ image 0.25.1 (image decoding)
   Copyright the image crate developers
   MIT/Apache-2.0
 
+objc2 0.6.5, objc2-foundation 0.3.2, objc2-av-foundation 0.3.2,
+objc2-avf-audio 0.3.2, objc2-core-media 0.3.2, objc2-core-video 0.3.2
+  (macOS media playback in dainiki-desktop only)
+  Copyright Mads Marquart and contributors
+  Zlib OR Apache-2.0 OR MIT — https://github.com/madsmtm/objc2
+
 Inter (UI typeface, bundled TTFs in crates/app/assets/fonts)
   Copyright The Inter Project Authors (https://github.com/rsms/inter)
   SIL Open Font License 1.1 — https://openfontlicense.org

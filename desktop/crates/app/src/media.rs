@@ -24,6 +24,8 @@ pub trait AudioBackend {
     fn position(&self) -> Duration;
     fn duration(&self) -> Option<Duration>;
     fn playing(&self) -> bool;
+    /// Whether a stream is loaded (a failed load leaves nothing loaded).
+    fn loaded(&self) -> bool;
 }
 
 /// One loaded medium.
@@ -33,6 +35,9 @@ struct Current {
     kind: MediaKind,
     playing: bool,
     error: Option<String>,
+    /// A video whose sound could not be opened: the frame pump owns
+    /// playback, the audio backend stays empty.
+    silent: bool,
 }
 
 /// The day's player: toggling semantics, state snapshots, and the platform
@@ -69,9 +74,22 @@ impl Player {
             .is_some_and(|current| current.resolved == resolved);
         if same {
             if let Some(current) = self.current.as_mut() {
-                if current.playing {
+                if current.silent {
+                    // A silent video: the frame pump follows this flag, so a
+                    // toggle is only the flag flipping.
+                    current.playing = !current.playing;
+                } else if current.playing {
                     self.backend.pause();
                     current.playing = false;
+                } else if !self.backend.loaded() {
+                    // A failed load left nothing to play; clicking again
+                    // retries instead of reporting "nothing is loaded".
+                    let retry = current.resolved.clone();
+                    current.error = None;
+                    match self.backend.load(&retry).and_then(|()| self.backend.play()) {
+                        Ok(()) => current.playing = true,
+                        Err(error) => current.error = Some(error),
+                    }
                 } else {
                     // A finished stream replays from its start.
                     if let Some(duration) = self.backend.duration()
@@ -96,6 +114,7 @@ impl Player {
                 kind,
                 playing: false,
                 error: None,
+                silent: false,
             };
             match self
                 .backend
@@ -103,7 +122,17 @@ impl Player {
                 .and_then(|()| self.backend.play())
             {
                 Ok(()) => current.playing = true,
-                Err(error) => current.error = Some(error),
+                Err(error) => {
+                    if kind == MediaKind::Video {
+                        // A video without an audio track (or an audio format
+                        // the player refuses) still plays as pictures.
+                        tracing::info!(error = %error, "video plays without sound");
+                        current.silent = true;
+                        current.playing = true;
+                    } else {
+                        current.error = Some(error);
+                    }
+                }
             }
             self.current = Some(current);
         }
@@ -124,14 +153,24 @@ impl Player {
 
     /// Whether the tick loop should keep running.
     pub fn playing(&self) -> bool {
-        self.current.as_ref().is_some_and(|current| current.playing)
+        self.current
+            .as_ref()
+            .is_some_and(|current| current.playing && (current.silent || self.backend.playing()))
+    }
+
+    /// Whether the current medium is a video playing without sound (the frame
+    /// pump owns its position and end).
+    pub fn silent(&self) -> bool {
+        self.current.as_ref().is_some_and(|current| current.silent)
     }
 
     /// The current state, after folding in a natural end (the backend stopped
-    /// on its own).
+    /// on its own). Silent videos end when their pump does; the app stops
+    /// them.
     pub fn state(&mut self) -> Option<(String, MediaPlaybackState)> {
         if let Some(current) = self.current.as_mut()
             && current.playing
+            && !current.silent
             && !self.backend.playing()
         {
             current.playing = false;
@@ -152,6 +191,16 @@ impl Player {
         let Some(current) = &self.current else {
             return MediaPlaybackState::default();
         };
+        if current.silent {
+            // Position and duration come from the frame pump; the app fills
+            // them in.
+            return MediaPlaybackState {
+                playing: current.playing,
+                position_ms: 0,
+                duration_ms: None,
+                error: None,
+            };
+        }
         MediaPlaybackState {
             playing: current.playing && self.backend.playing(),
             position_ms: self.backend.position().as_millis() as u64,
@@ -193,6 +242,9 @@ impl AudioBackend for Unsupported {
         None
     }
     fn playing(&self) -> bool {
+        false
+    }
+    fn loaded(&self) -> bool {
         false
     }
 }
@@ -289,6 +341,10 @@ mod mac {
                 .as_ref()
                 .is_some_and(|player| unsafe { player.isPlaying() })
         }
+
+        fn loaded(&self) -> bool {
+            self.player.is_some()
+        }
     }
 }
 
@@ -360,6 +416,9 @@ mod tests {
         }
         fn playing(&self) -> bool {
             self.state.playing.get()
+        }
+        fn loaded(&self) -> bool {
+            self.state.loaded.borrow().is_some()
         }
     }
 
@@ -448,6 +507,69 @@ mod tests {
         assert!(!playback_state.playing);
         assert_eq!(playback_state.error.as_deref(), Some("unsupported codec"));
         assert!(player.state().is_some(), "the failed medium stays visible");
+    }
+
+    #[test]
+    fn a_video_without_sound_plays_silently() {
+        let (mut player, state) = setup();
+        // A screen recording with no audio track: the player refuses the file.
+        state.load_error.set(Some(
+            "The operation couldn't be completed. (OSStatus error 1685348671.)".into(),
+        ));
+        let playback_state = player.toggle(
+            "assets/clip.mov",
+            Path::new("/j/assets/clip.mov"),
+            MediaKind::Video,
+        );
+        assert!(
+            playback_state.playing,
+            "the video plays anyway; the frame pump owns it"
+        );
+        assert_eq!(
+            playback_state.error, None,
+            "a missing audio track is not an error to show"
+        );
+        assert!(player.silent(), "the player knows it is picture-only");
+        assert!(player.playing());
+
+        // Pausing and resuming only flips the flag the pump follows.
+        let paused = player.toggle(
+            "assets/clip.mov",
+            Path::new("/j/assets/clip.mov"),
+            MediaKind::Video,
+        );
+        assert!(!paused.playing);
+        assert!(!player.silent() || !player.playing());
+        let resumed = player.toggle(
+            "assets/clip.mov",
+            Path::new("/j/assets/clip.mov"),
+            MediaKind::Video,
+        );
+        assert!(resumed.playing);
+    }
+
+    #[test]
+    fn a_failed_audio_load_retries_on_the_next_click() {
+        let (mut player, state) = setup();
+        state
+            .load_error
+            .set(Some("the file could not be opened".into()));
+        let first = player.toggle(
+            "assets/take.mp3",
+            Path::new("/j/assets/take.mp3"),
+            MediaKind::Audio,
+        );
+        assert_eq!(first.error.as_deref(), Some("the file could not be opened"));
+
+        // The failure cleared itself (the fake consumes it): a second click
+        // retries the load instead of reporting "no medium is loaded".
+        let second = player.toggle(
+            "assets/take.mp3",
+            Path::new("/j/assets/take.mp3"),
+            MediaKind::Audio,
+        );
+        assert!(second.playing, "the retry plays: {second:?}");
+        assert_eq!(second.error, None);
     }
 
     #[test]

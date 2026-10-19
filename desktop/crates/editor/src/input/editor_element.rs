@@ -842,24 +842,29 @@ fn paint_media_line(
                 ),
             };
             let playing = playback.is_some_and(|state| state.playing);
-            paint_media_button(button_center, button_radius, playing, theme, window);
             let label_x = match kind {
                 MediaKind::Video => card.origin.x + px(12.),
                 _ => card.origin.x + px(12.) + button_radius * 2. + px(12.),
             };
-            if !framed {
-                let label = match playback.and_then(|state| state.error.as_deref()) {
-                    Some(error) => format!("{} — {error}", file_name(path)),
-                    None => file_name(path),
-                };
-                paint_label(
-                    &label,
-                    point(label_x, card.origin.y + card.size.height - px(22.)),
-                    theme,
-                    window,
-                    cx,
-                );
-            }
+            // The controls live in their own layer: gpui paints an image's
+            // sprite after the quads of the layer it was added to, so a
+            // button drawn right after a frame would disappear under it.
+            window.paint_layer(card, |window| {
+                paint_media_button(button_center, button_radius, playing, theme, window);
+                if !framed {
+                    let label = match playback.and_then(|state| state.error.as_deref()) {
+                        Some(error) => format!("{} — {error}", file_name(path)),
+                        None => file_name(path),
+                    };
+                    paint_label(
+                        &label,
+                        point(label_x, card.origin.y + card.size.height - px(22.)),
+                        theme,
+                        window,
+                        cx,
+                    );
+                }
+            });
             // The progress track and its elapsed portion, when known.
             let track_bounds = Bounds {
                 origin: point(
@@ -868,17 +873,22 @@ fn paint_media_line(
                 ),
                 size: gpui::size((card.size.width - px(24.)).max(px(0.)), px(2.)),
             };
-            window.paint_quad(fill(track_bounds, theme.media_track).corner_radii(1.));
-            if let Some(state) = playback
-                && let Some(duration) = state.duration_ms.filter(|duration| *duration > 0)
-            {
-                let fraction = (state.position_ms as f32 / duration as f32).clamp(0., 1.);
-                let elapsed = Bounds {
-                    origin: track_bounds.origin,
-                    size: gpui::size(track_bounds.size.width * fraction, track_bounds.size.height),
-                };
-                window.paint_quad(fill(elapsed, theme.media_progress).corner_radii(1.));
-            }
+            window.paint_layer(card, |window| {
+                window.paint_quad(fill(track_bounds, theme.media_track).corner_radii(1.));
+                if let Some(state) = playback
+                    && let Some(duration) = state.duration_ms.filter(|duration| *duration > 0)
+                {
+                    let fraction = (state.position_ms as f32 / duration as f32).clamp(0., 1.);
+                    let elapsed = Bounds {
+                        origin: track_bounds.origin,
+                        size: gpui::size(
+                            track_bounds.size.width * fraction,
+                            track_bounds.size.height,
+                        ),
+                    };
+                    window.paint_quad(fill(elapsed, theme.media_progress).corner_radii(1.));
+                }
+            });
         }
         MediaKind::File => {
             let label = format!("▢ {}", file_name(path));

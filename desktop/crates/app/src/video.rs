@@ -7,11 +7,16 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// One decoded frame, top-down RGBA, tightly packed.
+/// One decoded frame, top-down RGBA, tightly packed, with its position on the
+/// asset's timeline.
 pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    /// Presentation time from the start of the stream.
+    pub pts_ms: u64,
+    /// The stream's total length, when the track reports one.
+    pub duration_ms: Option<u64>,
 }
 
 impl VideoFrame {
@@ -219,6 +224,12 @@ mod platform {
             .ok_or_else(|| "the file has no video track".to_string())?;
 
         let (width, height) = target_size(&track);
+        let duration_ms = {
+            #[allow(deprecated)] // The sync reader is the pinned bindings' shape.
+            let range = unsafe { track.timeRange() };
+            let seconds = unsafe { range.duration.seconds() };
+            (seconds > 0.0).then_some((seconds * 1000.0) as u64)
+        };
         let settings = output_settings(width, height);
         // The bindings ask for `AnyObject` values; the dictionary stores
         // NSNumbers either way (the generic parameter is a type-level tag).
@@ -264,6 +275,7 @@ mod platform {
             let seconds = unsafe { sample.presentation_time_stamp().seconds() };
             let start = *first_pts.get_or_insert(seconds);
             let target = Duration::from_secs_f64((seconds - start).max(0.0));
+            let pts_ms = target.as_millis() as u64;
             while play_started.elapsed() < target {
                 if control.stopped() {
                     return Ok(());
@@ -277,7 +289,7 @@ mod platform {
             let Some(buffer) = (unsafe { sample.image_buffer() }) else {
                 continue;
             };
-            let frame = convert(&buffer)?;
+            let frame = convert(&buffer, pts_ms, duration_ms)?;
             if !send_frame(sender, frame, control) {
                 return Ok(());
             }
@@ -285,7 +297,11 @@ mod platform {
     }
 
     /// Copies a locked BGRA pixel buffer into tightly packed RGBA.
-    fn convert(buffer: &objc2_core_video::CVImageBuffer) -> Result<VideoFrame, String> {
+    fn convert(
+        buffer: &objc2_core_video::CVImageBuffer,
+        pts_ms: u64,
+        duration_ms: Option<u64>,
+    ) -> Result<VideoFrame, String> {
         let pixel_buffer: &CVPixelBuffer = buffer;
         let format = CVPixelBufferGetPixelFormatType(pixel_buffer);
         if format != kCVPixelFormatType_32BGRA {
@@ -325,6 +341,8 @@ mod platform {
             width: width as u32,
             height: height as u32,
             rgba,
+            pts_ms,
+            duration_ms,
         })
     }
 }

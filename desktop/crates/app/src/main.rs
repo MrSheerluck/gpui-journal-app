@@ -130,8 +130,11 @@ struct JournalSession {
     video: Option<video::Pump>,
     /// Which destination the frame pump belongs to.
     video_destination: Option<String>,
-    /// The latest decoded frame, for read-only video cards.
-    latest_frame: Option<(String, Arc<RenderImage>)>,
+    /// The latest decoded frame, for read-only video cards: the destination,
+    /// the image, and its position on the timeline.
+    latest_frame: Option<(String, Arc<RenderImage>, u64)>,
+    /// The current video's total length, as reported by the decoder.
+    video_duration_ms: Option<u64>,
     _jump_events: Subscription,
 }
 
@@ -328,6 +331,7 @@ impl DainikiApp {
             video: None,
             video_destination: None,
             latest_frame: None,
+            video_duration_ms: None,
             _jump_events: jump_events,
         }));
         cx.notify();
@@ -601,10 +605,15 @@ impl DainikiApp {
         };
         match frame {
             Ok(frame) => {
+                let pts_ms = frame.pts_ms;
+                let duration_ms = frame.duration_ms;
                 let Some(image) = frame.into_render_image() else {
                     return;
                 };
-                session.latest_frame = Some((destination.to_string(), image.clone()));
+                session.latest_frame = Some((destination.to_string(), image.clone(), pts_ms));
+                if duration_ms.is_some() {
+                    session.video_duration_ms = duration_ms;
+                }
                 let editor = session.active.as_ref().map(|active| active.editor.clone());
                 if let Some(editor) = editor {
                     editor.update(cx, |editor, cx| {
@@ -658,11 +667,28 @@ impl DainikiApp {
         let Some(session) = self.session_mut() else {
             return false;
         };
-        let Some((destination, state)) = session.media.state() else {
+        let Some((destination, mut state)) = session.media.state() else {
             session.media_ticks.set(false);
             return false;
         };
-        let keep_going = session.media.playing();
+        let mut keep_going = session.media.playing();
+        if session.media.silent() {
+            // A silent video's clock is its frame pump: the position is the
+            // newest frame's, the length is the decoder's, and the end is the
+            // pump finishing.
+            if let Some((frame_destination, _, pts_ms)) = &session.latest_frame
+                && frame_destination == &destination
+            {
+                state.position_ms = *pts_ms;
+            }
+            state.duration_ms = session.video_duration_ms;
+            let pump_gone = session.video.as_ref().is_none_or(|pump| pump.finished());
+            if pump_gone {
+                state.playing = false;
+                keep_going = false;
+                session.media.stop();
+            }
+        }
         let editor = session.active.as_ref().map(|active| active.editor.clone());
         if let Some(editor) = editor {
             editor.update(cx, |editor, cx| {
@@ -1606,8 +1632,8 @@ impl JournalSession {
                 let framed = self
                     .latest_frame
                     .as_ref()
-                    .filter(|(current, _)| current == destination);
-                let area = if let Some((_, frame)) = framed {
+                    .filter(|(current, _, _)| current == destination);
+                let area = if let Some((_, frame, _)) = framed {
                     div()
                         .w_full()
                         .h(px(150.))

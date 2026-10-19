@@ -60,6 +60,11 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// While something plays, the player's state is pushed this often.
 const MEDIA_TICK: Duration = Duration::from_millis(100);
 
+/// The stream's viewport margins for caret keeping-visible: the chrome above
+/// (title bar, toolbar, panels) and a little air below.
+const STREAM_TOP_MARGIN: f32 = 120.;
+const STREAM_BOTTOM_MARGIN: f32 = 48.;
+
 /// The app shell. A chosen folder turns into a [`JournalSession`]; until then
 /// the welcome screen asks for one.
 struct DainikiApp {
@@ -101,6 +106,9 @@ struct JournalSession {
     jump_error: Option<String>,
     /// The search palette's state, shared across openings.
     search_palette: Entity<CommandState>,
+    /// Set when the open day's caret should be scrolled into view on the next
+    /// frame (typing, or a freshly opened day whose caret sits at the end).
+    reveal_caret: Cell<bool>,
     /// The session's "today", captured at open; a timer rolls it over past
     /// midnight.
     today: NaiveDate,
@@ -317,6 +325,7 @@ impl DainikiApp {
             jump_open: false,
             jump_error: None,
             search_palette,
+            reveal_caret: Cell::new(true),
             today,
             pending_rollover: Cell::new(false),
             pending_delete: None,
@@ -380,6 +389,10 @@ impl DainikiApp {
         let editor = cx.new(|cx| {
             let mut editor = MarkdownEditor::new(buffer, theme.clone(), cx);
             editor.set_base_dir(base_dir, cx);
+            // The timeline is the only scroller: the open entry grows to its
+            // content instead of scrolling inside its own box, so one wheel
+            // gesture can never belong to two scrollers at once.
+            editor.fit_content(cx);
             editor
         });
         editor.update(cx, |editor, cx| editor.place_caret_at_end(cx));
@@ -393,6 +406,11 @@ impl DainikiApp {
                     .and_then(|session| session.active.as_mut())
                 {
                     active.dirty = true;
+                }
+                if let Some(session) = app.session_mut() {
+                    // A fit-content editor cannot scroll itself; the timeline
+                    // keeps the caret visible.
+                    session.reveal_caret.set(true);
                 }
                 app.schedule_save(cx);
                 cx.notify();
@@ -439,6 +457,9 @@ impl DainikiApp {
                 if let Some(session) = self.session_mut() {
                     session.days.remove(&date);
                     session.active = Some(active);
+                    // The caret starts at the entry's end: unless the day is
+                    // short, the stream scrolls it into view next frame.
+                    session.reveal_caret.set(true);
                 }
                 cx.notify();
             }
@@ -1769,9 +1790,26 @@ impl JournalSession {
             self.stream.reset(dates.len() + 1);
         }
 
-        // The live day's editor takes the full remaining height under the
-        // chrome; it scrolls internally when the entry is long.
-        let editor_height = px((window.viewport_size().height.as_f32() - 160.).max(320.));
+        // The open entry grows to its content height inside the list; the
+        // timeline is the only scroller. Keep the caret visible while typing
+        // by moving the stream itself.
+        // Before the first layout the caret rect is unknown; keep the flag so
+        // the reveal happens on a later frame rather than being lost.
+        if self.reveal_caret.get()
+            && let Some(rect) = self
+                .active
+                .as_ref()
+                .and_then(|active| active.editor.read(cx).caret_window_rect())
+        {
+            self.reveal_caret.set(false);
+            let viewport_bottom = window.viewport_size().height - px(STREAM_BOTTOM_MARGIN);
+            if rect.origin.y + rect.size.height > viewport_bottom {
+                self.stream
+                    .scroll_by(rect.origin.y + rect.size.height - viewport_bottom);
+            } else if rect.origin.y < px(STREAM_TOP_MARGIN) {
+                self.stream.scroll_by(rect.origin.y - px(STREAM_TOP_MARGIN));
+            }
+        }
 
         // A day that swapped between editor and render changed height; the
         // list must remeasure it (preserving the scroll anchor).
@@ -1902,7 +1940,6 @@ impl JournalSession {
                     .as_ref()
                     .expect("the active day always has an editor");
                 div()
-                    .h(editor_height)
                     .text_size(px(15.2))
                     .line_height(px(24.7))
                     .child(editor.clone())
@@ -2147,18 +2184,14 @@ impl JournalSession {
                         .h_full()
                         .child(stream_list.size_full().px_8().pt_8()),
                 )
-                // While a day is open the editor scrolls inside its item and
-                // paints its own bar. Showing the stream's beside it put two
-                // thumbs on the right edge, chasing each other as the entry
-                // bottomed out and the timeline took over. One scroller at a
-                // time: the entry's while editing, the timeline's otherwise.
-                .when(self.active.is_none(), |el| {
-                    el.child(
-                        Scrollbar::new(&self.stream)
-                            .id("stream-scrollbar")
-                            .axis(ScrollbarAxis::Vertical),
-                    )
-                }),
+                // The timeline's scrollbar is the page's only bar: the open
+                // entry grows to its content instead of scrolling inside its
+                // own box.
+                .child(
+                    Scrollbar::new(&self.stream)
+                        .id("stream-scrollbar")
+                        .axis(ScrollbarAxis::Vertical),
+                ),
         );
 
         div()
@@ -5182,14 +5215,15 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn the_open_entry_and_the_stream_do_not_scroll_together(cx: &mut TestAppContext) {
+    async fn the_wheel_scrolls_the_page_through_the_open_entry(cx: &mut TestAppContext) {
         init(cx);
         let dir = scratch_dir();
         let journal = journal::Journal::new(&dir);
         let today = Local::now().date_naive();
         let yesterday = today.pred_opt().expect("yesterday");
         seed_day(&journal, yesterday, "# yesterday\n\nwords\n");
-        // A tall entry: the editor itself scrolls.
+        // A tall entry: in the old nested-scroll model this was a second
+        // scroller beside the timeline.
         let long: String = (0..200).map(|ix| format!("line {ix}\n")).collect();
         seed_day(&journal, today, &long);
 
@@ -5204,66 +5238,94 @@ mod tests {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
-
-        let wheel = |cx: &mut VisualTestContext, y: f32| {
-            cx.simulate_event(ScrollWheelEvent {
-                position: point(px(700.), px(y)),
-                delta: ScrollDelta::Pixels(point(px(0.), px(-180.))),
-                ..Default::default()
-            });
-        };
-        let editor_offset = |cx: &mut VisualTestContext| {
-            cx.update(|_window, cx| {
-                app.read(cx)
-                    .session()
-                    .and_then(|session| session.active.as_ref())
-                    .map(|active| active.editor.read(cx).scroll_offset())
-                    .unwrap_or_default()
-            })
-        };
-        let stream_top = |cx: &mut VisualTestContext| -> (usize, f32) {
-            cx.update(|_window, cx| {
-                let app = app.read(cx);
-                let session = app.session().expect("an open session");
-                let top = session.stream.logical_scroll_top();
-                (top.item_ix, top.offset_in_item.as_f32())
-            })
-        };
-
-        let stream_before = stream_top(cx);
-        wheel(cx, 300.);
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
-        let offset_after_one = editor_offset(cx);
-        assert!(
-            offset_after_one > px(0.),
-            "the wheel scrolls the open entry first, got {offset_after_one:?}"
-        );
-        assert_eq!(
-            stream_top(cx),
-            stream_before,
-            "the stream must not move while the entry still scrolls"
-        );
 
-        // Keep wheeling: the entry scrolls to its end, then the stream takes
-        // over. The entry stays where it is.
-        for _ in 0..40 {
-            wheel(cx, 300.);
+        // The open entry grows to its content: it has no scroller of its own.
+        let editor_offset = cx.update(|_window, cx| {
+            app.read(cx)
+                .session()
+                .and_then(|session| session.active.as_ref())
+                .map(|active| active.editor.read(cx).scroll_offset())
+                .unwrap_or_default()
+        });
+        assert_eq!(editor_offset, px(0.), "the entry does not scroll itself");
+
+        // The wheel, wherever it sits over the entry, scrolls the timeline.
+        // (Wheel up: opening the day already revealed the caret at its end.)
+        let before = cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let session = app.session().expect("an open session");
+            let top = session.stream.logical_scroll_top();
+            (top.item_ix, top.offset_in_item.as_f32())
+        });
+        for _ in 0..3 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(700.), px(300.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(180.))),
+                ..Default::default()
+            });
             cx.update(|window, cx| {
                 let _ = window.draw(cx);
             });
         }
-        let offset_at_end = editor_offset(cx);
-        assert_eq!(
-            offset_at_end,
-            editor_offset(cx),
-            "the entry holds still once the stream scrolls"
-        );
+        let after = cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let session = app.session().expect("an open session");
+            let top = session.stream.logical_scroll_top();
+            (top.item_ix, top.offset_in_item.as_f32())
+        });
         assert!(
-            stream_top(cx) != stream_before,
-            "once the entry is at its end the stream scrolls"
+            after.1 < before.1 || after.0 < before.0,
+            "the wheel scrolls the timeline, before {before:?} after {after:?}"
         );
+        let editor_offset = cx.update(|_window, cx| {
+            app.read(cx)
+                .session()
+                .and_then(|session| session.active.as_ref())
+                .map(|active| active.editor.read(cx).scroll_offset())
+                .unwrap_or_default()
+        });
+        assert_eq!(editor_offset, px(0.), "the entry still does not scroll");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn a_long_entry_opens_with_its_caret_visible(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let long: String = (0..200).map(|ix| format!("line {ix}\n")).collect();
+        seed_day(&journal, today, &long);
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        // The caret sits at the end of the entry; the timeline scrolls so it
+        // is visible instead of the editor scrolling itself.
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            let session = app.session().expect("an open session");
+            let top = session.stream.logical_scroll_top();
+            assert_eq!(top.item_ix, 0, "still inside today's item");
+            assert!(
+                top.offset_in_item > px(0.),
+                "the stream scrolled down into the entry to show the caret"
+            );
+        });
         fs::remove_dir_all(&dir).ok();
     }
 

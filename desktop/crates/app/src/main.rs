@@ -2147,11 +2147,18 @@ impl JournalSession {
                         .h_full()
                         .child(stream_list.size_full().px_8().pt_8()),
                 )
-                .child(
-                    Scrollbar::new(&self.stream)
-                        .id("stream-scrollbar")
-                        .axis(ScrollbarAxis::Vertical),
-                ),
+                // While a day is open the editor scrolls inside its item and
+                // paints its own bar. Showing the stream's beside it put two
+                // thumbs on the right edge, chasing each other as the entry
+                // bottomed out and the timeline took over. One scroller at a
+                // time: the entry's while editing, the timeline's otherwise.
+                .when(self.active.is_none(), |el| {
+                    el.child(
+                        Scrollbar::new(&self.stream)
+                            .id("stream-scrollbar")
+                            .axis(ScrollbarAxis::Vertical),
+                    )
+                }),
         );
 
         div()
@@ -5171,6 +5178,92 @@ mod tests {
             );
             assert_eq!(session.stream.item_count(), 2, "today and the edge");
         });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn the_open_entry_and_the_stream_do_not_scroll_together(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let yesterday = today.pred_opt().expect("yesterday");
+        seed_day(&journal, yesterday, "# yesterday\n\nwords\n");
+        // A tall entry: the editor itself scrolls.
+        let long: String = (0..200).map(|ix| format!("line {ix}\n")).collect();
+        seed_day(&journal, today, &long);
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let wheel = |cx: &mut VisualTestContext, y: f32| {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(700.), px(y)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-180.))),
+                ..Default::default()
+            });
+        };
+        let editor_offset = |cx: &mut VisualTestContext| {
+            cx.update(|_window, cx| {
+                app.read(cx)
+                    .session()
+                    .and_then(|session| session.active.as_ref())
+                    .map(|active| active.editor.read(cx).scroll_offset())
+                    .unwrap_or_default()
+            })
+        };
+        let stream_top = |cx: &mut VisualTestContext| -> (usize, f32) {
+            cx.update(|_window, cx| {
+                let app = app.read(cx);
+                let session = app.session().expect("an open session");
+                let top = session.stream.logical_scroll_top();
+                (top.item_ix, top.offset_in_item.as_f32())
+            })
+        };
+
+        let stream_before = stream_top(cx);
+        wheel(cx, 300.);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let offset_after_one = editor_offset(cx);
+        assert!(
+            offset_after_one > px(0.),
+            "the wheel scrolls the open entry first, got {offset_after_one:?}"
+        );
+        assert_eq!(
+            stream_top(cx),
+            stream_before,
+            "the stream must not move while the entry still scrolls"
+        );
+
+        // Keep wheeling: the entry scrolls to its end, then the stream takes
+        // over. The entry stays where it is.
+        for _ in 0..40 {
+            wheel(cx, 300.);
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
+        let offset_at_end = editor_offset(cx);
+        assert_eq!(
+            offset_at_end,
+            editor_offset(cx),
+            "the entry holds still once the stream scrolls"
+        );
+        assert!(
+            stream_top(cx) != stream_before,
+            "once the entry is at its end the stream scrolls"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

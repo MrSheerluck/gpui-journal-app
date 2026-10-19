@@ -535,6 +535,12 @@ impl MarkdownEditor {
         scrolled
     }
 
+    /// The editor's scroll offset. Hosts use it to persist or restore a
+    /// position; tests use it to observe wheel chaining.
+    pub fn scroll_offset(&self) -> Pixels {
+        self.scroll.offset()
+    }
+
     fn on_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,

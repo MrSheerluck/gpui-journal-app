@@ -2978,7 +2978,7 @@ impl ActiveDay {
                                         return;
                                     };
                                     editor.update(cx, |editor, cx| {
-                                        editor.insert_image(&alt, &relative, cx)
+                                        editor.insert_media(&alt, &relative, cx)
                                     });
                                 })
                                 .detach();

@@ -364,6 +364,42 @@ pub fn insert_image(selection: Selection, alt: &str, path: &str) -> Edit {
     }
 }
 
+/// Inserts a media reference on its own paragraph, replacing any selection.
+///
+/// Attachments render as cards only when the reference is a whole line, so
+/// this adds the paragraph breaks an inline insert would miss: a leading
+/// blank line when the caret is mid-text, a single break when it sits at the
+/// start of a line, and a trailing newline when text follows.
+pub fn insert_media(text: &str, selection: Selection, alt: &str, path: &str) -> Edit {
+    let (start, end) = (selection.start(), selection.end());
+    let reference = format!("![{alt}]({path})");
+    let before = &text[..start];
+    let after = &text[end..];
+
+    let mut new_text = String::new();
+    if !before.is_empty() {
+        if before.ends_with("\n\n") {
+            // Already at the start of a fresh paragraph.
+        } else if before.ends_with('\n') {
+            new_text.push('\n');
+        } else {
+            new_text.push_str("\n\n");
+        }
+    }
+    new_text.push_str(&reference);
+    // The reference needs its own line; text that follows already starts one.
+    if after.is_empty() || !after.starts_with('\n') {
+        new_text.push('\n');
+    }
+
+    let caret = start + new_text.len();
+    Edit {
+        range: start..end,
+        new_text,
+        new_selection: Selection::caret(caret),
+    }
+}
+
 /// Items offered by the slash menu. Every item applies without the user
 /// typing any Markdown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -677,6 +713,35 @@ mod tests {
 
         let edit = super::insert_image(Selection::caret(0), "shot", "assets/shot.png");
         assert_eq!(apply("", &edit), "![shot](assets/shot.png)");
+    }
+
+    #[test]
+    fn insert_media_places_the_reference_on_its_own_paragraph() {
+        // Empty document: the reference and a terminalline break.
+        let edit = super::insert_media("", Selection::caret(0), "a", "assets/a.mp3");
+        assert_eq!(apply("", &edit), "![a](assets/a.mp3)\n");
+        assert_eq!(edit.new_selection, Selection::caret(19));
+
+        // Mid-text: a paragraph break on both sides.
+        let text = "hello";
+        let edit = super::insert_media(text, Selection::caret(5), "a", "assets/a.mp3");
+        assert_eq!(apply(text, &edit), "hello\n\n![a](assets/a.mp3)\n");
+
+        // Already after a blank line: no extra leading break.
+        let text = "hello\n\n";
+        let edit = super::insert_media(text, Selection::caret(7), "a", "assets/a.mp3");
+        assert_eq!(apply(text, &edit), "hello\n\n![a](assets/a.mp3)\n");
+
+        // At the start of a line with content below: one break before, one
+        // newline after.
+        let text = "hello\nworld";
+        let edit = super::insert_media(text, Selection::caret(6), "a", "assets/a.mp3");
+        assert_eq!(apply(text, &edit), "hello\n\n![a](assets/a.mp3)\nworld");
+
+        // Replacing a selection keeps the reference block-level.
+        let text = "one two three";
+        let edit = super::insert_media(text, Selection::new(4, 7), "a", "assets/a.mp3");
+        assert_eq!(apply(text, &edit), "one \n\n![a](assets/a.mp3)\n three");
     }
 
     #[test]

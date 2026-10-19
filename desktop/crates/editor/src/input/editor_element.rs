@@ -748,8 +748,17 @@ fn paint_media_line(
                 return;
             }
 
-            // Loading or failed: a placeholder box labeled with the file name.
-            let label = format!("▢ {path}");
+            // Loading or failed: a placeholder box. A failed decode names the
+            // file and says so, instead of looking like unrendered markup.
+            let label = match images.get(path) {
+                Some(ImageState::Failed) => {
+                    format!(
+                        "▢ {} — this image format cannot be displayed",
+                        file_name(path)
+                    )
+                }
+                _ => format!("▢ {path}"),
+            };
             let rect = Bounds {
                 origin: point(x, y),
                 size: gpui::size(

@@ -1104,6 +1104,15 @@ impl MarkdownEditor {
         self.apply_command(command, cx);
     }
 
+    /// Inserts a media reference on its own paragraph, replacing any
+    /// selection (the toolbar's Media… flow). Attachments render as cards only
+    /// as whole lines, so this adds the surrounding breaks.
+    pub fn insert_media(&mut self, alt: &str, path: &str, cx: &mut Context<Self>) {
+        let text = self.content(cx);
+        let command = commands::insert_media(&text, self.selection, alt, path);
+        self.apply_command(command, cx);
+    }
+
     /// Wraps the selection in a fenced code block, or inserts an empty one.
     pub fn insert_code_fence(&mut self, cx: &mut Context<Self>) {
         let text = self.content(cx);
@@ -1776,6 +1785,47 @@ mod interaction_tests {
             assert!(
                 editor.read(app).hover_task().is_none(),
                 "hover should clear away from the checkbox"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn insert_media_renders_a_card(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "hello");
+        cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.place_caret_at_end(cx);
+                editor.insert_media("shot", "assets/a.png", cx);
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_, app| {
+            let editor = editor.read(app);
+            assert_eq!(
+                editor.content(app),
+                "hello\n\n![shot](assets/a.png)\n",
+                "the reference sits on its own paragraph"
+            );
+            let plan = editor.plan();
+            let media_line = plan
+                .lines
+                .iter()
+                .find(|line| {
+                    line.fragments.iter().any(|fragment| {
+                        matches!(
+                            fragment.kind,
+                            crate::display::FragmentKind::Widget(
+                                crate::display::WidgetKind::Media { .. }
+                            )
+                        )
+                    })
+                })
+                .expect("the inserted reference projects as a media widget");
+            assert!(
+                media_line.text.starts_with(' '),
+                "the widget substitutes the collapsed markup"
             );
         });
     }

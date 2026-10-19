@@ -24,7 +24,6 @@ use dainiki_editor::{
     destination_path, media_kind,
 };
 use gpui_kit::assets::IconName;
-use gpui_kit::component::Disableable;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants, Toggle, ToggleGroup};
@@ -2087,7 +2086,7 @@ impl JournalSession {
                                             .child(active.block_toolbar(cx)),
                                     ),
                             )
-                            .child(active.insert_menu())
+                            .child(active.insert_menu(&self.root))
                             .child(
                                 Button::new("today-button")
                                     .label("Today")
@@ -2907,17 +2906,19 @@ impl ActiveDay {
             })
     }
 
-    fn insert_menu(&self) -> Popover {
+    fn insert_menu(&self, journal_root: &Path) -> Popover {
         let editor = self.editor.clone();
         let link_input = self.link_input.clone();
-        let document_dir = self.path.parent().map(Path::to_path_buf);
+        // Every attachment lands in one `assets/` folder at the journal root.
+        let journal_root = journal_root.to_path_buf();
+        let assets = journal_root.join("assets");
+        let entry_path = self.path.clone();
 
         let link_editor = editor.clone();
         let link_state = link_input.clone();
         let fence_editor = editor.clone();
         let rule_editor = editor.clone();
         let image_editor = editor.clone();
-        let image_dir = document_dir.clone();
 
         Popover::new("insert-menu")
             .trigger(
@@ -2947,14 +2948,15 @@ impl ActiveDay {
                     .label("Media…")
                     .tooltip("Insert an image, audio or video file")
                     .compact()
-                    .disabled(image_dir.is_none())
                     .on_click({
                         let editor = image_editor.clone();
-                        let directory = image_dir.clone();
+                        let assets = assets.clone();
+                        let entry_path = entry_path.clone();
+                        let journal_root = journal_root.clone();
                         move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                            let Some(directory) = directory.clone() else {
-                                return;
-                            };
+                            let assets = assets.clone();
+                            let entry_path = entry_path.clone();
+                            let journal_root = journal_root.clone();
                             let prompt = cx.prompt_for_paths(PathPromptOptions {
                                 files: true,
                                 directories: false,
@@ -2970,16 +2972,17 @@ impl ActiveDay {
                                     let Some(source) = paths.into_iter().next() else {
                                         return;
                                     };
-                                    let assets = directory.join("assets");
                                     let copied = cx
                                         .background_executor()
                                         .spawn(async move { copy_into_assets(&source, &assets) })
                                         .await;
-                                    let Ok((alt, relative)) = copied else {
+                                    let Ok((alt, name)) = copied else {
                                         return;
                                     };
+                                    let reference =
+                                        media_reference(&entry_path, &journal_root, &name);
                                     editor.update(cx, |editor, cx| {
-                                        editor.insert_media(&alt, &relative, cx)
+                                        editor.insert_media(&alt, &reference, cx)
                                     });
                                 })
                                 .detach();
@@ -3344,45 +3347,84 @@ fn parse_jump_date(input: &str, today: NaiveDate) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(&text.replace('/', "-"), "%Y-%m-%d").ok()
 }
 
-/// Copies a media file into the journal's `assets/` folder under a fresh
-/// name, returning `(alt text, relative markdown path)`. Images, audio and
-/// video all ride the same `![](…)` reference.
+/// Copies a media file into the journal's `assets/` folder under a fresh,
+/// sanitized name, returning `(alt text, file name)`. Images, audio and video
+/// all ride the same `![](…)` reference.
 fn copy_into_assets(source: &Path, assets: &Path) -> Result<(String, String), String> {
     std::fs::create_dir_all(assets).map_err(|error| error.to_string())?;
-    let stem = source
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
+    let original = source
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "media".to_string());
-    let extension = source
-        .extension()
-        .map(|extension| extension.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let alt = original
+        .rsplit_once('.')
+        .map(|(stem, _)| stem.to_string())
+        .unwrap_or_else(|| original.clone())
+        .replace(['[', ']'], "");
+    let sanitized = sanitized_media_name(&original);
+    let (stem, extension) = match sanitized.rsplit_once('.') {
+        Some((stem, extension)) => (stem.to_string(), format!(".{extension}")),
+        None => (sanitized.clone(), String::new()),
+    };
     let mut counter = 0usize;
     let name = loop {
-        let name = if counter == 0 {
-            source
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "media".to_string())
-        } else if extension.is_empty() {
-            format!("{stem}-{counter}")
+        let candidate = if counter == 0 {
+            sanitized.clone()
         } else {
-            format!("{stem}-{counter}.{extension}")
+            format!("{stem}-{counter}{extension}")
         };
-        if !assets.join(&name).exists() {
-            break name;
+        if !assets.join(&candidate).exists() {
+            break candidate;
         }
         counter += 1;
     };
     std::fs::copy(source, assets.join(&name)).map_err(|error| error.to_string())?;
-    // CommonMark wraps a destination with spaces in angle brackets; without
-    // them the reference parses as plain text everywhere.
-    let relative = if name.contains(' ') {
-        format!("assets/<{name}>")
-    } else {
-        format!("assets/{name}")
+    Ok((alt, name))
+}
+
+/// A file name that survives Markdown destinations and every filesystem we
+/// target: letters, digits, `-`, `_` and `.` are kept (Unicode letters
+/// included), anything else collapses to a single dash.
+fn sanitized_media_name(file_name: &str) -> String {
+    let (stem, extension) = match file_name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() && !extension.is_empty() => (stem, extension),
+        _ => (file_name, ""),
     };
-    Ok((stem, relative))
+    let mut cleaned = String::with_capacity(stem.len());
+    let mut dash = false;
+    for ch in stem.chars() {
+        if ch.is_alphanumeric() || ch == '_' || ch == '.' {
+            cleaned.push(ch);
+            dash = false;
+        } else if !dash {
+            cleaned.push('-');
+            dash = true;
+        }
+    }
+    let cleaned = cleaned.trim_matches('-');
+    let cleaned = if cleaned.is_empty() { "media" } else { cleaned };
+    let extension: String = extension
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if extension.is_empty() {
+        cleaned.to_string()
+    } else {
+        format!("{cleaned}.{extension}")
+    }
+}
+
+/// The reference written into an entry for a file in the journal's root
+/// `assets/` folder: the link walks up from the entry's own folder (two
+/// levels for the `YYYY/MM/` layout), so it stays correct if the layout
+/// deepens.
+fn media_reference(entry_path: &Path, journal_root: &Path, file_name: &str) -> String {
+    let depth = entry_path
+        .parent()
+        .and_then(|directory| directory.strip_prefix(journal_root).ok())
+        .map(|relative| relative.components().count())
+        .unwrap_or(2);
+    format!("{}assets/{file_name}", "../".repeat(depth))
 }
 
 impl Render for DainikiApp {
@@ -3816,23 +3858,63 @@ mod tests {
     }
 
     #[test]
-    fn copying_a_spaced_name_writes_a_bracketed_reference() {
+    fn copying_a_spaced_name_sanitizes_it_into_one_assets_folder() {
         let dir = scratch_dir();
         let source = dir.join("Screen Recording 2026-10-15 at 09.54.02-1.mov");
         fs::write(&source, b"x").expect("seed");
         let assets = dir.join("assets");
-        let (alt, relative) = super::copy_into_assets(&source, &assets).expect("copy");
+        let (alt, name) = super::copy_into_assets(&source, &assets).expect("copy");
         assert_eq!(
-            relative, "assets/<Screen Recording 2026-10-15 at 09.54.02-1.mov>",
-            "spaced names are bracketed so the reference parses everywhere"
+            name, "Screen-Recording-2026-10-15-at-09.54.02-1.mov",
+            "spaces and odd characters collapse to dashes"
         );
         assert_eq!(alt, "Screen Recording 2026-10-15 at 09.54.02-1");
-        assert!(
-            assets
-                .join("Screen Recording 2026-10-15 at 09.54.02-1.mov")
-                .exists()
+        assert!(assets.join(&name).exists(), "the copy lands in assets/");
+        assert_eq!(
+            super::media_reference(
+                Path::new("/journal/2026/10/2026-10-19.md"),
+                Path::new("/journal"),
+                &name
+            ),
+            "../../assets/Screen-Recording-2026-10-15-at-09.54.02-1.mov",
+            "entries link back up to the journal's assets folder"
         );
+        assert_eq!(
+            super::media_reference(
+                Path::new("/journal/2026-10-19.md"),
+                Path::new("/journal"),
+                &name
+            ),
+            "assets/Screen-Recording-2026-10-15-at-09.54.02-1.mov",
+            "a shallower layout links one level up"
+        );
+
+        // A second copy of the same name takes a numbered suffix.
+        let (_, again) = super::copy_into_assets(&source, &assets).expect("copy again");
+        assert_eq!(again, "Screen-Recording-2026-10-15-at-09.54.02-1-1.mov");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn media_names_sanitize_to_markdown_safe_filenames() {
+        use super::sanitized_media_name;
+        assert_eq!(
+            sanitized_media_name("Screenshot 2026-10-18 at 08.11.33-1.png"),
+            "Screenshot-2026-10-18-at-08.11.33-1.png"
+        );
+        assert_eq!(sanitized_media_name("a  b\tc.png"), "a-b-c.png");
+        assert_eq!(
+            sanitized_media_name("clip(1)[draft].mov"),
+            "clip-1-draft.mov"
+        );
+        assert_eq!(sanitized_media_name("shot #2?.png"), "shot-2.png");
+        assert_eq!(
+            sanitized_media_name("日本語 ノート.png"),
+            "日本語-ノート.png"
+        );
+        assert_eq!(sanitized_media_name("   .png"), "media.png");
+        assert_eq!(sanitized_media_name("no-extension"), "no-extension");
+        assert_eq!(sanitized_media_name("weird.EXT!"), "weird.EXT");
     }
 
     #[test]
@@ -4402,10 +4484,14 @@ mod tests {
         let today = Local::now().date_naive();
         let yesterday = today.pred_opt().expect("yesterday");
         fs::create_dir_all(yesterday.format("%Y/%m").to_string()).ok();
+        // One file in the month's own assets folder, one in the journal-root
+        // folder the insert flow now targets.
+        fs::create_dir_all(dir.join("assets")).expect("root assets");
+        fs::write(dir.join("assets/root.mp3"), b"x").expect("seed root asset");
         seed_day(
             &journal,
             yesterday,
-            "# Media day\n\nAn audio take:\n\n![](assets/take.mp3)\n\nA clip:\n\n![](assets/clip.mp4)\n",
+            "# Media day\n\nAn audio take:\n\n![](assets/take.mp3)\n\nA root take:\n\n![](../../assets/root.mp3)\n\nA clip:\n\n![](assets/clip.mp4)\n",
         );
 
         let (app, cx) = cx.add_window_view({
@@ -4434,6 +4520,11 @@ mod tests {
             "the audio reference renders as a card"
         );
         assert!(
+            cx.debug_bounds("media-card-../../assets/root.mp3")
+                .is_some(),
+            "a journal-root asset renders as a card"
+        );
+        assert!(
             cx.debug_bounds("media-card-assets/clip.mp4").is_some(),
             "the video reference renders as a card"
         );
@@ -4448,8 +4539,8 @@ mod tests {
                     .iter()
                     .filter(|segment| matches!(segment, super::DaySegment::Media { .. }))
                     .count(),
-                2,
-                "two media segments"
+                3,
+                "three media segments"
             );
         });
         fs::remove_dir_all(&dir).ok();

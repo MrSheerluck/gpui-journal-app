@@ -69,7 +69,7 @@ impl Element for EditorElement {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let text_style = window.text_style();
         let base_font_size = text_style.font_size.to_pixels(window.rem_size());
@@ -82,11 +82,17 @@ impl Element for EditorElement {
         let state = self.layout.clone();
         let measure_state = self.layout.clone();
         let view = self.view.clone();
+        let fit_content = self.view.read(cx).is_fit_content();
         let layout_id = window.request_measured_layout(
             Style {
                 size: Size {
                     width: Length::Auto,
-                    height: Length::Definite(DefiniteLength::Fraction(1.0)),
+                    height: if fit_content {
+                        // Grow to the content: the host's viewport scrolls.
+                        Length::Auto
+                    } else {
+                        Length::Definite(DefiniteLength::Fraction(1.0))
+                    },
                 },
                 ..Default::default()
             },
@@ -187,10 +193,16 @@ impl Element for EditorElement {
 
                 let fill = Size {
                     width: wrap_width,
-                    height: known_dimensions.height.or(match available_space.height {
-                        AvailableSpace::Definite(height) => Some(height),
-                        _ => None,
-                    }),
+                    height: if fit_content {
+                        // The content height is the element's height; there is
+                        // no inner viewport to fill.
+                        Some(content_size.height)
+                    } else {
+                        known_dimensions.height.or(match available_space.height {
+                            AvailableSpace::Definite(height) => Some(height),
+                            _ => None,
+                        })
+                    },
                 };
                 Size {
                     width: fill.width.unwrap_or(content_size.width),
@@ -324,7 +336,6 @@ impl Element for EditorElement {
             self.view.update(cx, |view, _| view.clear_reveal());
         }
 
-        let viewport_bottom = bounds.origin.y + bounds.size.height;
         let max_offset = (inner.content_height - bounds.size.height).max(Pixels::ZERO);
         let offset = clamp_offset(self.scroll.offset(), max_offset);
         let scroll_progress = if max_offset > Pixels::ZERO {
@@ -332,6 +343,17 @@ impl Element for EditorElement {
         } else {
             0.0
         };
+
+        // A fit-content editor is taller than the window: cull its lines
+        // against the real clip, not its own bounds.
+        let fit_content = self.view.read(cx).is_fit_content();
+        let cull = if fit_content {
+            let clip = window.content_mask();
+            clip.bounds
+        } else {
+            bounds
+        };
+        let cull_bottom = cull.origin.y + cull.size.height;
 
         let show_selection = !selection_state.is_caret();
         let selection = (selection_state.start(), selection_state.end());
@@ -342,7 +364,7 @@ impl Element for EditorElement {
             for (ix, laid) in inner.lines.iter().enumerate() {
                 let height = laid.height;
                 let line_bottom = line_origin.y + height;
-                if line_bottom > bounds.origin.y && line_origin.y < viewport_bottom {
+                if line_bottom > cull.origin.y && line_origin.y < cull_bottom {
                     if let Some(projected) = plan.lines.get(ix) {
                         if matches!(projected.style, LineStyle::Code { marker: false }) {
                             let block = Bounds {

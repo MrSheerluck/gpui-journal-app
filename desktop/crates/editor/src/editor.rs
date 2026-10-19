@@ -94,6 +94,10 @@ pub struct MarkdownEditor {
     /// the caret into view. Scrolling never triggers it, so the wheel is
     /// never fought by the reveal.
     reveal_pending: bool,
+    /// Grow to the content height instead of filling the host's box; the
+    /// host's scroll viewport then owns scrolling (one scroller for a
+    /// timeline of entries).
+    fit_content: bool,
 }
 
 /// Decoded state of one referenced image, keyed by its destination string.
@@ -158,6 +162,7 @@ impl MarkdownEditor {
             slash: None,
             slash_dismissed: None,
             reveal_pending: true,
+            fit_content: false,
         };
         this.spawn_blink(cx);
         this
@@ -539,6 +544,44 @@ impl MarkdownEditor {
     /// position; tests use it to observe wheel chaining.
     pub fn scroll_offset(&self) -> Pixels {
         self.scroll.offset()
+    }
+
+    /// Grows the editor to its content instead of filling the host's box.
+    ///
+    /// Use it when the host owns the scroll viewport — a timeline of entries
+    /// is one scroller — and reveal the caret with
+    /// [`Self::caret_window_rect`] instead of relying on the editor's own
+    /// scrollbar.
+    pub fn fit_content(&mut self, cx: &mut Context<Self>) {
+        if self.fit_content {
+            return;
+        }
+        self.fit_content = true;
+        cx.notify();
+    }
+
+    pub(crate) fn is_fit_content(&self) -> bool {
+        self.fit_content
+    }
+
+    /// The caret's rectangle in window coordinates, from the last layout, or
+    /// `None` before the first frame. Hosts that own the viewport scroll this
+    /// rect into view while typing.
+    pub fn caret_window_rect(&self) -> Option<Bounds<Pixels>> {
+        let plan_index = self.plan.line_for_source(self.selection.head())?;
+        let projected = self.plan.lines.get(plan_index)?;
+        let bounds = self.layout.bounds()?;
+        let top = self.layout.line_top(plan_index)?;
+        let (x, y, height) = self.layout.with_line(plan_index, |line, height| {
+            let display = projected.display_for_source(self.selection.head());
+            line.position_for_index(display, height)
+                .map(|position| (position.x, position.y, height))
+        })??;
+        let offset = self.scroll.offset().max(Pixels::ZERO);
+        Some(Bounds {
+            origin: point(bounds.origin.x + x, bounds.origin.y + top + y - offset),
+            size: gpui::size(px(2.), height),
+        })
     }
 
     fn on_scroll_wheel(

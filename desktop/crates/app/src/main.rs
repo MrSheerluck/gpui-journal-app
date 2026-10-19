@@ -3064,11 +3064,23 @@ enum DaySegment {
 }
 
 /// Splits day text at whole-line `![alt](destination)` references. Inline
-/// references stay inside the text runs and render as markdown.
+/// references stay inside the text runs and become links (so the reading view
+/// shows a name rather than raw markup); fenced code is left untouched.
 fn day_segments(text: &str) -> Vec<DaySegment> {
     let mut segments: Vec<DaySegment> = Vec::new();
     let mut pending = String::new();
+    let mut in_fence = false;
     for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            pending.push_str(line);
+            continue;
+        }
+        if in_fence {
+            pending.push_str(line);
+            continue;
+        }
         match whole_line_media(line.trim()) {
             Some((destination, kind)) => {
                 if !pending.is_empty() {
@@ -3076,13 +3088,48 @@ fn day_segments(text: &str) -> Vec<DaySegment> {
                 }
                 segments.push(DaySegment::Media { destination, kind });
             }
-            None => pending.push_str(line),
+            None => pending.push_str(&inline_media_links(line)),
         }
     }
     if !pending.is_empty() {
         segments.push(DaySegment::Text(pending));
     }
     segments
+}
+
+/// Rewrites inline `![alt](destination)` references into `[label](destination)`
+/// links: the reading view has no inline media cards, and a raw path reads as
+/// a bug. The label is the alt text, or the file name when there is none.
+fn inline_media_links(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find("![") {
+        output.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(alt_end) = after.find("](") else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let Some(destination_end) = after[alt_end + 2..].find(')') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let alt = after[..alt_end].trim();
+        let destination = &after[alt_end + 2..alt_end + 2 + destination_end];
+        if destination.is_empty() {
+            output.push_str(&rest[start..start + 2 + alt_end + 2 + destination_end + 1]);
+        } else {
+            let label = if alt.is_empty() {
+                destination.rsplit('/').next().unwrap_or(destination)
+            } else {
+                alt
+            };
+            output.push_str(&format!("[{label}]({destination})"));
+        }
+        rest = &after[alt_end + 2 + destination_end + 1..];
+    }
+    output.push_str(rest);
+    output
 }
 
 /// The destination and kind of a whole-line `![alt](destination)`, when the
@@ -4400,16 +4447,28 @@ mod tests {
         );
         assert!(matches!(&segments[4], DaySegment::Text(text) if text == "\nend\n"));
 
-        // Inline references stay markdown, and unknown files stay text.
+        // Inline references become links, with the alt text or file name as
+        // the label; unknown files stay text.
         let inline = "text ![a](p.png) more\n";
         assert!(matches!(
             day_segments(inline).as_slice(),
-            [DaySegment::Text(_)]
+            [DaySegment::Text(text)] if text == "text [a](p.png) more\n"
+        ));
+        let no_alt = "text ![](assets/p.png) more\n";
+        assert!(matches!(
+            day_segments(no_alt).as_slice(),
+            [DaySegment::Text(text)] if text == "text [p.png](assets/p.png) more\n"
         ));
         let file = "![](notes.txt)\n";
         assert!(matches!(
             day_segments(file).as_slice(),
             [DaySegment::Text(_)]
+        ));
+        // Fenced code keeps its source untouched.
+        let fence = "```\n![a](p.png)\n```\n";
+        assert!(matches!(
+            day_segments(fence).as_slice(),
+            [DaySegment::Text(text)] if text == fence
         ));
         // Images are media too.
         let image = "![](assets/photo.png)\n";

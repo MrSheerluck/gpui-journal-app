@@ -512,9 +512,11 @@ fn line_media(fragments: &[Fragment]) -> Option<(MediaKind, String)> {
     })
 }
 
-/// The file name at the end of a destination path.
-fn file_name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+/// The file name at the end of a destination (brackets and percent-escapes
+/// resolved).
+fn file_name(path: &str) -> String {
+    let cleaned = crate::display::destination_path(path);
+    cleaned.rsplit('/').next().unwrap_or(&cleaned).to_string()
 }
 
 /// Where a widget fragment sits on its line, and the horizontal centre of the
@@ -848,7 +850,7 @@ fn paint_media_line(
             if !framed {
                 let label = match playback.and_then(|state| state.error.as_deref()) {
                     Some(error) => format!("{} — {error}", file_name(path)),
-                    None => file_name(path).to_string(),
+                    None => file_name(path),
                 };
                 paint_label(
                     &label,

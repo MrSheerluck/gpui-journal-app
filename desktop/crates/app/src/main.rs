@@ -21,7 +21,7 @@ use chrono::{Datelike, Local, NaiveDate};
 use dainiki_editor::{
     Buffer, EditorEvent, EditorTheme, MarkdownEditor, MediaKind, MediaPlaybackState,
     commands::{BlockFormat, InlineFormat},
-    media_kind,
+    destination_path, media_kind,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Disableable;
@@ -1522,16 +1522,17 @@ impl JournalSession {
         playback: Option<&(String, MediaPlaybackState)>,
         this: &WeakEntity<DainikiApp>,
     ) -> AnyElement {
+        let cleaned = destination_path(destination);
         let resolved = journal::Journal::new(&self.root)
             .entry_path(date)
             .parent()
-            .map(|directory| directory.join(destination))
-            .unwrap_or_else(|| PathBuf::from(destination));
+            .map(|directory| directory.join(&cleaned))
+            .unwrap_or_else(|| PathBuf::from(&cleaned));
         let state = playback
             .filter(|(current, _)| current == destination)
             .map(|(_, state)| state.clone())
             .unwrap_or_default();
-        let name = destination.rsplit('/').next().unwrap_or(destination);
+        let name = cleaned.rsplit('/').next().unwrap_or(&cleaned).to_string();
 
         if kind == MediaKind::Image {
             return div()
@@ -1652,7 +1653,7 @@ impl JournalSession {
                                         div()
                                             .text_size(px(12.))
                                             .text_color(brand::on_surface_variant())
-                                            .child(name.to_string()),
+                                            .child(name.clone()),
                                     )
                                     .children(error),
                             )
@@ -1680,7 +1681,7 @@ impl JournalSession {
                                     div()
                                         .text_size(px(12.))
                                         .text_color(brand::on_surface_variant())
-                                        .child(name.to_string()),
+                                        .child(name.clone()),
                                 )
                                 .children(error),
                         )
@@ -3374,7 +3375,14 @@ fn copy_into_assets(source: &Path, assets: &Path) -> Result<(String, String), St
         counter += 1;
     };
     std::fs::copy(source, assets.join(&name)).map_err(|error| error.to_string())?;
-    Ok((stem, format!("assets/{name}")))
+    // CommonMark wraps a destination with spaces in angle brackets; without
+    // them the reference parses as plain text everywhere.
+    let relative = if name.contains(' ') {
+        format!("assets/<{name}>")
+    } else {
+        format!("assets/{name}")
+    };
+    Ok((stem, relative))
 }
 
 impl Render for DainikiApp {
@@ -3804,6 +3812,26 @@ mod tests {
                 "the clicked toggle should apply a block format, got {content:?}"
             );
         });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn copying_a_spaced_name_writes_a_bracketed_reference() {
+        let dir = scratch_dir();
+        let source = dir.join("Screen Recording 2026-10-15 at 09.54.02-1.mov");
+        fs::write(&source, b"x").expect("seed");
+        let assets = dir.join("assets");
+        let (alt, relative) = super::copy_into_assets(&source, &assets).expect("copy");
+        assert_eq!(
+            relative, "assets/<Screen Recording 2026-10-15 at 09.54.02-1.mov>",
+            "spaced names are bracketed so the reference parses everywhere"
+        );
+        assert_eq!(alt, "Screen Recording 2026-10-15 at 09.54.02-1");
+        assert!(
+            assets
+                .join("Screen Recording 2026-10-15 at 09.54.02-1.mov")
+                .exists()
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -4431,6 +4459,24 @@ mod tests {
     fn day_segments_split_whole_line_media_only() {
         use super::{DaySegment, day_segments};
         use dainiki_editor::MediaKind;
+
+        // The exact shape a real entry takes: spacey macOS attachment names,
+        // bare (the fallback grammar handles it) and bracketed.
+        let real = "Ok Testing this journal write now #thoughts\n\n\
+                    ![Screenshot 2026-10-18 at 08.11.33](assets/Screenshot 2026-10-18 at 08.11.33-1.png)\n\n\
+                    ![Screen Recording 2026-10-15 at 09.54.02](assets/Screen Recording 2026-10-15 at 09.54.02-1.mov)\n";
+        let segments = day_segments(real);
+        assert_eq!(segments.len(), 4, "text, image, text, video");
+        assert!(
+            matches!(&segments[1], DaySegment::Media { kind, destination }
+                if *kind == MediaKind::Image
+                    && destination == "assets/Screenshot 2026-10-18 at 08.11.33-1.png")
+        );
+        assert!(
+            matches!(&segments[3], DaySegment::Media { kind, destination }
+                if *kind == MediaKind::Video
+                    && destination == "assets/Screen Recording 2026-10-15 at 09.54.02-1.mov")
+        );
 
         let text = "intro\n\n![](assets/a.mp3)\n\nmiddle\n\n![](assets/b.mp4)\n\nend\n";
         let segments = day_segments(text);

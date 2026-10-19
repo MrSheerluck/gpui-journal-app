@@ -14,7 +14,7 @@ use gpui::{
 use crate::{
     buffer::Buffer,
     commands::{self, BlockFormat, Edit as CommandEdit, InlineFormat, SlashItem},
-    display::{DisplayPlan, MediaKind, WidgetKind, media_kind},
+    display::{DisplayPlan, MediaKind, WidgetKind, destination_path, media_kind},
     input::{
         EditorElement, EditorLayout, EditorScrollState, Selection,
         history::{Edit, History, MergeKind},
@@ -455,9 +455,9 @@ impl MarkdownEditor {
         self.media_frames.clone()
     }
 
-    /// The resolved filesystem path for an image destination.
+    /// The resolved filesystem path for a media destination.
     fn resolved_asset_path(&self, destination: &str) -> PathBuf {
-        let path = PathBuf::from(destination);
+        let path = PathBuf::from(destination_path(destination));
         if path.is_absolute() {
             return path;
         }
@@ -509,6 +509,10 @@ impl MarkdownEditor {
                     editor.images.insert(destination, state);
                     editor.revision += 1;
                     cx.notify();
+                    // A plain notify can be dropped when it lands between
+                    // frames; a decoded image must reach the screen without
+                    // waiting for the next input event.
+                    cx.refresh_windows();
                 })
                 .ok();
             })

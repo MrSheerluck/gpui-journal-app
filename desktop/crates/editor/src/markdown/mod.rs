@@ -200,6 +200,12 @@ impl MarkdownIndex {
         self.inline_regions = inline_regions;
 
         constructs.sort_by_key(|construct| (construct.range.start, construct.range.end));
+        // CommonMark rejects bare destinations with spaces, so the grammar
+        // yields no Image for the most common macOS attachment names
+        // (`assets/Screen Recording ….mov`). Accept whole-line references
+        // anyway; destinations the grammar did parse overlap an existing
+        // Image and are skipped.
+        add_spaced_whole_line_images(text, &mut constructs);
         self.block_tree = Some(tree);
         self.constructs = constructs;
         let mut highlights = Vec::new();
@@ -433,6 +439,76 @@ impl MarkdownIndex {
 /// Shifts a slice-relative byte range into document coordinates.
 fn shift(range: Range<usize>, offset: usize) -> Range<usize> {
     range.start + offset..range.end + offset
+}
+
+/// Appends an `Image` construct for every whole-line `![alt](destination)`
+/// whose destination contains spaces — a form CommonMark rejects, which is
+/// exactly how macOS names attachments. Constructs the grammar already found
+/// (angle-bracketed `<…>` or percent-encoded destinations) overlap the line
+/// and are left in place.
+fn add_spaced_whole_line_images(text: &str, out: &mut Vec<Construct>) {
+    // For a spaced destination the grammar emits a partial `Image` fragment
+    // that stops short of the closing paren; drop every Image whose source is
+    // not a complete reference before re-recognising the whole-line form.
+    out.retain(|construct| {
+        construct.kind != ConstructKind::Image
+            || is_complete_image_reference(&text[construct.range.clone()])
+    });
+
+    let mut line_start = 0;
+    for line in text.split_inclusive('\n') {
+        let without_newline = line.trim_end_matches(['\n', '\r']);
+        let leading = without_newline.len() - without_newline.trim_start().len();
+        let content = without_newline.trim_end();
+        let content = &content[leading..];
+        if let Some((alt, destination)) = spaced_whole_line_image(content) {
+            let start = line_start + leading;
+            let range = start..start + content.len();
+            let already = out.iter().any(|construct| {
+                construct.kind == ConstructKind::Image
+                    && construct.range.start < range.end
+                    && range.start < construct.range.end
+            });
+            if !already {
+                let alt_start = start + 2;
+                let destination_start = alt_start + alt.len() + 2;
+                out.push(Construct {
+                    kind: ConstructKind::Image,
+                    range,
+                    markers: Vec::new(),
+                    inner: vec![
+                        alt_start..alt_start + alt.len(),
+                        destination_start..destination_start + destination.len(),
+                    ],
+                });
+            }
+        }
+        line_start += line.len();
+    }
+    out.sort_by_key(|construct| (construct.range.start, construct.range.end));
+}
+
+/// Whether a construct's source is a complete `![…](…)` reference. The
+/// grammar can emit truncated fragments; only complete ones are trusted.
+fn is_complete_image_reference(source: &str) -> bool {
+    source.starts_with("![") && source.contains("](") && source.ends_with(')')
+}
+
+/// `![alt](destination)` with spaces in the destination: the bare form the
+/// grammar drops. Parentheses in either part would make the boundaries
+/// ambiguous, so those stay literal text.
+fn spaced_whole_line_image(content: &str) -> Option<(&str, &str)> {
+    let rest = content.strip_prefix("![")?;
+    let (alt, rest) = rest.split_once("](")?;
+    let destination = rest.strip_suffix(')')?;
+    if destination.is_empty()
+        || !destination.contains(' ')
+        || destination.contains(['(', ')'])
+        || alt.contains(['[', ']'])
+    {
+        return None;
+    }
+    Some((alt, destination))
 }
 
 /// Shifts a byte range by a signed delta, clamped at zero.
@@ -703,6 +779,55 @@ mod tests {
         assert_eq!(
             &"![](assets/x.png)\n\n"[image.inner[1].clone()],
             "assets/x.png"
+        );
+    }
+
+    #[test]
+    fn spaced_whole_line_images_are_recognised() {
+        // The exact shape macOS attachments take: the bare destination has
+        // spaces, which CommonMark rejects, so the grammar alone would leave
+        // the line as literal text.
+        let text = "Ok Testing this journal write now #thoughts\n\n\
+             ![Screenshot 2026-10-18 at 08.11.33](assets/Screenshot 2026-10-18 at 08.11.33-1.png)\n\n\
+             ![Screen Recording](assets/Clip-1.mov)\n";
+        let index = index_of(text);
+        let images: Vec<&Construct> = index
+            .constructs()
+            .iter()
+            .filter(|c| c.kind == ConstructKind::Image)
+            .collect();
+        assert_eq!(images.len(), 2, "the spaced reference plus the clean one");
+        let spaced = images
+            .iter()
+            .find(|image| text[image.inner[1].clone()].contains(' '))
+            .expect("the spaced reference is recognised");
+        assert_eq!(
+            &text[spaced.inner[1].clone()],
+            "assets/Screenshot 2026-10-18 at 08.11.33-1.png"
+        );
+        assert_eq!(
+            &text[spaced.inner[0].clone()],
+            "Screenshot 2026-10-18 at 08.11.33"
+        );
+        // The whole line is covered, so the projection treats it as whole-line.
+        assert_eq!(
+            &text[spaced.range.clone()],
+            "![Screenshot 2026-10-18 at 08.11.33](assets/Screenshot 2026-10-18 at 08.11.33-1.png)"
+        );
+    }
+
+    #[test]
+    fn inline_spaced_images_stay_text() {
+        // The fallback is whole-line only: a spaced reference inside a
+        // sentence stays literal text (nothing to card there).
+        let text = "text ![a](assets/a b.png) more\n";
+        let index = index_of(text);
+        assert!(
+            index
+                .constructs()
+                .iter()
+                .all(|c| c.kind != ConstructKind::Image),
+            "inline spaced references are not images"
         );
     }
 

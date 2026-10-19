@@ -81,11 +81,27 @@ pub enum MediaKind {
     File,
 }
 
+/// The file a media destination names: CommonMark wraps destinations that
+/// contain spaces in angle brackets (`<assets/a b.png>`), and some writers
+/// percent-encode them instead; both name the same file on disk.
+pub fn destination_path(destination: &str) -> String {
+    let inner = destination
+        .trim()
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .unwrap_or(destination.trim());
+    if inner.contains("%20") {
+        inner.replace("%20", " ")
+    } else {
+        inner.to_string()
+    }
+}
+
 /// Classifies a media destination by extension, case-insensitively and
 /// ignoring URL query/fragment suffixes. Unknown extensions are `File`.
 pub fn media_kind(destination: &str) -> MediaKind {
-    let path = destination.trim();
-    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let path = destination_path(destination);
+    let path = path.split(['?', '#']).next().unwrap_or(&path);
     let extension = path
         .rsplit_once('.')
         .map(|(_, extension)| extension.to_ascii_lowercase())
@@ -362,8 +378,10 @@ fn project_line(
             ConstructKind::Image => {
                 if !revealed(construct, selection) {
                     let destination = construct.inner.get(1).map(|range| &text[range.clone()]);
-                    let file_name = destination
-                        .and_then(|destination| destination.rsplit('/').next())
+                    let cleaned = destination.map(destination_path);
+                    let file_name = cleaned
+                        .as_deref()
+                        .and_then(|path| path.rsplit('/').next())
                         .unwrap_or("image");
                     let whole_line = is_whole_line(&construct.range, &source, text);
                     if whole_line {
@@ -890,6 +908,44 @@ mod tests {
         assert_eq!(media_kind("assets/notes.txt"), MediaKind::File);
         assert_eq!(media_kind("assets/no_dot"), MediaKind::File);
         assert_eq!(media_kind("assets/v1.2/x"), MediaKind::File);
+        // Spaced destinations: angle-bracketed and percent-encoded forms.
+        assert_eq!(
+            media_kind("<assets/Screen Shot 2026.png>"),
+            MediaKind::Image
+        );
+        assert_eq!(
+            media_kind("assets/Screen%20Recording.mov"),
+            MediaKind::Video
+        );
+    }
+
+    #[test]
+    fn destination_path_unwraps_brackets_and_escapes() {
+        use super::destination_path;
+        assert_eq!(destination_path("assets/a.png"), "assets/a.png");
+        assert_eq!(destination_path("<assets/a b.png>"), "assets/a b.png");
+        assert_eq!(destination_path("assets/a%20b.png"), "assets/a b.png");
+        assert_eq!(destination_path("  assets/a.png  "), "assets/a.png");
+        assert_eq!(destination_path("<assets/a b.png>"), "assets/a b.png");
+        assert_eq!(destination_path(""), "");
+    }
+
+    #[test]
+    fn bracketed_whole_line_media_becomes_a_widget() {
+        let text = "![Shot](<assets/a b.png>)\n";
+        let plan = plan_for(text, Selection::caret(30));
+        let line = &plan.lines[0];
+        let (_, widget) = line.widget_at_display(0).expect("media widget");
+        assert_eq!(
+            widget,
+            WidgetKind::Media {
+                kind: super::MediaKind::Image,
+                path: "<assets/a b.png>".into()
+            }
+        );
+        // Inline fallback label uses the cleaned file name.
+        let plan = plan_for("see ![s](<assets/a b.png>) here\n", Selection::caret(0));
+        assert_eq!(plan.lines[0].text, "see [image: a b.png] here");
     }
 
     #[test]

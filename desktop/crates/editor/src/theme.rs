@@ -13,6 +13,8 @@ pub struct EditorTheme {
     pub code_background: Hsla,
     /// Background across fenced code block content lines.
     pub code_block_background: Hsla,
+    /// The light rounded track a waveform sits in (the landing's players).
+    pub media_waveform_track: Hsla,
     /// Background behind `==highlight==`.
     pub highlight_background: Hsla,
     /// Link text color.
@@ -79,6 +81,7 @@ impl Default for EditorTheme {
             media_border: rgba(0x00000014).into(),
             media_control: rgba(0x1F2328E6).into(),
             media_track: rgba(0x0000001A).into(),
+            media_waveform_track: rgba(0x2F6FEB14).into(),
             media_progress: rgb(0x2F6FEB).into(),
             tooltip_background: rgba(0x1F2328F2).into(),
             tooltip_text: rgb(0xFAFAF8).into(),

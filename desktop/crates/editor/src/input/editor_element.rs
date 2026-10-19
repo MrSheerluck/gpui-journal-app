@@ -141,7 +141,7 @@ impl Element for EditorElement {
                                     None => px(120.),
                                 }
                             }
-                            MediaKind::Audio => px(84.),
+                            MediaKind::Audio => px(98.),
                             MediaKind::Video => {
                                 let width = wrap_width.unwrap_or(px(480.));
                                 // A frame, once decoded, decides the card's
@@ -549,6 +549,8 @@ fn paint_slash_menu(
                 row.origin.x + px(10.),
                 row.origin.y + (row_height - px(14.)) / 2.,
             ),
+            px(12.),
+            theme.text.opacity(0.6),
             theme,
             window,
             cx,
@@ -832,6 +834,8 @@ fn paint_media_line(
                     rect.origin.x + px(8.),
                     rect.origin.y + (rect.size.height - px(14.)) / 2.,
                 ),
+                px(12.),
+                theme.text.opacity(0.6),
                 theme,
                 window,
                 cx,
@@ -843,7 +847,7 @@ fn paint_media_line(
                 // it, which follows the frame's shape: the picture fills it
                 // with no letterbox bands.
                 MediaKind::Video => (line_height.max(px(120.)), 10., px(22.)),
-                _ => ((line_height - px(8.)).clamp(px(64.), px(84.)), 8., px(17.)),
+                _ => ((line_height - px(6.)).clamp(px(78.), px(98.)), 8., px(17.)),
             };
             let width = bounds.size.width.min(px(560.));
             let card = Bounds {
@@ -894,8 +898,8 @@ fn paint_media_line(
                     card.origin.y + card.size.height / 2.,
                 ),
                 _ => point(
-                    card.origin.x + px(14.) + button_radius,
-                    card.origin.y + px(30.),
+                    card.origin.x + px(12.) + button_radius,
+                    card.origin.y + px(12.) + button_radius,
                 ),
             };
             let playing = playback.is_some_and(|state| state.playing);
@@ -915,7 +919,7 @@ fn paint_media_line(
                     Some(duration) => format!("{} / {}", clock(state.position_ms), clock(duration)),
                     None => clock(state.position_ms),
                 },
-                None => String::new(),
+                None => clock(0),
             });
             // The controls live in their own layer: gpui paints an image's
             // sprite after the quads of the layer it was added to, so a
@@ -933,19 +937,31 @@ fn paint_media_line(
                         None => file_name(path),
                     };
                     let label_y = if kind == MediaKind::Audio {
-                        card.origin.y + px(10.)
+                        card.origin.y + px(22.)
                     } else {
                         card.origin.y + card.size.height - px(22.)
                     };
-                    paint_label(&label, point(label_x, label_y), theme, window, cx);
-                    if let Some(time) = time_label.as_deref()
-                        && !time.is_empty()
-                    {
+                    let (label_size, label_color) = if kind == MediaKind::Audio {
+                        (px(14.), theme.text)
+                    } else {
+                        (px(12.), theme.text.opacity(0.6))
+                    };
+                    paint_label(
+                        &label,
+                        point(label_x, label_y),
+                        label_size,
+                        label_color,
+                        theme,
+                        window,
+                        cx,
+                    );
+                    if let Some(time) = time_label.as_deref() {
                         paint_label_right(
                             time,
                             card.origin.x + card.size.width - px(14.),
                             label_y,
-                            theme,
+                            px(12.),
+                            theme.text.opacity(0.6),
                             window,
                             cx,
                         );
@@ -963,22 +979,30 @@ fn paint_media_line(
                 .unwrap_or(0.);
             window.paint_layer(card, |window| {
                 if kind == MediaKind::Audio {
-                    // The hero's waveform: deterministic ticks, the played
-                    // stretch in the accent, the rest in the track colour.
+                    // The hero's waveform: a light rounded track holding
+                    // deterministic ticks, the played stretch in the accent.
+                    let track = Bounds {
+                        origin: point(
+                            card.origin.x + px(12.),
+                            card.origin.y + card.size.height - px(12.) - px(28.),
+                        ),
+                        size: gpui::size((card.size.width - px(24.)).max(px(1.)), px(28.)),
+                    };
+                    window.paint_quad(fill(track, theme.media_waveform_track).corner_radii(8.));
                     const TICKS: usize = 40;
-                    let left = card.origin.x + px(12.);
-                    let right = card.origin.x + card.size.width - px(12.);
+                    let left = track.origin.x + px(8.);
+                    let right = track.origin.x + track.size.width - px(8.);
                     let width = (right - left).max(px(1.));
                     let pitch = width / TICKS as f32;
                     let tick_width = (pitch - px(2.)).max(px(1.));
-                    let base_y = card.origin.y + card.size.height - px(12.);
+                    let center_y = track.origin.y + track.size.height / 2.;
                     let seed: usize = path.bytes().map(|byte| byte as usize).sum();
                     for tick in 0..TICKS {
                         let at = tick as f32 / (TICKS - 1) as f32;
                         let amplitude = 0.3 + 0.7 * (((seed + tick * 7) % 11) as f32 / 10.);
-                        let height = px(5. + 15. * amplitude);
+                        let height = px(5. + 13. * amplitude);
                         let bar = Bounds {
-                            origin: point(left + pitch * tick as f32, base_y - height),
+                            origin: point(left + pitch * tick as f32, center_y - height / 2.),
                             size: gpui::size(tick_width, height),
                         };
                         let color = if at <= fraction {
@@ -991,11 +1015,8 @@ fn paint_media_line(
                     return;
                 }
                 let track_bounds = Bounds {
-                    origin: point(
-                        card.origin.x + px(12.),
-                        card.origin.y + card.size.height - px(10.),
-                    ),
-                    size: gpui::size((card.size.width - px(24.)).max(px(0.)), px(2.)),
+                    origin: point(card.origin.x, card.origin.y + card.size.height - px(3.)),
+                    size: gpui::size(card.size.width.max(px(0.)), px(3.)),
                 };
                 window.paint_quad(fill(track_bounds, theme.media_track).corner_radii(1.));
                 let elapsed = Bounds {
@@ -1020,6 +1041,8 @@ fn paint_media_line(
             paint_label(
                 &label,
                 point(chip.origin.x + px(8.), chip.origin.y + px(5.)),
+                px(12.),
+                theme.text.opacity(0.6),
                 theme,
                 window,
                 cx,
@@ -1121,16 +1144,17 @@ fn paint_label_right(
     label: &str,
     right: Pixels,
     y: Pixels,
-    theme: &EditorTheme,
+    size: Pixels,
+    color: Hsla,
     window: &mut Window,
     cx: &mut App,
 ) {
     let mut style = window.text_style().clone();
-    style.font_size = px(12.).into();
-    style.color = theme.text.opacity(0.6);
+    style.font_size = size.into();
+    style.color = color;
     let Ok(mut shaped) = window.text_system().shape_text(
         SharedString::new(label),
-        px(12.),
+        size,
         &[style.to_run(label.len())],
         None,
         None,
@@ -1157,16 +1181,19 @@ fn paint_label_right(
 fn paint_label(
     label: &str,
     origin: Point<Pixels>,
+    size: Pixels,
+    color: Hsla,
     theme: &EditorTheme,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let _ = theme;
     let mut style = window.text_style().clone();
-    style.font_size = px(12.).into();
-    style.color = theme.text.opacity(0.6);
+    style.font_size = size.into();
+    style.color = color;
     let Ok(mut shaped) = window.text_system().shape_text(
         SharedString::new(label),
-        px(12.),
+        size,
         &[style.to_run(label.len())],
         None,
         None,

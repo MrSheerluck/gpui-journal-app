@@ -64,6 +64,11 @@ const MEDIA_TICK: Duration = Duration::from_millis(100);
 /// header under the cursor asks them to.
 const DAY_HEADER_GROUP: &str = "day-header";
 
+/// How many scrolls a single caret reveal may spend. A wrong landing (a stale
+/// layout, item heights not yet measured) corrects itself on the next frame;
+/// the bound keeps a caret that cannot be brought into view from spinning.
+const REVEAL_ATTEMPTS: u8 = 4;
+
 /// The stream's viewport margins for caret keeping-visible: the chrome above
 /// (title bar, toolbar, panels) and a little air below.
 const STREAM_TOP_MARGIN: f32 = 120.;
@@ -113,6 +118,11 @@ struct JournalSession {
     /// Set when the open day's caret should be scrolled into view on the next
     /// frame (typing, or a freshly opened day whose caret sits at the end).
     reveal_caret: Cell<bool>,
+    /// The caret rect the last reveal saw, for the settle check.
+    reveal_rect: Cell<Option<Bounds<Pixels>>>,
+    /// Scrolls spent on the pending reveal; bounded so a caret that cannot be
+    /// brought into view (a stale layout, a resize mid-flight) never spins.
+    reveal_attempts: Cell<u8>,
     /// The days the stream's items currently stand for (newest first); the
     /// closing edge is one extra item after them.
     stream_dates: RefCell<Vec<NaiveDate>>,
@@ -335,6 +345,8 @@ impl DainikiApp {
             jump_error: None,
             search_palette,
             reveal_caret: Cell::new(true),
+            reveal_rect: Cell::new(None),
+            reveal_attempts: Cell::new(0),
             stream_dates: RefCell::new(Vec::new()),
             stream_items: Cell::new(0),
             today,
@@ -421,7 +433,7 @@ impl DainikiApp {
                 if let Some(session) = app.session_mut() {
                     // A fit-content editor cannot scroll itself; the timeline
                     // keeps the caret visible.
-                    session.reveal_caret.set(true);
+                    session.request_reveal_caret();
                 }
                 app.schedule_save(cx);
                 cx.notify();
@@ -470,7 +482,7 @@ impl DainikiApp {
                     session.active = Some(active);
                     // The caret starts at the entry's end: unless the day is
                     // short, the stream scrolls it into view next frame.
-                    session.reveal_caret.set(true);
+                    session.request_reveal_caret();
                 }
                 cx.notify();
             }
@@ -1793,14 +1805,29 @@ impl JournalSession {
         self.stream_items.set(new_total);
     }
 
+    /// Asks for the caret to be brought into view on the next frames: a fresh
+    /// day, or a keystroke that may have pushed the caret off the screen.
+    fn request_reveal_caret(&self) {
+        self.reveal_caret.set(true);
+        self.reveal_attempts.set(0);
+    }
+
     /// Scrolls the stream so the open day's caret sits in the viewport.
     ///
     /// The editor grows to its content and cannot scroll itself, so the
-    /// timeline has to. Call this after the item sync in the same frame: a
-    /// splice keeps the scroll anchor, but a reset would drop it, and the
-    /// caret rect from the last layout is only trustworthy while the scroll
-    /// position stands. Before the first layout there is no rect at all; the
-    /// app's render keeps a frame coming until there is one.
+    /// timeline has to. Two safeguards keep this honest:
+    ///
+    /// - the caret rect is only trusted when it has held still for a frame,
+    ///   because the first layout of a freshly opened day can still be a
+    ///   partial one (revealing against it either does nothing or scrolls to
+    ///   the wrong place, and the stream's item heights may not be measured
+    ///   yet);
+    /// - the reveal keeps at it — up to [`REVEAL_ATTEMPTS`] scrolls — until
+    ///   the caret is actually inside the viewport, so a wrong landing
+    ///   corrects itself on the next frame.
+    ///
+    /// Before the first layout there is no rect at all; the app's render
+    /// keeps a frame coming while the flag stands.
     fn reveal_caret(&self, window: &Window, cx: &App) {
         if !self.reveal_caret.get() {
             return;
@@ -1812,14 +1839,38 @@ impl JournalSession {
         let Some(rect) = active.editor.read(cx).caret_window_rect() else {
             return;
         };
-        self.reveal_caret.set(false);
-        let viewport_bottom = window.viewport_size().height - px(STREAM_BOTTOM_MARGIN);
-        if rect.origin.y + rect.size.height > viewport_bottom {
-            self.stream
-                .scroll_by(rect.origin.y + rect.size.height - viewport_bottom);
-        } else if rect.origin.y < px(STREAM_TOP_MARGIN) {
-            self.stream.scroll_by(rect.origin.y - px(STREAM_TOP_MARGIN));
+        let settled = self.reveal_rect.get() == Some(rect);
+        self.reveal_rect.set(Some(rect));
+        if !settled {
+            return;
         }
+        let viewport_bottom = window.viewport_size().height - px(STREAM_BOTTOM_MARGIN);
+        let delta = if rect.origin.y + rect.size.height > viewport_bottom {
+            rect.origin.y + rect.size.height - viewport_bottom
+        } else if rect.origin.y < px(STREAM_TOP_MARGIN) {
+            rect.origin.y - px(STREAM_TOP_MARGIN)
+        } else {
+            // The caret is in the viewport: nothing left to do.
+            self.reveal_caret.set(false);
+            self.reveal_attempts.set(0);
+            return;
+        };
+        if self.reveal_attempts.get() >= REVEAL_ATTEMPTS {
+            self.reveal_caret.set(false);
+            self.reveal_attempts.set(0);
+            return;
+        }
+        self.reveal_attempts.set(self.reveal_attempts.get() + 1);
+        // Move by offset inside the current top item rather than asking the
+        // list to seek by pixels: a seek walks the *recorded* item heights,
+        // and the day being revealed is often the one still being measured,
+        // so a seek overshoots into later days. A stored offset lets the
+        // layout measure its way down instead.
+        let top = self.stream.logical_scroll_top();
+        self.stream.scroll_to(ListOffset {
+            item_ix: top.item_ix,
+            offset_in_item: (top.offset_in_item + delta).max(Pixels::ZERO),
+        });
     }
 
     fn view(
@@ -3552,14 +3603,11 @@ fn media_reference(entry_path: &Path, journal_root: &Path, file_name: &str) -> S
 
 impl Render for DainikiApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // A caret reveal is pending but the editor has no layout to measure
-        // it against yet (the opening frame): keep a frame coming, or the
-        // reveal would wait forever on an idle window.
+        // A caret reveal is pending: keep a frame coming until it settles, or
+        // it would wait forever on an idle window.
         if self
             .session()
-            .filter(|session| session.reveal_caret.get())
-            .and_then(|session| session.active.as_ref())
-            .is_some_and(|active| active.editor.read(cx).caret_window_rect().is_none())
+            .is_some_and(|session| session.reveal_caret.get())
         {
             cx.notify();
         }
@@ -3765,7 +3813,7 @@ mod tests {
 
     use chrono::{Datelike, Local, NaiveDate};
     use gpui::{
-        AppContext as _, Bounds, Entity, ScrollDelta, ScrollWheelEvent, TestAppContext,
+        AppContext as _, Bounds, Entity, ListOffset, ScrollDelta, ScrollWheelEvent, TestAppContext,
         VisualTestContext, WindowBounds, WindowOptions, point, px,
     };
 
@@ -5383,12 +5431,11 @@ mod tests {
         });
         // The caret sits at the end of the entry; the timeline scrolls so it
         // is visible instead of the editor scrolling itself.
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
         cx.update(|_window, cx| {
             let app = app.read(cx);
             let session = app.session().expect("an open session");
@@ -5489,6 +5536,72 @@ mod tests {
                 (top.item_ix, top.offset_in_item),
                 before.0,
                 "the reader keeps their place when days appear"
+            );
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn typing_pulls_the_view_back_to_the_caret(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        let long: String = (0..200).map(|ix| format!("line {ix}\n")).collect();
+        seed_day(&journal, today, &long);
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
+
+        // Wander off to the top of the entry, far from the caret.
+        cx.update(|_window, cx| {
+            app.update(cx, |app, _cx| {
+                let session = app.session_mut().expect("an open session");
+                session.stream.scroll_to(ListOffset {
+                    item_ix: 0,
+                    offset_in_item: px(0.),
+                });
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // A keystroke asks for the caret again, wherever the reader wandered.
+        cx.simulate_input("x");
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
+        cx.update(|window, cx| {
+            let app = app.read(cx);
+            let session = app.session().expect("an open session");
+            let active = session.active.as_ref().expect("today is open");
+            let caret = active
+                .editor
+                .read(cx)
+                .caret_window_rect()
+                .expect("the editor has a layout");
+            let viewport = window.viewport_size().height;
+            assert!(
+                caret.origin.y + caret.size.height <= viewport,
+                "the caret came back into the viewport at {caret:?} of {viewport:?}"
+            );
+            assert!(
+                session.stream.logical_scroll_top().offset_in_item > px(0.),
+                "the stream scrolled down to it"
             );
         });
         fs::remove_dir_all(&dir).ok();

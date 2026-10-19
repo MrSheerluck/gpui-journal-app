@@ -81,6 +81,8 @@ pub struct MarkdownEditor {
     autoscroll_active: bool,
     base_dir: Option<PathBuf>,
     images: HashMap<String, ImageState>,
+    /// Bumped whenever an image load settles; see [`Self::media_revision`].
+    media_revision: u64,
     /// Host-pushed playback state per media destination.
     media_states: HashMap<String, MediaPlaybackState>,
     /// Host-pushed video frames per media destination (the latest one wins).
@@ -156,6 +158,7 @@ impl MarkdownEditor {
             autoscroll_active: false,
             base_dir: None,
             images: HashMap::new(),
+            media_revision: 0,
             media_states: HashMap::new(),
             media_frames: HashMap::new(),
             pending_edit: None,
@@ -513,6 +516,7 @@ impl MarkdownEditor {
                 this.update(cx, |editor, cx| {
                     editor.images.insert(destination, state);
                     editor.revision += 1;
+                    editor.media_revision += 1;
                     cx.notify();
                     // A plain notify can be dropped when it lands between
                     // frames; a decoded image must reach the screen without
@@ -528,6 +532,13 @@ impl MarkdownEditor {
     /// Snapshot of image load states for layout and painting.
     pub(crate) fn image_metrics(&self) -> HashMap<String, ImageState> {
         self.images.clone()
+    }
+
+    /// Bumped whenever an image load settles. A decoded image changes the
+    /// height its line occupies, so hosts that cache item heights — a list of
+    /// days — must re-measure when this moves.
+    pub fn media_revision(&self) -> u64 {
+        self.media_revision
     }
 
     /// Scrolls by `delta`; returns whether the offset actually changed, so
@@ -1442,7 +1453,15 @@ struct PointHit {
 fn load_render_image(path: &std::path::Path) -> Result<Arc<RenderImage>, String> {
     let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
     let decoded = image::load_from_memory(&bytes).map_err(|error| error.to_string())?;
-    let frame = image::Frame::new(decoded.to_rgba8());
+    // `RenderImage` holds BGRA; decoding to RGBA swaps red and blue on screen
+    // (a red cover reads blue) while the reading view, which goes through
+    // gpui's own loader, stays right. `image` has no BGRA buffer type, so the
+    // swap is by hand.
+    let mut rgba = decoded.to_rgba8();
+    for pixel in rgba.as_mut().as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    let frame = image::Frame::new(rgba);
     Ok(Arc::new(RenderImage::new([frame])))
 }
 
@@ -1945,6 +1964,26 @@ mod interaction_tests {
                 "a click on the audio row toggles playback"
             );
         });
+    }
+
+    #[test]
+    fn decoded_images_arrive_in_the_renderers_channel_order() {
+        // A pure red pixel must reach the renderer as BGRA, or every decoded
+        // image paints with red and blue swapped — a red cover reads blue.
+        let dir = std::env::temp_dir().join(format!("dainiki-bgra-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("red.png");
+        let rgba = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        rgba.save(&path).expect("write png");
+
+        let loaded = super::load_render_image(&path).expect("decode");
+        let bytes = loaded.as_bytes(0).expect("frame bytes");
+        assert_eq!(
+            &bytes[..4],
+            &[0, 0, 255, 255],
+            "red arrives as BGRA (blue, green, red, alpha)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[gpui::test]

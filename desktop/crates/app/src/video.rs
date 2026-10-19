@@ -7,12 +7,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// One decoded frame, top-down RGBA, tightly packed, with its position on the
-/// asset's timeline.
+/// One decoded frame, top-down **BGRA**, tightly packed — the order
+/// `RenderImage` wants — with its position on the asset's timeline.
 pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub bgra: Vec<u8>,
     /// Presentation time from the start of the stream.
     pub pts_ms: u64,
     /// The stream's total length, when the track reports one.
@@ -22,7 +22,7 @@ pub struct VideoFrame {
 impl VideoFrame {
     /// The frame as a renderer-ready image.
     pub fn into_render_image(self) -> Option<Arc<gpui_kit::RenderImage>> {
-        let buffer = image::RgbaImage::from_raw(self.width, self.height, self.rgba)?;
+        let buffer = image::RgbaImage::from_raw(self.width, self.height, self.bgra)?;
         Some(Arc::new(gpui_kit::RenderImage::new([image::Frame::new(
             buffer,
         )])))
@@ -319,14 +319,14 @@ mod platform {
         }
         let base = CVPixelBufferGetBaseAddress(pixel_buffer) as *const u8;
         let stride = CVPixelBufferGetBytesPerRow(pixel_buffer);
-        let mut rgba = vec![0u8; width * height * 4];
+        let mut bgra = vec![0u8; width * height * 4];
         if !base.is_null() {
             // SAFETY: the buffer is locked for reading, `stride` covers the
             // row, and `width * 4` bytes fit inside it.
             unsafe {
                 for row in 0..height {
                     let source = base.add(row * stride);
-                    let destination = rgba.as_mut_ptr().add(row * width * 4);
+                    let destination = bgra.as_mut_ptr().add(row * width * 4);
                     std::ptr::copy_nonoverlapping(source, destination, width * 4);
                 }
             }
@@ -334,13 +334,12 @@ mod platform {
         unsafe {
             CVPixelBufferUnlockBaseAddress(pixel_buffer, CVPixelBufferLockFlags::ReadOnly);
         }
-        for pixel in rgba.as_chunks_mut::<4>().0 {
-            pixel.swap(0, 2);
-        }
+        // CoreVideo hands back BGRA already, which is exactly what the
+        // renderer wants; swapping here used to tint every frame.
         Ok(VideoFrame {
             width: width as u32,
             height: height as u32,
-            rgba,
+            bgra,
             pts_ms,
             duration_ms,
         })
@@ -377,12 +376,12 @@ mod tests {
         let frame = frames.recv_blocking().expect("a frame").expect("decoded");
         assert!(frame.width > 0 && frame.height > 0);
         assert_eq!(
-            frame.rgba.len(),
+            frame.bgra.len(),
             (frame.width * frame.height * 4) as usize,
             "frames are tightly packed RGBA"
         );
         assert!(
-            frame.rgba.iter().any(|byte| *byte != 0),
+            frame.bgra.iter().any(|byte| *byte != 0),
             "the frame is not blank"
         );
         println!("decoded {}x{}", frame.width, frame.height);

@@ -684,6 +684,9 @@ impl DainikiApp {
                 if duration_ms.is_some() {
                     session.video_duration_ms = duration_ms;
                 }
+                // The first frame decides the card's shape (it is shown
+                // whole, letterboxed): the timeline must re-measure the day.
+                session.media_settled.set(session.media_settled.get() + 1);
                 let editor = session.active.as_ref().map(|active| active.editor.clone());
                 if let Some(editor) = editor {
                     editor.update(cx, |editor, cx| {
@@ -1767,31 +1770,104 @@ impl JournalSession {
             .filter(|duration| *duration > 0)
             .map(|duration| (state.position_ms as f32 / duration as f32).clamp(0., 1.))
             .unwrap_or(0.);
-        let progress = div()
-            .h(px(3.))
-            .w_full()
-            .rounded_full()
-            .bg(brand::outline_variant().opacity(0.5))
-            .child(
-                div()
-                    .h_full()
-                    .w(relative(fraction))
-                    .rounded_full()
-                    .bg(brand::primary()),
-            );
-        let icon = Icon::new(if playing {
+        let progress = move || {
+            div()
+                .h(px(3.))
+                .w_full()
+                .rounded_full()
+                .bg(brand::outline_variant().opacity(0.5))
+                .child(
+                    div()
+                        .h_full()
+                        .w(relative(fraction))
+                        .rounded_full()
+                        .bg(brand::primary()),
+                )
+        };
+        // The hero's transport: a round accent button, the name beside it and
+        // the elapsed time on the right.
+        let round_button = |size: f32, icon_size: f32, transport: IconName| {
+            div()
+                .w(px(size))
+                .h(px(size))
+                .flex_none()
+                .rounded_full()
+                .bg(brand::primary())
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::new(transport)
+                        .size(px(icon_size))
+                        .text_color(brand::surface_container_lowest()),
+                )
+        };
+        let transport = if playing {
             IconName::Pause
         } else {
             IconName::Play
-        })
-        .size(px(if kind == MediaKind::Video { 28. } else { 16. }))
-        .text_color(brand::primary());
+        };
+        // A small translucent square over the picture, as in the hero.
+        let video_button = move || {
+            div()
+                .w(px(30.))
+                .h(px(30.))
+                .rounded_md()
+                .bg(brand::surface_container_lowest().opacity(0.92))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::new(transport)
+                        .size(px(15.))
+                        .text_color(brand::primary()),
+                )
+        };
+        let clock = |milliseconds: u64| {
+            format!(
+                "{:02}:{:02}",
+                milliseconds / 60_000,
+                (milliseconds / 1000) % 60
+            )
+        };
+        let time_label = match state.duration_ms.filter(|duration| *duration > 0) {
+            Some(duration) => format!("{} / {}", clock(state.position_ms), clock(duration)),
+            None => clock(state.position_ms),
+        };
         let error = state.error.as_ref().map(|error| {
             div()
                 .text_size(px(11.))
                 .text_color(brand::secondary())
                 .child(error.clone())
         });
+
+        // The hero's waveform: deterministic ticks, the played stretch in the
+        // accent, the rest in outline. Decorative, but the fill is real.
+        let mut wave = h_flex().items_center().gap(px(2.)).h(px(22.));
+        const TICKS: usize = 40;
+        let seed: usize = destination.bytes().map(|byte| byte as usize).sum();
+        for tick in 0..TICKS {
+            let at = tick as f32 / (TICKS - 1) as f32;
+            let amplitude = 0.3 + 0.7 * (((seed + tick * 7) % 11) as f32 / 10.);
+            wave = wave.child(
+                div()
+                    .w(px(2.))
+                    .h(px(5. + 15. * amplitude))
+                    .rounded_full()
+                    .bg(if at <= fraction {
+                        brand::primary()
+                    } else {
+                        brand::outline_variant().opacity(0.75)
+                    }),
+            );
+        }
+        let waveform = div()
+            .w_full()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(brand::primary().opacity(0.08))
+            .child(wave);
 
         let card = div()
             .id(ElementId::Name(format!("media-card-{destination}").into()))
@@ -1814,12 +1890,25 @@ impl JournalSession {
                     .latest_frame
                     .as_ref()
                     .filter(|(current, _, _)| current == destination);
-                let area = if let Some((_, frame, _)) = framed {
+                let area: AnyElement = if let Some((_, frame, _)) = framed {
+                    // The picture is shown whole, letterboxed into the card,
+                    // never cropped to a fixed box — a screen recording of a
+                    // different shape used to look stretched.
+                    let size = frame.size(0);
+                    let scale = scale_factor.max(1.);
+                    let natural_width = (size.width.0 as f32 / scale).max(1.);
+                    let natural_height = (size.height.0 as f32 / scale).max(1.);
+                    let height = (560. * natural_height / natural_width).clamp(160., 360.);
                     div()
                         .w_full()
-                        .h(px(150.))
+                        .h(px(height))
                         .relative()
-                        .child(img(frame.clone()).object_fit(ObjectFit::Cover).size_full())
+                        .bg(brand::surface_container_lowest())
+                        .child(
+                            img(frame.clone())
+                                .object_fit(ObjectFit::Contain)
+                                .size_full(),
+                        )
                         .child(
                             div()
                                 .absolute()
@@ -1827,72 +1916,73 @@ impl JournalSession {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child(icon),
+                                .child(video_button()),
+                        )
+                        // Playback progress stays legible on a still frame.
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .child(progress()),
                         )
                         .into_any_element()
                 } else {
                     div()
                         .w_full()
-                        .h(px(150.))
+                        .h(px(160.))
                         .flex()
+                        .flex_col()
                         .items_center()
                         .justify_center()
-                        .child(icon)
+                        .gap_3()
+                        .child(video_button())
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(brand::on_surface_variant())
+                                .child(name.clone()),
+                        )
+                        .children(error)
                         .into_any_element()
                 };
-                card.h(px(200.))
-                    .overflow_hidden()
+                card.overflow_hidden()
                     .flex()
                     .flex_col()
-                    .justify_between()
                     .child(area)
-                    .child(
-                        v_flex()
-                            .px_3()
-                            .pb_3()
-                            .gap_2()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .text_size(px(12.))
-                                            .text_color(brand::on_surface_variant())
-                                            .child(name.clone()),
-                                    )
-                                    .children(error),
-                            )
-                            .child(progress),
-                    )
                     .into_any_element()
             }
             _ => card
                 .flex()
-                .flex_row()
+                .flex_col()
                 .gap_3()
-                .items_center()
                 .px_3()
                 .py_3()
-                .child(icon)
                 .child(
-                    v_flex()
-                        .flex_1()
-                        .gap_2()
+                    h_flex()
+                        .gap_3()
+                        .items_center()
+                        .child(round_button(34., 16., transport))
                         .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
+                            v_flex()
+                                .flex_1()
                                 .child(
                                     div()
-                                        .text_size(px(12.))
-                                        .text_color(brand::on_surface_variant())
+                                        .text_size(px(14.))
+                                        .text_color(brand::on_surface())
                                         .child(name.clone()),
                                 )
                                 .children(error),
                         )
-                        .child(progress),
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(brand::on_surface_variant())
+                                .child(time_label.clone()),
+                        ),
                 )
+                .child(waveform)
                 .into_any_element(),
         }
     }

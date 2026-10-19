@@ -102,9 +102,14 @@ impl Element for EditorElement {
                     _ => None,
                 });
 
-                let (plan, theme, images) = {
+                let (plan, theme, images, frames) = {
                     let view = view.read(cx);
-                    (view.plan(), view.theme().clone(), view.image_metrics())
+                    (
+                        view.plan(),
+                        view.theme().clone(),
+                        view.image_metrics(),
+                        view.media_frames(),
+                    )
                 };
 
                 let mut lines = Vec::with_capacity(plan.lines.len());
@@ -136,10 +141,23 @@ impl Element for EditorElement {
                                     None => px(120.),
                                 }
                             }
-                            MediaKind::Audio => px(64.),
+                            MediaKind::Audio => px(84.),
                             MediaKind::Video => {
                                 let width = wrap_width.unwrap_or(px(480.));
-                                (width * (9. / 16.)).clamp(px(140.), px(320.))
+                                // A frame, once decoded, decides the card's
+                                // shape: the picture is shown whole, never
+                                // cropped or stretched into a fixed box.
+                                let shape = frames.get(&path).map(|frame| frame.size(0));
+                                match shape {
+                                    Some(size) if size.width.0 > 0 => {
+                                        let scale = window.scale_factor();
+                                        let frame_width = size.width.0 as f32 / scale;
+                                        let frame_height = size.height.0 as f32 / scale;
+                                        px((width.as_f32() * frame_height / frame_width)
+                                            .clamp(140., 360.))
+                                    }
+                                    _ => (width * (9. / 16.)).clamp(px(140.), px(320.)),
+                                }
                             }
                             MediaKind::File => px(28.),
                         };
@@ -822,7 +840,7 @@ fn paint_media_line(
         MediaKind::Video | MediaKind::Audio => {
             let (card_height, radius, button_radius) = match kind {
                 MediaKind::Video => ((line_height - px(8.)).max(px(120.)), 10., px(22.)),
-                _ => ((line_height - px(8.)).clamp(px(40.), px(56.)), 8., px(12.)),
+                _ => ((line_height - px(8.)).clamp(px(64.), px(84.)), 8., px(17.)),
             };
             let width = bounds.size.width.min(px(560.));
             let card = Bounds {
@@ -846,8 +864,10 @@ fn paint_media_line(
                 let natural_width = size.width.0 as f32 / scale_factor;
                 let natural_height = size.height.0 as f32 / scale_factor;
                 if natural_width > 0. && natural_height > 0. {
+                    // Shown whole, letterboxed in the card: `max` cropped the
+                    // picture to the box, which read as a stretched video.
                     let fit = (card.size.width.as_f32() / natural_width)
-                        .max(card.size.height.as_f32() / natural_height);
+                        .min(card.size.height.as_f32() / natural_height);
                     let target = gpui::size(px(natural_width * fit), px(natural_height * fit));
                     let rect = Bounds {
                         origin: point(
@@ -871,57 +891,115 @@ fn paint_media_line(
                     card.origin.y + card.size.height / 2.,
                 ),
                 _ => point(
-                    card.origin.x + px(12.) + button_radius,
-                    card.origin.y + card.size.height / 2.,
+                    card.origin.x + px(14.) + button_radius,
+                    card.origin.y + px(30.),
                 ),
             };
             let playing = playback.is_some_and(|state| state.playing);
             let label_x = match kind {
                 MediaKind::Video => card.origin.x + px(12.),
-                _ => card.origin.x + px(12.) + button_radius * 2. + px(12.),
+                _ => card.origin.x + px(12.) + button_radius * 2. + px(10.),
             };
+            let clock = |milliseconds: u64| {
+                format!(
+                    "{:02}:{:02}",
+                    milliseconds / 60_000,
+                    (milliseconds / 1000) % 60
+                )
+            };
+            let time_label = (kind == MediaKind::Audio).then(|| match playback {
+                Some(state) => match state.duration_ms.filter(|duration| *duration > 0) {
+                    Some(duration) => format!("{} / {}", clock(state.position_ms), clock(duration)),
+                    None => clock(state.position_ms),
+                },
+                None => String::new(),
+            });
             // The controls live in their own layer: gpui paints an image's
             // sprite after the quads of the layer it was added to, so a
             // button drawn right after a frame would disappear under it.
+            let square_button = kind == MediaKind::Video;
             window.paint_layer(card, |window| {
-                paint_media_button(button_center, button_radius, playing, theme, window);
+                if square_button {
+                    paint_video_button(button_center, playing, theme, window);
+                } else {
+                    paint_media_button(button_center, button_radius, playing, theme, window);
+                }
                 if !framed {
                     let label = match playback.and_then(|state| state.error.as_deref()) {
                         Some(error) => format!("{} — {error}", file_name(path)),
                         None => file_name(path),
                     };
-                    paint_label(
-                        &label,
-                        point(label_x, card.origin.y + card.size.height - px(22.)),
-                        theme,
-                        window,
-                        cx,
-                    );
+                    let label_y = if kind == MediaKind::Audio {
+                        card.origin.y + px(10.)
+                    } else {
+                        card.origin.y + card.size.height - px(22.)
+                    };
+                    paint_label(&label, point(label_x, label_y), theme, window, cx);
+                    if let Some(time) = time_label.as_deref()
+                        && !time.is_empty()
+                    {
+                        paint_label_right(
+                            time,
+                            card.origin.x + card.size.width - px(14.),
+                            label_y,
+                            theme,
+                            window,
+                            cx,
+                        );
+                    }
                 }
             });
             // The progress track and its elapsed portion, when known.
-            let track_bounds = Bounds {
-                origin: point(
-                    card.origin.x + px(12.),
-                    card.origin.y + card.size.height - px(10.),
-                ),
-                size: gpui::size((card.size.width - px(24.)).max(px(0.)), px(2.)),
-            };
+            let fraction = playback
+                .and_then(|state| {
+                    state
+                        .duration_ms
+                        .filter(|duration| *duration > 0)
+                        .map(|duration| (state.position_ms as f32 / duration as f32).clamp(0., 1.))
+                })
+                .unwrap_or(0.);
             window.paint_layer(card, |window| {
-                window.paint_quad(fill(track_bounds, theme.media_track).corner_radii(1.));
-                if let Some(state) = playback
-                    && let Some(duration) = state.duration_ms.filter(|duration| *duration > 0)
-                {
-                    let fraction = (state.position_ms as f32 / duration as f32).clamp(0., 1.);
-                    let elapsed = Bounds {
-                        origin: track_bounds.origin,
-                        size: gpui::size(
-                            track_bounds.size.width * fraction,
-                            track_bounds.size.height,
-                        ),
-                    };
-                    window.paint_quad(fill(elapsed, theme.media_progress).corner_radii(1.));
+                if kind == MediaKind::Audio {
+                    // The hero's waveform: deterministic ticks, the played
+                    // stretch in the accent, the rest in the track colour.
+                    const TICKS: usize = 40;
+                    let left = card.origin.x + px(12.);
+                    let right = card.origin.x + card.size.width - px(12.);
+                    let width = (right - left).max(px(1.));
+                    let pitch = width / TICKS as f32;
+                    let tick_width = (pitch - px(2.)).max(px(1.));
+                    let base_y = card.origin.y + card.size.height - px(12.);
+                    let seed: usize = path.bytes().map(|byte| byte as usize).sum();
+                    for tick in 0..TICKS {
+                        let at = tick as f32 / (TICKS - 1) as f32;
+                        let amplitude = 0.3 + 0.7 * (((seed + tick * 7) % 11) as f32 / 10.);
+                        let height = px(5. + 15. * amplitude);
+                        let bar = Bounds {
+                            origin: point(left + pitch * tick as f32, base_y - height),
+                            size: gpui::size(tick_width, height),
+                        };
+                        let color = if at <= fraction {
+                            theme.media_progress
+                        } else {
+                            theme.media_track
+                        };
+                        window.paint_quad(fill(bar, color).corner_radii(tick_width / 2.));
+                    }
+                    return;
                 }
+                let track_bounds = Bounds {
+                    origin: point(
+                        card.origin.x + px(12.),
+                        card.origin.y + card.size.height - px(10.),
+                    ),
+                    size: gpui::size((card.size.width - px(24.)).max(px(0.)), px(2.)),
+                };
+                window.paint_quad(fill(track_bounds, theme.media_track).corner_radii(1.));
+                let elapsed = Bounds {
+                    origin: track_bounds.origin,
+                    size: gpui::size(track_bounds.size.width * fraction, track_bounds.size.height),
+                };
+                window.paint_quad(fill(elapsed, theme.media_progress).corner_radii(1.));
             });
         }
         MediaKind::File => {
@@ -961,7 +1039,9 @@ fn paint_media_button(
         origin: point(center.x - radius, center.y - radius),
         size: gpui::size(radius * 2., radius * 2.),
     };
-    window.paint_quad(fill(button, theme.media_control).corner_radii(radius));
+    // The hero's transport: an accent disc with the glyph knocked out in the
+    // page colour, so it reads on both light and dark themes.
+    window.paint_quad(fill(button, theme.caret).corner_radii(radius));
     if playing {
         let bar_width = radius * 0.22;
         let bar_height = radius * 0.9;
@@ -985,6 +1065,88 @@ fn paint_media_button(
         if let Ok(path) = builder.build() {
             window.paint_path(path, theme.background);
         }
+    }
+}
+
+/// The video player's control: a small translucent square with an accent
+/// glyph, as in the landing hero, instead of a disc over the picture.
+fn paint_video_button(
+    center: Point<Pixels>,
+    playing: bool,
+    theme: &EditorTheme,
+    window: &mut Window,
+) {
+    let side = px(30.);
+    let button = Bounds {
+        origin: point(center.x - side / 2., center.y - side / 2.),
+        size: gpui::size(side, side),
+    };
+    window.paint_quad(
+        fill(button, theme.background.opacity(0.92))
+            .corner_radii(8.)
+            .border_widths(1.)
+            .border_color(theme.media_border),
+    );
+    if playing {
+        let bar_width = px(3.);
+        let bar_height = px(12.);
+        for offset in [-px(3.5), px(0.5)] {
+            let bar = Bounds {
+                origin: point(center.x + offset, center.y - bar_height / 2.),
+                size: gpui::size(bar_width, bar_height),
+            };
+            window.paint_quad(fill(bar, theme.caret).corner_radii(px(1.5)));
+        }
+    } else {
+        let mut builder = PathBuilder::fill();
+        builder.add_polygon(
+            &[
+                point(center.x - px(3.5), center.y - px(6.)),
+                point(center.x - px(3.5), center.y + px(6.)),
+                point(center.x + px(6.5), center.y),
+            ],
+            true,
+        );
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, theme.caret);
+        }
+    }
+}
+
+/// Like [`paint_label`], but with its right edge at `right`.
+fn paint_label_right(
+    label: &str,
+    right: Pixels,
+    y: Pixels,
+    theme: &EditorTheme,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let mut style = window.text_style().clone();
+    style.font_size = px(12.).into();
+    style.color = theme.text.opacity(0.6);
+    let Ok(mut shaped) = window.text_system().shape_text(
+        SharedString::new(label),
+        px(12.),
+        &[style.to_run(label.len())],
+        None,
+        None,
+    ) else {
+        return;
+    };
+    let Some(line) = shaped.pop() else {
+        return;
+    };
+    let width = line.width();
+    if let Err(error) = line.paint(
+        point(right - width, y),
+        window.pixel_snap(px(14.)),
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    ) {
+        tracing::warn!(error = %error, "failed to paint a label");
     }
 }
 

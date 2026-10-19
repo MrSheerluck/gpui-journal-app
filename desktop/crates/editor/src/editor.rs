@@ -450,6 +450,9 @@ impl MarkdownEditor {
         cx: &mut Context<Self>,
     ) {
         self.media_frames.insert(destination.to_string(), frame);
+        // A first frame decides the card's shape, so hosts that cache item
+        // heights must re-measure (the same revision image loads bump).
+        self.media_revision += 1;
         cx.notify();
     }
 

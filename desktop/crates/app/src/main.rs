@@ -544,16 +544,16 @@ impl DainikiApp {
         cx.notify();
     }
 
-    fn on_toggle_editing(
-        &mut self,
-        _: &ToggleEditing,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let editing = self
-            .session()
-            .is_some_and(|session| session.active.is_some());
-        if editing {
+    /// True while a day is open in the editor — the edit mode.
+    fn is_editing(&self) -> bool {
+        self.session()
+            .is_some_and(|session| session.active.is_some())
+    }
+
+    /// Flips between reading the stream and editing a day: leaving editing
+    /// flushes and stashes the open day; entering it opens today.
+    fn toggle_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_editing() {
             self.stop_editing(cx);
         } else {
             let today = self.session().map(|session| session.today);
@@ -561,6 +561,15 @@ impl DainikiApp {
                 self.activate_day(today, window, cx);
             }
         }
+    }
+
+    fn on_toggle_editing(
+        &mut self,
+        _: &ToggleEditing,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_mode(window, cx);
     }
 
     // -- media ------------------------------------------------------------
@@ -984,12 +993,23 @@ impl DainikiApp {
         }
     }
 
+    /// Goes to a day: while editing it opens in the editor, while reading the
+    /// stream scrolls to it. The future is clamped to today — the stream
+    /// never shows days that have not happened.
+    fn show_day(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_editing() {
+            self.activate_day(date, window, cx);
+        } else if let Some(session) = self.session_mut() {
+            session.pending_reveal.set(Some(date));
+        }
+    }
+
     /// Opens `date` for editing and reveals it in the stream. The future is
     /// clamped to today — the stream never shows days that have not happened.
     fn jump_to(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
         let today = self.session().map_or(date, |session| session.today);
         let date = date.min(today);
-        self.activate_day(date, window, cx);
+        self.show_day(date, window, cx);
         if let Some(session) = self.session_mut() {
             session.jump_open = false;
             session.jump_error = None;
@@ -1290,12 +1310,17 @@ impl DainikiApp {
             return;
         }
         tracing::info!(from = %session.today, to = %now, "rolling the journal over midnight");
+        // Whichever day was open belongs to the old date and is flushed; a
+        // reader stays a reader, an editor keeps editing the new day.
+        let was_editing = self.is_editing();
         self.stop_editing(cx);
         if let Some(session) = self.session_mut() {
             session.today = now;
             session.pending_reveal.set(Some(now));
         }
-        self.activate_day(now, window, cx);
+        if was_editing {
+            self.activate_day(now, window, cx);
+        }
         cx.notify();
     }
 
@@ -1805,6 +1830,8 @@ impl JournalSession {
                     app.on_media_toggle(destination.clone(), resolved.clone(), kind, cx)
                 })
                 .ok();
+                // A play press is not a press on the day.
+                cx.stop_propagation();
             }
         };
         let fraction = state
@@ -2521,10 +2548,64 @@ impl JournalSession {
             );
         }
 
-        // The toolbar belongs to editing: it appears only while a day is
-        // open in the editor.
-        if let Some(active) = &self.active {
-            let today_this = this.clone();
+        // The bar is always there: the mode switch must be findable. The
+        // format controls only make sense with a day open, so they come and
+        // go with editing.
+        {
+            let mut bar = h_flex().gap_2().items_center();
+            if let Some(active) = &self.active {
+                let today_this = this.clone();
+                bar = bar
+                    .child(
+                        Toolbar::new("editor-toolbar")
+                            .content(
+                                div()
+                                    .debug_selector(|| "inline-formats".to_string())
+                                    .child(active.inline_toolbar(cx)),
+                            )
+                            .content(Separator::vertical())
+                            .content(
+                                div()
+                                    .debug_selector(|| "block-formats".to_string())
+                                    .child(active.block_toolbar(cx)),
+                            ),
+                    )
+                    .child(active.insert_menu(&self.root))
+                    .child(
+                        Button::new("today-button")
+                            .label("Today")
+                            .compact()
+                            .on_click(move |_, window, cx| {
+                                today_this
+                                    .update(cx, |app, cx| {
+                                        if let Some(today) =
+                                            app.session().map(|session| session.today)
+                                        {
+                                            app.jump_to(today, window, cx);
+                                        }
+                                    })
+                                    .ok();
+                            }),
+                    );
+                let help = active.help_menu();
+                bar = bar
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .debug_selector(|| "mode-toggle".to_string())
+                            .child(mode_toggle(true, this.clone())),
+                    )
+                    .child(help);
+            } else {
+                bar = bar
+                    .child(div().debug_selector(|| "read-mode-bar".to_string()))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .debug_selector(|| "mode-toggle".to_string())
+                            .child(mode_toggle(false, this.clone())),
+                    );
+            }
             main = main.child(
                 div()
                     .w_full()
@@ -2533,44 +2614,7 @@ impl JournalSession {
                     .bg(brand::surface_container_low())
                     .border_b_1()
                     .border_color(brand::outline_variant().opacity(0.6))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                Toolbar::new("editor-toolbar")
-                                    .content(
-                                        div()
-                                            .debug_selector(|| "inline-formats".to_string())
-                                            .child(active.inline_toolbar(cx)),
-                                    )
-                                    .content(Separator::vertical())
-                                    .content(
-                                        div()
-                                            .debug_selector(|| "block-formats".to_string())
-                                            .child(active.block_toolbar(cx)),
-                                    ),
-                            )
-                            .child(active.insert_menu(&self.root))
-                            .child(
-                                Button::new("today-button")
-                                    .label("Today")
-                                    .compact()
-                                    .on_click(move |_, window, cx| {
-                                        today_this
-                                            .update(cx, |app, cx| {
-                                                if let Some(today) =
-                                                    app.session().map(|session| session.today)
-                                                {
-                                                    app.jump_to(today, window, cx);
-                                                }
-                                            })
-                                            .ok();
-                                    }),
-                            )
-                            .child(finish_toggle(this.clone()))
-                            .child(active.help_menu()),
-                    ),
+                    .child(bar),
             );
         }
 
@@ -3234,7 +3278,9 @@ fn stream_edge(oldest: Option<String>) -> AnyElement {
 }
 
 /// Wraps a rendered day so a click opens it for editing.
-/// Wraps a whole rendered day so a click anywhere opens it for editing.
+/// Wraps a whole rendered day so a click anywhere opens it for editing — but
+/// only in edit mode. In read mode a click is a click on a player, a link or
+/// plain text, and must not swap the mode behind the reader's back.
 fn clickable_day(this: WeakEntity<DainikiApp>, date: NaiveDate, body: AnyElement) -> AnyElement {
     div()
         .id(ElementId::Name(format!("day-{date}").into()))
@@ -3242,21 +3288,34 @@ fn clickable_day(this: WeakEntity<DainikiApp>, date: NaiveDate, body: AnyElement
         .cursor_text()
         .debug_selector(|| "day-body".to_string())
         .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
-            this.update(cx, |app, cx| app.activate_day(date, window, cx))
-                .ok();
+            this.update(cx, |app, cx| {
+                // In read mode a click is a click on a player, a link or plain
+                // text; it must not swap the mode behind the reader's back.
+                if app.is_editing() {
+                    app.activate_day(date, window, cx);
+                }
+            })
+            .ok();
         })
         .child(body)
         .into_any_element()
 }
 
-/// Leaves editing and returns to the stream.
-fn finish_toggle(this: WeakEntity<DainikiApp>) -> Toggle {
-    Toggle::new("finish-editing")
-        .label("Done")
-        .tooltip("Finish editing — ⌘E")
-        .checked(false)
-        .on_click(move |_checked, _window, cx| {
-            this.update(cx, |app, cx| app.stop_editing(cx)).ok();
+/// The read/edit switch, naming where it takes you: `Read` while editing,
+/// `Edit` while reading.
+fn mode_toggle(editing: bool, this: WeakEntity<DainikiApp>) -> Toggle {
+    let (label, icon, tooltip) = if editing {
+        ("Read", IconName::BookOpen, "Read the stream — ⌘E")
+    } else {
+        ("Edit", IconName::Pencil, "Edit today's entry — ⌘E")
+    };
+    Toggle::new("read-edit-mode")
+        .label(label)
+        .icon(Icon::new(icon))
+        .tooltip(tooltip)
+        .checked(editing)
+        .on_click(move |_checked, window, cx| {
+            this.update(cx, |app, cx| app.toggle_mode(window, cx)).ok();
         })
 }
 
@@ -4895,7 +4954,61 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn clicking_a_rendered_day_opens_it(cx: &mut TestAppContext) {
+    async fn the_mode_toggle_flips_between_reading_and_editing(cx: &mut TestAppContext) {
+        init(cx);
+        let dir = scratch_dir();
+        let journal = journal::Journal::new(&dir);
+        let today = Local::now().date_naive();
+        seed_day(&journal, today, "# today\n");
+
+        let (app, cx) = cx.add_window_view({
+            let dir = dir.clone();
+            move |window, cx| {
+                let mut app = DainikiApp::new(brand::editor_theme(), config::Config::default());
+                app.enter_journal(dir, window, cx);
+                app
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        // Editing by default: the format controls are there, the switch
+        // reads Read.
+        assert!(cx.debug_bounds("block-formats").is_some(), "editing");
+        let target = cx
+            .debug_bounds("mode-toggle")
+            .expect("the switch is in the bar")
+            .center();
+        cx.simulate_click(target, gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| assert!(!app.read(cx).is_editing()));
+        assert!(
+            cx.debug_bounds("block-formats").is_none(),
+            "reading hides the format controls"
+        );
+
+        // The switch stays put and takes you back.
+        let target = cx
+            .debug_bounds("mode-toggle")
+            .expect("the switch stayed in the bar")
+            .center();
+        cx.simulate_click(target, gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| assert!(app.read(cx).is_editing()));
+        assert!(
+            cx.debug_bounds("block-formats").is_some(),
+            "editing brings the format controls back"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    async fn a_click_opens_a_day_only_while_editing(cx: &mut TestAppContext) {
         init(cx);
         let dir = scratch_dir();
         let journal = journal::Journal::new(&dir);
@@ -4915,18 +5028,45 @@ mod tests {
             let _ = window.draw(cx);
         });
 
-        // Reading mode first: with the full-height editor open, yesterday
-        // sits below the fold. Finishing editing renders today as a day too.
+        // The app opens editing today — the default mode.
+        cx.update(|_window, cx| {
+            let app = app.read(cx);
+            assert!(app.is_editing(), "the default mode is editing");
+        });
+
+        // Reading mode: a click on a day is a click on text, a player or a
+        // link — it must not swap the mode.
         cx.update(|_window, cx| {
             app.update(cx, |app, cx| app.stop_editing(cx));
         });
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
+        cx.update(|_window, cx| {
+            assert!(!app.read(cx).is_editing());
+        });
+        let target = cx
+            .debug_bounds("day-body")
+            .expect("yesterday's body is painted")
+            .center();
+        cx.simulate_click(target, gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|_window, cx| {
+            assert!(
+                !app.read(cx).is_editing(),
+                "a click while reading does not open the editor"
+            );
+        });
 
-        // Click into yesterday's day body (the interactive wrapper); the
-        // item's geometric center can fall in the gap between its header
-        // and its body.
+        // Editing mode: the same click opens the day.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_mode(window, cx));
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
         let target = cx
             .debug_bounds("day-body")
             .expect("yesterday's body is painted")
@@ -4946,7 +5086,6 @@ mod tests {
         });
         fs::remove_dir_all(&dir).ok();
     }
-
     #[gpui::test]
     async fn a_tag_filters_the_stream(cx: &mut TestAppContext) {
         init(cx);

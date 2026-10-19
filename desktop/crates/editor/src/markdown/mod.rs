@@ -346,6 +346,20 @@ impl MarkdownIndex {
                         inner: Vec::new(),
                     });
                 }
+                // Continuation lines carry their `>` in a `block_continuation`
+                // node rather than a `block_quote_marker`: the empty quote
+                // line, and a lazy continuation glued to the previous
+                // paragraph. The same `>` is a quote's marker wherever it
+                // stands, so it collapses the same way. Lists share the node
+                // kind for their own continuations, hence the `>` test.
+                "block_continuation" if text[child.byte_range()].contains('>') => {
+                    out.push(Construct {
+                        kind: ConstructKind::QuoteMarker,
+                        range: child.byte_range(),
+                        markers: Vec::new(),
+                        inner: Vec::new(),
+                    });
+                }
                 _ => {}
             }
             self.walk_blocks(child, text, out);

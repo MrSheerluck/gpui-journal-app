@@ -1026,6 +1026,33 @@ mod tests {
     }
 
     #[test]
+    fn quote_continuations_collapse_their_markers() {
+        // The grammar hands the first line a `block_quote_marker` and every
+        // continuation line a `block_continuation`; both are the same `>` to
+        // a reader, so both collapse to the bar.
+        let text = "before\n\n> first\n>\n> third\n";
+        let caret = text.len();
+        let plan = plan_for(text, Selection::caret(caret));
+        for ix in [2, 3, 4] {
+            assert_eq!(
+                plan.lines[ix].style,
+                Style::Quote,
+                "line {ix} reads as a quote"
+            );
+            assert!(
+                !plan.lines[ix].text.contains('>'),
+                "line {ix} keeps no marker: {:?}",
+                plan.lines[ix].text
+            );
+        }
+
+        // With the caret on that line the source comes back, as everywhere.
+        let second_marker = text.find("\n>\n").expect("the empty quote line") + 2;
+        let plan = plan_for(text, Selection::caret(second_marker));
+        assert_eq!(plan.lines[3].text, ">");
+    }
+
+    #[test]
     fn fences_style_markers_and_content_lines() {
         let text = "before\n\n```rust\nfn main() {}\n```\n\nafter\n";
         let plan = plan_for(text, Selection::caret(0));

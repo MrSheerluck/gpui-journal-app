@@ -422,6 +422,16 @@ impl Element for EditorElement {
                             }
                         }
                     }
+                    if let Err(error) = laid.wrapped.paint_background(
+                        line_origin,
+                        height,
+                        align,
+                        Some(bounds),
+                        window,
+                        cx,
+                    ) {
+                        tracing::warn!(error = %error, "failed to paint a line's background");
+                    }
                     if let Err(error) =
                         laid.wrapped
                             .paint(line_origin, height, align, Some(bounds), window, cx)
